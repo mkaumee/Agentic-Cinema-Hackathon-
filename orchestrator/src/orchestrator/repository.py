@@ -270,12 +270,18 @@ class FirestoreRepository:
         negotiation_id: str,
         message_id: str,
         rec: MessageRecord,
-    ) -> None:
-        """Add one message to a negotiation's timeline.
+    ) -> bool:
+        """Add one message to a negotiation's timeline. True if it was new.
 
-        Uses ``create()`` so replaying the same Gmail message ID after a killed
-        tick is refused rather than silently duplicating the conversation. The
-        caller treats ``AlreadyExists`` as "already filed, nothing to do".
+        Keyed by Gmail message ID and written with ``create()``, so a message
+        redelivered after a killed tick is refused rather than duplicating the
+        conversation.
+
+        The return value is what makes the *state transition* replay-safe too,
+        not just the document. Filing a message is only half the work; the other
+        half is applying QUOTE_RECEIVED to the negotiation. A caller that
+        ignored this would re-apply that transition on every redelivery and
+        burn a negotiation round for a reply the supplier only sent once.
         """
         ref = (
             self._negotiation_ref(project_id, negotiation_id)
@@ -285,7 +291,8 @@ class FirestoreRepository:
         try:
             _ = await ref.create(rec.to_firestore())
         except AlreadyExists:
-            return
+            return False
+        return True
 
     async def list_messages(
         self, project_id: str, negotiation_id: str

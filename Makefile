@@ -28,11 +28,12 @@ test: ## Unit tests
 
 check: lint types guard test ## Everything that must pass before a merge
 
-emulator: ## Start the Firestore emulator on :8080
-	firebase emulators:start --only firestore
+emulator: ## Start the Firestore emulator on :8080 (leave running while you work)
+	firebase emulators:start --only firestore --project demo-cinema
 
 e2e: ## The daily ten-minute habit: boot the emulator, run the loop end to end
-	uv run python scripts/run_e2e.py
+	firebase emulators:exec --only firestore --project demo-cinema \
+		"uv run python scripts/run_e2e.py"
 
 clean:
 	rm -rf .pytest_cache .ruff_cache **/__pycache__ web/dist

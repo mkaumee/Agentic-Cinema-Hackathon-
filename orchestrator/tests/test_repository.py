@@ -260,8 +260,8 @@ async def test_replaying_a_message_after_a_killed_tick_does_not_duplicate_it(
     await repo.save_negotiation(PID, "neg1", _negotiation())
 
     message = MessageRecord(direction="INBOUND", body="RM1,250", sim_sent_at=T0)
-    await repo.append_message(PID, "neg1", "gmail-msg-1", message)
-    await repo.append_message(PID, "neg1", "gmail-msg-1", message)
+    _ = await repo.append_message(PID, "neg1", "gmail-msg-1", message)
+    _ = await repo.append_message(PID, "neg1", "gmail-msg-1", message)
 
     assert len(await repo.list_messages(PID, "neg1")) == 1
 
@@ -271,7 +271,7 @@ async def test_messages_come_back_in_simulated_order(firestore: AsyncClient) -> 
     await repo.create_project(PID, _project())
     await repo.save_negotiation(PID, "neg1", _negotiation())
 
-    await repo.append_message(
+    _ = await repo.append_message(
         PID,
         "neg1",
         "m2",
@@ -279,7 +279,7 @@ async def test_messages_come_back_in_simulated_order(firestore: AsyncClient) -> 
             direction="INBOUND", body="second", sim_sent_at=T0 + timedelta(days=1)
         ),
     )
-    await repo.append_message(
+    _ = await repo.append_message(
         PID,
         "neg1",
         "m1",
