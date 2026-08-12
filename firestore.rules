@@ -1,0 +1,109 @@
+rules_version = '2';
+
+// Security rules are part of the product, not deployment configuration.
+//
+// The claim this system makes is that the agent cannot spend money. That claim
+// is worth nothing if it rests on prompt design, because a prompt is a request
+// and a rule is a refusal. Everything below exists so that "the agent cannot
+// create a purchase order" is a fact about IAM rather than a hope about an LLM.
+//
+// The agent runs as a service account with no `producer` claim. A human signs
+// in through Firebase Auth and gets one. Read the rules with that in mind: the
+// agent is simply a caller that fails the `isProducer()` check.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // Producers are humans. The agent's service account never carries this
+    // claim, and nothing in the codebase can mint one for itself — custom
+    // claims are set server-side by an admin, outside anything the agent runs.
+    function isProducer() {
+      return isSignedIn() && request.auth.token.role == 'producer';
+    }
+
+    // ---------------------------------------------------------------------
+    // Purchase orders. The guardrail.
+    // ---------------------------------------------------------------------
+    //
+    // Top-level and keyed by item_id, which is what makes the duplicate
+    // impossible rather than merely unlikely:
+    //
+    //   - `create` fails with ALREADY_EXISTS if the document is there, so a
+    //     second order for the same item is refused by the storage engine
+    //     before any application code runs.
+    //   - Because the *item* is the key, ordering one item from two different
+    //     suppliers is the same violation and is refused identically. That is
+    //     the case a per-order ID would have let through.
+    //   - `update` and `delete` are closed outright. An order, once placed, is
+    //     a record of something that happened. Nothing rewrites history.
+    //
+    // There is deliberately no `allow write` shorthand anywhere in this block.
+    // `write` covers create, update and delete together, and using it here
+    // would silently reopen the two we just closed.
+    match /purchase_orders/{itemId} {
+      allow get, list: if isSignedIn();
+
+      allow create: if isProducer()
+                    && request.resource.data.approved_by == request.auth.uid
+                    && request.resource.data.item_id == itemId
+                    && request.resource.data.price.amount is int
+                    && request.resource.data.price.amount > 0
+                    && request.resource.data.price.currency is string;
+
+      allow update, delete: if false;
+    }
+
+    // ---------------------------------------------------------------------
+    // Everything else
+    // ---------------------------------------------------------------------
+    //
+    // The agent owns the negotiation record. It may read and write projects,
+    // items, suppliers, negotiations and messages freely — that is its job, and
+    // none of it moves money.
+    match /projects/{projectId} {
+      allow read: if isSignedIn();
+      allow write: if isSignedIn();
+
+      match /items/{itemId} {
+        allow read: if isSignedIn();
+        allow write: if isSignedIn();
+      }
+
+      match /suppliers/{supplierId} {
+        allow read: if isSignedIn();
+        allow write: if isSignedIn();
+      }
+
+      match /negotiations/{negotiationId} {
+        allow read: if isSignedIn();
+
+        // The agent may drive a negotiation anywhere except into ORDERED.
+        // ORDERED means a purchase order exists, and only a producer can have
+        // created one. Without this, the UI could show an ordered negotiation
+        // with no order behind it.
+        allow create: if isSignedIn()
+                      && request.resource.data.state != 'ORDERED';
+        allow update: if isSignedIn()
+                      && (request.resource.data.state != 'ORDERED' || isProducer());
+        allow delete: if false;
+
+        match /messages/{messageId} {
+          allow read: if isSignedIn();
+          // Correspondence is append-only. An agent that could rewrite what a
+          // supplier said would make the timeline worthless as evidence.
+          allow create: if isSignedIn();
+          allow update, delete: if false;
+        }
+      }
+    }
+
+    // Anything not named above is denied.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
