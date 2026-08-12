@@ -68,10 +68,11 @@ ignore = [
 "time.monotonic".msg = "Wall-clock time is banned. Use clock.now() — see CLAUDE.md."
 
 [tool.ruff.lint.per-file-ignores]
-# The clock implementation is the one place allowed to read real time, and the
-# simulator's own latency modelling is outside the product's time domain.
-"orchestrator/src/orchestrator/clock.py" = ["DTZ", "TID251"]
+# The guard script names the banned functions in order to detect them.
 "scripts/check_no_wallclock.py" = ["TID251"]
+# Deliberately no exemption for orchestrator/clock.py. Its single wall-clock
+# read carries an inline noqa instead, so a second one cannot be added there
+# without another visible suppression.
 
 [tool.ruff.format]
 quote-style = "double"
@@ -81,8 +82,12 @@ line-ending = "lf"
 [tool.basedpyright]
 typeCheckingMode = "recommended"
 pythonVersion = "3.14"
-include = ["contracts", "orchestrator", "supplier-sim"]
+include = ["contracts", "orchestrator", "supplier-sim", "scripts"]
 exclude = ["**/node_modules", "**/.venv", "**/__pycache__"]
+# scripts/ holds standalone tools that CI runs without installing anything.
+# Putting it on the path lets tests import them with real types instead of
+# loading them by filename and casting.
+extraPaths = ["scripts"]
 
 # Ruff already ignores ISC001, so implicit concatenation is a deliberate team
 # choice. Leaving this on would make the two tools disagree about the same code.
@@ -91,3 +96,4 @@ reportImplicitStringConcatenation = false
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["contracts/tests", "orchestrator/tests", "supplier-sim/tests"]
+pythonpath = ["scripts"]
