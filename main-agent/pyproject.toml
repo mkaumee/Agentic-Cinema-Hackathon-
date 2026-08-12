@@ -21,3 +21,46 @@ dev = [
     "basedpyright>=1.39.9",
     "ruff>=0.16.2",
 ]
+
+[tool.ruff]
+target-version = "py314"
+line-length = 88
+indent-width = 4
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "W",
+    "F",
+    "I",
+    "UP",
+    "B",
+    "A",
+    "C4",
+    "T10",
+    "ISC",
+    "PIE",
+    "RSE",
+    "RET",
+    "SIM",
+    "PERF",
+    "RUF",
+    "N",
+    "PLE",
+    "PLW",
+]
+
+ignore = [
+    "E501",
+    "ISC001",
+    "COM812",
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+
+[tool.basedpyright]
+typeCheckingMode = "recommended"
+pythonVersion = "3.14"
