@@ -28,6 +28,7 @@ from cinema_contracts import (
     Money,
     NegotiationState,
     ReferenceBand,
+    SceneMention,
 )
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -83,6 +84,14 @@ class ItemRecord(_Record):
     scenes: list[str] = Field(default_factory=list)
     qty: int = Field(ge=1, default=1)
     notes: str = ""
+
+    mentions: list[SceneMention] = Field(default_factory=list)
+    """The script lines this item was found in. Shown on the item detail screen
+    so a producer can see why the agent thinks the shoot needs this."""
+
+    consumable: bool = False
+    """Destroyed on camera, so the quantity is per take rather than per shoot."""
+
     reference_band: ReferenceBand | None = None
     status: ItemStatus = ItemStatus.DRAFT
     chosen_quote: ExtractedQuote | None = None

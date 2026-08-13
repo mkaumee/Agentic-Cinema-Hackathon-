@@ -419,6 +419,7 @@ class TickLoop:
                 category=item.category,
                 scenes=item.scenes,
                 qty=item.qty,
+                consumable=item.consumable,
                 notes=item.notes,
                 reference_band=item.reference_band,
             ),
