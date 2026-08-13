@@ -62,6 +62,11 @@ claims. The short version:
   engine before application code runs.
 - The agent's service account cannot write to `purchase_orders` at all.
 
+## What happens next
+
+`docs/PLAN.md` holds the phased build plan: what is done, what is not, and
+the order the rest goes in.
+
 ## Licence
 
 MIT. See `LICENSE`.
