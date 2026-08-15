@@ -1,16 +1,19 @@
 [project]
 name = "main-agent"
 version = "0.1.0"
-description = "Add your description here"
+description = "Stateless Gemini reasoning service for cinema procurement."
 readme = "README.md"
 authors = [
     { name = "BlueGecko", email = "kei09doya@gmail.com" }
 ]
 requires-python = ">=3.14"
-dependencies = []
+dependencies = [
+    "cinema-contracts",
+    "google-adk>=2.7.0",
+]
 
-[project.scripts]
-main-agent = "main_agent:main"
+[tool.uv.sources]
+cinema-contracts = { workspace = true }
 
 [build-system]
 requires = ["uv_build>=0.12.3,<0.13.0"]

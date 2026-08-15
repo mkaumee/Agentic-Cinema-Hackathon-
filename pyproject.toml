@@ -3,7 +3,7 @@
 # `main-agent` (Role A) joins this members list when role_a and role_b merge.
 # It is absent here only because it does not exist on this branch yet.
 [tool.uv.workspace]
-members = ["contracts", "orchestrator", "supplier-sim"]
+members = ["contracts", "orchestrator", "supplier-sim", "main-agent"]
 
 [tool.uv.sources]
 cinema-contracts = { workspace = true }
@@ -82,12 +82,12 @@ line-ending = "lf"
 [tool.basedpyright]
 typeCheckingMode = "recommended"
 pythonVersion = "3.14"
-include = ["contracts", "orchestrator", "supplier-sim", "scripts"]
+include = ["contracts", "orchestrator", "supplier-sim", "scripts", "main-agent"]
 exclude = ["**/node_modules", "**/.venv", "**/__pycache__"]
 # scripts/ holds standalone tools that CI runs without installing anything.
 # Putting it on the path lets tests import them with real types instead of
 # loading them by filename and casting.
-extraPaths = ["scripts"]
+extraPaths = ["scripts", "main-agent/src"]
 
 # Ruff already ignores ISC001, so implicit concatenation is a deliberate team
 # choice. Leaving this on would make the two tools disagree about the same code.
