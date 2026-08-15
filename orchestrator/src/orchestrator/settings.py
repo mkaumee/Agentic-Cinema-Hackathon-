@@ -28,6 +28,14 @@ either; the agent has no business deleting anything.
 """
 
 
+class MailBackend(StrEnum):
+    MEMORY = "memory"
+    """No network. The default, so nothing accidentally emails a real supplier."""
+
+    GMAIL = "gmail"
+    """The real thing. Requires a refresh token to have been bootstrapped."""
+
+
 class TokenBackend(StrEnum):
     FILE = "file"
     """A gitignored directory on disk. The default while there is no GCP project."""
@@ -56,6 +64,19 @@ class Settings(BaseSettings):
     gcp_project: str = "demo-cinema"
     agent_email: str = "agent@example.invalid"
     agent_display_name: str = "Agentic Cinema"
+
+    # -- transports -------------------------------------------------------- #
+
+    mail_backend: MailBackend = MailBackend.MEMORY
+    """Defaults to memory on purpose.
+
+    Real email to a real seller is not something to fall into because a token
+    happened to be present. Sending for real is an explicit choice:
+    ``CINEMA_MAIL_BACKEND=gmail``.
+    """
+
+    oauth_client_id: str = ""
+    oauth_client_secret: str = ""
 
     # -- credentials ------------------------------------------------------- #
 

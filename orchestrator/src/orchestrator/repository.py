@@ -114,6 +114,17 @@ class FirestoreRepository:
     async def create_project(self, project_id: str, record: ProjectRecord) -> None:
         _ = await self._project_ref(project_id).create(record.to_firestore())
 
+    async def list_project_ids(self) -> list[str]:
+        """Every project id, sorted.
+
+        The tick endpoint uses this when Cloud Scheduler calls it with no body:
+        one scheduled call has to cover every production in the system, and
+        the clock is advanced per project.
+        """
+        return sorted(
+            [snapshot.id async for snapshot in self._db.collection(PROJECTS).stream()]
+        )
+
     async def get_project(self, project_id: str) -> ProjectRecord | None:
         snapshot = await self._project_ref(project_id).get()
         data = snapshot.to_dict()
