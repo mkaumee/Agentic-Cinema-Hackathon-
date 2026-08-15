@@ -1,0 +1,20 @@
+[project]
+name = "orchestrator"
+version = "0.1.0"
+description = "Role B runtime: clock, Firestore, Gmail, state machine, tick loop."
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "cinema-contracts",
+    "google-cloud-firestore>=2.19",
+    "google-api-python-client>=2.150",
+    "google-auth-oauthlib>=1.2",
+    "google-cloud-secret-manager>=2.20",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic-settings>=2.6",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.3,<0.13.0"]
+build-backend = "uv_build"
