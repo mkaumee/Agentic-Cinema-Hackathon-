@@ -57,24 +57,29 @@ Verified, not assumed — every claim below is covered by a test in the repo.
 | `orchestrator/mail.py` — transport seam + in-memory impl | Done |
 | `orchestrator/tick.py` — the loop | Done, kill-mid-run tested |
 | `scripts/run_e2e.py` / `make e2e` | Green, ends with 0 purchase orders |
+| **Phase 1** — settings, Gmail transport, HTTP service, OAuth bootstrap, runbook, CI | Done |
 
-116 tests. 36 of them need the Firestore emulator and skip without it.
+156 tests. 46 of them need the Firestore emulator and skip without it; CI fails
+the build if they skip there.
 
 **Not started**
 
-`orchestrator/app.py` (no HTTP service at all) · real Gmail transport · auth ·
-script upload → items → research → negotiation creation · `web/` (empty) ·
-deploy config (no Dockerfile, no CI) · `supplier-sim/` (scaffolding only).
+Script upload → items → research → negotiation creation (Phase 2) · deploy
+config, no Dockerfile (Phase 3) · auth and the approval endpoint (Phase 4) ·
+`web/`, still empty (Phases 5–6) · `supplier-sim/`, scaffolding only (later).
 
 **Known debts, carried deliberately**
 
-- `CLAUDE.md` references `docs/oauth-runbook.md`, which does not exist yet →
-  Phase 1.
 - `firestore.rules` has no tests. The `create()` uniqueness guarantee is proven
   in Python, but the admin SDK bypasses rules, so the rules themselves are
   unverified → Phase 4.
 - Nothing protects against two ticks overlapping → Phase 3.
-- No CI. `make check` only runs when someone remembers → Phase 1.
+- `/tick` is unauthenticated. It gets Scheduler OIDC and private ingress in
+  Phase 3; a home-grown shared secret in the meantime would look like
+  protection without being any.
+- The live email round-trip is unproven — it needs two mailboxes and a consent
+  screen that do not exist yet. The transport is covered offline; the runbook
+  is the checklist.
 
 ---
 
@@ -93,9 +98,21 @@ wrong, not the invariant.
 
 ---
 
-## Phase 1 — Make it reachable, and make the mail real
+## Phase 1 — Make it reachable, and make the mail real — DONE
 
 **Goal.** A deployable HTTP service that sends and receives real Gmail.
+
+**Shipped.** `settings.py`, `gmail.py` (transport + file/Secret-Manager token
+stores), `app.py` (`GET /healthz`, `POST /tick`), `scripts/oauth_bootstrap.py`,
+`docs/oauth-runbook.md`, and CI running the full gate on push.
+
+Also fixed a latent bug found while building it: threading was keyed on Gmail's
+API message id rather than the RFC-822 `Message-ID` header. Those are different
+strings, and only the header threads — so every reply would have forked a new
+thread in the supplier's inbox, invisibly, because our own routing uses Gmail's
+thread id and would have kept working.
+
+**Outstanding.** The live round-trip, which needs the mailboxes.
 
 **Why here.** Nothing can run on a schedule until there is something to call,
 and no simulated day passes until real email moves.
