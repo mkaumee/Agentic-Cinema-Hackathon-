@@ -72,6 +72,18 @@ SILENCE_HOURS = 48.0
 """Simulated hours of supplier silence before the loop raises SILENCE_TIMEOUT."""
 
 
+def _references(record: NegotiationRecord) -> str:
+    """The ``References`` header: thread root first, then the latest message.
+
+    Deliberately not the full chain. A five-day negotiation would accumulate a
+    header that grows every round, and root-plus-last threads correctly in
+    every client that matters.
+    """
+    ids = [record.thread_root_rfc822_id, record.last_rfc822_id]
+    seen = [i for n, i in enumerate(ids) if i and i not in ids[:n]]
+    return " ".join(seen)
+
+
 def _require(value: datetime | None) -> datetime:
     """Narrow an optional timestamp that the caller has already checked."""
     if value is None:
@@ -302,15 +314,22 @@ class TickLoop:
                 report.errors.append(f"{due.negotiation_id}: supplier record vanished")
                 return
 
+            # Threading is built from RFC-822 header ids, never from the
+            # transport's own message id. See SentMessage in mail.py for why
+            # confusing the two silently shreds the supplier's thread.
             sent = await self._mail.send(
                 to=supplier.email,
                 subject=move.draft_subject or f"Regarding {record.item_id}",
                 body=move.draft_body,
                 thread_id=record.gmail_thread_id,
-                in_reply_to=record.last_msg_id,
+                in_reply_to=record.last_rfc822_id,
+                references=_references(record),
             )
             record.gmail_thread_id = sent.thread_id
             record.last_msg_id = sent.message_id
+            if not record.thread_root_rfc822_id:
+                record.thread_root_rfc822_id = sent.rfc822_message_id
+            record.last_rfc822_id = sent.rfc822_message_id
             record.last_outbound_at = now
             report.messages_sent += 1
 

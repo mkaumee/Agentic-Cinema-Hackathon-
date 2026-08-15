@@ -128,6 +128,17 @@ class NegotiationRecord(_Record):
 
     gmail_thread_id: str = ""
     last_msg_id: str = ""
+    """Gmail's API id for our last outbound. For lookups and debugging."""
+
+    thread_root_rfc822_id: str = ""
+    last_rfc822_id: str = ""
+    """RFC-822 ``Message-ID`` headers: the thread's first message, and the most
+    recent one in it.
+
+    These are what ``In-Reply-To`` and ``References`` are built from. Keeping
+    the root and the last one is bounded — a full ``References`` chain grows
+    with every round — and is enough for every mail client to thread correctly.
+    """
 
     first_quote: ExtractedQuote | None = None
     latest_quote: ExtractedQuote | None = None

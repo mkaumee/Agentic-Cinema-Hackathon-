@@ -199,8 +199,55 @@ async def test_a_counter_stays_in_the_same_email_thread(harness: _Harness) -> No
     await harness.at(T0 + timedelta(hours=6))
     _ = await harness.loop.run_tick(PID)
 
-    assert harness.mail.sent[1]["thread_id"] == thread
-    assert harness.mail.sent[1]["in_reply_to"] == harness.mail.sent[0]["message_id"]
+    opening, counter = harness.mail.sent[0], harness.mail.sent[1]
+    assert counter["thread_id"] == thread
+    assert counter["in_reply_to"] == opening["rfc822_message_id"]
+    assert counter["references"] == opening["rfc822_message_id"]
+
+
+async def test_in_reply_to_uses_the_header_id_not_the_transport_id(
+    harness: _Harness,
+) -> None:
+    """The two ids are different strings and only one of them threads.
+
+    Gmail's send returns an API handle; ``In-Reply-To`` needs the ``Message-ID``
+    header. Using the handle produces a header no client matches, so replies
+    fork into new threads — and our own routing is by thread_id, so nothing
+    inside the system would notice.
+    """
+    await harness.add_negotiation(floor=Money(amount=900))
+    _ = await harness.loop.run_tick(PID)
+    thread = harness.mail.sent[0]["thread_id"]
+    _ = harness.mail.deliver(thread_id=thread, body="RM1,250")
+    await harness.at(T0 + timedelta(hours=6))
+    _ = await harness.loop.run_tick(PID)
+
+    opening, counter = harness.mail.sent[0], harness.mail.sent[1]
+    assert opening["message_id"] != opening["rfc822_message_id"]
+    assert counter["in_reply_to"] != opening["message_id"]
+    assert counter["in_reply_to"].startswith("<")
+    assert counter["in_reply_to"].endswith(">")
+
+
+async def test_the_thread_root_is_recorded_once_and_kept(harness: _Harness) -> None:
+    """References stays bounded: root plus latest, not the whole chain."""
+    await harness.add_negotiation(floor=Money(amount=1))
+    _ = await harness.loop.run_tick(PID)
+    thread = harness.mail.sent[0]["thread_id"]
+    root = harness.mail.sent[0]["rfc822_message_id"]
+
+    moment = T0
+    for _ in range(3):
+        _ = harness.mail.deliver(thread_id=thread, body="RM1,250")
+        moment += timedelta(hours=6)
+        await harness.at(moment)
+        _ = await harness.loop.run_tick(PID)
+
+    record = await harness.repo.get_negotiation(PID, "neg1")
+    assert record is not None
+    assert record.thread_root_rfc822_id == root
+    assert record.last_rfc822_id == harness.mail.sent[-1]["rfc822_message_id"]
+    assert len(harness.mail.sent[-1]["references"].split()) == 2
 
 
 async def test_a_quote_at_the_floor_stops_for_a_human(harness: _Harness) -> None:
