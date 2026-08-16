@@ -94,18 +94,36 @@ declare -a NEEDED=(
 
 say "Preflight — what this account can do"
 
-perms=$(printf '%s\n' "${NEEDED[@]}" | cut -d'|' -f1 | paste -sd,)
-if ! probe=$(gcloud projects test-iam-permissions "$PROJECT_ID" \
-       --permissions="$perms" --format='value(permissions)' 2>&1); then
-  # Distinguish "you may not do these things" from "I could not even ask",
-  # which usually means the project id is wrong or gcloud is signed in as
-  # someone with no access to it at all.
-  echo "  Could not query permissions on $PROJECT_ID:" >&2
-  printf '    %s\n' "$probe" >&2
-  echo "  Check the project id and that gcloud is signed in as the right account." >&2
+# Straight to the REST API. testIamPermissions exists on Cloud Resource
+# Manager, but gcloud never exposed it as a `gcloud projects` subcommand — only
+# on some other resource types — so calling it by hand is the only way.
+#
+# It answers "which of these may *I* do", needs no special permission itself,
+# and returns only the granted subset. Anything absent from the reply is denied.
+json_perms=$(printf '%s\n' "${NEEDED[@]}" | cut -d'|' -f1 \
+  | sed 's/.*/"&"/' | paste -sd,)
+
+probe=$(curl -sS -w $'\n%{http_code}' -X POST \
+  -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+  -H "Content-Type: application/json" \
+  -d "{\"permissions\":[${json_perms}]}" \
+  "https://cloudresourcemanager.googleapis.com/v1/projects/${PROJECT_ID}:testIamPermissions" \
+  2>&1) || true
+
+http_code=$(tail -n1 <<<"$probe")
+granted=$(sed '$d' <<<"$probe")
+
+if [[ "$http_code" != "200" ]]; then
+  # "I could not even ask" is a different problem from "I may not do these
+  # things", and confusing the two sends you off requesting the wrong roles.
+  echo "  Could not query permissions on $PROJECT_ID (HTTP $http_code):" >&2
+  printf '    %s\n' "$granted" >&2
+  echo >&2
+  echo "  Usually the project id is wrong, or gcloud is signed in as an" >&2
+  echo "  account with no access to it at all. Current account:" >&2
+  echo "    $(gcloud config get-value account 2>/dev/null)" >&2
   exit 3
 fi
-granted=" $(tr '\n' ' ' <<<"$probe") "
 
 missing=0
 declare -a ASK_FOR=()
@@ -114,7 +132,9 @@ for entry in "${NEEDED[@]}"; do
   rest="${entry#*|}"
   what="${rest%%|*}"
   role="${rest##*|}"
-  if [[ "$granted" == *" $perm "* ]]; then
+  # Each permission comes back as its own quoted string, so a substring match
+  # on the raw JSON is exact enough and saves depending on jq being installed.
+  if grep -q "\"${perm}\"" <<<"$granted"; then
     ok "$what"
   else
     printf '  \033[31m✗\033[0m %s\n' "$what"
