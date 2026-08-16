@@ -45,11 +45,17 @@ jobs:
       - name: Install firebase-tools
         run: npm install --global firebase-tools@15
 
+      - name: Install web dependencies
+        run: npm ci --prefix web
+
       - name: Lint
         run: make lint
 
       - name: Types
         run: make types
+
+      - name: Types (web)
+        run: npx --prefix web tsc --noEmit --project web
 
       - name: Wall-clock guard
         run: make guard
@@ -62,12 +68,17 @@ jobs:
       - name: Tests
         run: |
           set -o pipefail
-          firebase emulators:exec --only firestore --project demo-cinema \
+          firebase emulators:exec --only firestore,auth --project demo-cinema \
             "uv run pytest -q" 2>&1 | tee pytest.out
           if grep -qE "[0-9]+ skipped" pytest.out; then
-            echo "::error::Firestore-backed tests skipped — the emulator did not come up."
+            echo "::error::Emulator-backed tests skipped — an emulator did not come up."
             exit 1
           fi
+
+      # The only thing in the repo that executes the rules files. Everything
+      # else reaches Firestore through the admin SDK, which bypasses them.
+      - name: Security rules
+        run: make rules-test
 
       - name: End to end
         run: make e2e
