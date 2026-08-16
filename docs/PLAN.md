@@ -53,7 +53,8 @@ Verified, not assumed — every claim below is covered by a test in the repo.
 | `scripts/check_no_wallclock.py` — AST guard + its own tests | Done |
 | `orchestrator/state_machine.py` | Done, `ORDERED` proven unreachable by agent |
 | `orchestrator/records.py`, `repository.py` | Done, emulator-tested |
-| `firestore.rules`, `firestore.indexes.json` | **Written, rules untested** |
+| `firestore.rules`, `firestore.orders.rules`, indexes | **Written, rules untested** |
+| GCP setup script, two-database split | Done; script not yet run against a real project |
 | `orchestrator/mail.py` — transport seam + in-memory impl | Done |
 | `orchestrator/tick.py` — the loop | Done, kill-mid-run tested |
 | `scripts/run_e2e.py` / `make e2e` | Green, ends with 0 purchase orders |
@@ -72,7 +73,13 @@ config, no Dockerfile (Phase 3) · auth and the approval endpoint (Phase 4) ·
 
 - `firestore.rules` has no tests. The `create()` uniqueness guarantee is proven
   in Python, but the admin SDK bypasses rules, so the rules themselves are
-  unverified → Phase 4.
+  unverified → Phase 4. Note this is not a gap in the *agent* guardrail: rules
+  never constrained the agent at all, which is why orders moved to their own
+  database. Rules only govern the producer's browser path.
+- firebase-tools 15 does not load rules from the multi-database array form in
+  `firebase.json`, so the emulator now runs open. Harmless today — our Python
+  tests use the admin SDK and bypass rules regardless — and Phase 4's rules
+  tests load each file explicitly rather than through `firebase.json`.
 - Nothing protects against two ticks overlapping → Phase 3.
 - `/tick` is unauthenticated. It gets Scheduler OIDC and private ingress in
   Phase 3; a home-grown shared secret in the meantime would look like
@@ -243,6 +250,10 @@ that advanced without anyone touching it.
 - `POST /items/{item_id}/approve` — verifies the ID token and the `producer`
   claim, creates the purchase order via `create()`, transitions the negotiation
   `READY_FOR_HUMAN → ORDERED`.
+  **This cannot live in the tick service.** That service's account has no IAM
+  binding on the orders database, which is the whole guardrail. Approval runs
+  as a separate service account, or straight from the producer's browser where
+  rules apply. Bolting it onto `app.py` would quietly undo the split.
 - `POST /negotiations/{nid}/floor` — the producer sets a floor and hands the
   negotiation back (`HUMAN_RETURNED_WITH_FLOOR → NEGOTIATING`).
 - `POST /negotiations/{nid}/cancel` → `DEAD`.
@@ -250,6 +261,7 @@ that advanced without anyone touching it.
   - an agent identity (no `producer` claim) cannot create a purchase order
   - a producer can, exactly once
   - update and delete are refused for everyone, including producers
+  - both rules files are loaded explicitly; `firebase.json` is not consulted
   - a payload whose `item_id` disagrees with the document key is refused
   - negotiation messages cannot be rewritten
 

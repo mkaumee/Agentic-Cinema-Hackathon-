@@ -79,7 +79,9 @@ system makes.
   Any handler must be safe to kill mid-run and resume on the next tick.
 - `purchase_orders` is created only via `create()` keyed by `item_id`.
   Never `set()`, never update, never delete.
-- The agent service account has no write access to `purchase_orders`.
+- `purchase_orders` lives in its own Firestore database. The agent service
+  account has no IAM binding on it, and the tick service never builds a client
+  for it.
 
 ### Why each one exists
 
@@ -109,9 +111,36 @@ document already exists, so a duplicate purchase order is refused before our
 code runs. Because the *item* is the key, ordering the same item from two
 suppliers is the same violation and is refused identically.
 
-**No agent write access.** "The agent cannot spend money" has to be an IAM fact,
-not a claim about how well we wrote the prompt. The agent service account has no
-`producer` role; only a human-authenticated request can create an order.
+**No agent write access — and why that needs a second database.** "The agent
+cannot spend money" has to be an IAM fact, not a claim about how well we wrote
+the prompt. Getting there took more than a security rule, because of two things
+about Firestore that only bite once deployed:
+
+1. **Rules do not apply to server SDKs.** `firestore.rules` governs the Firebase
+   *client* SDKs — a browser holding an Auth token. Anything going through
+   `google-cloud-firestore` with a service account bypasses every rule in the
+   file. A rule denying order writes constrains a producer's browser and
+   constrains nothing whatsoever about the agent.
+2. **Firestore IAM cannot see collections.** `roles/datastore.user` is all or
+   nothing across an entire database. There is no binding that means "may write
+   negotiations, may not write orders".
+
+Together those make the claim unachievable in a single database. The smallest
+thing IAM can name is a database, so orders got their own: the agent is granted
+`roles/datastore.user` on `(default)` under an IAM condition, and has no binding
+at all on `orders`. Verify it, do not trust it:
+
+```
+gcloud projects get-iam-policy $PROJECT --flatten='bindings[].members' \
+  --filter="bindings.members:serviceAccount:cinema-agent@$PROJECT.iam.gserviceaccount.com" \
+  --format='table(bindings.role, bindings.condition.expression)'
+```
+
+In code the same line is drawn twice: `FirestoreRepository` has no method that
+writes an order, and `OrdersRepository` is never constructed by the tick
+service. The approval endpoint must therefore run somewhere else — a separate
+service account, or the producer's browser under rules. It cannot be bolted
+onto the tick service without undoing all of this.
 
 ## Money and units
 
