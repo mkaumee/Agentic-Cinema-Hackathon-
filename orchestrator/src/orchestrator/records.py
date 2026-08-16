@@ -56,15 +56,37 @@ class _Record(BaseModel):
 
 
 class ItemStatus(StrEnum):
-    """Where an item is in the procurement flow, for the breakdown screen."""
+    """Where an item is in the procurement flow, for the breakdown screen.
+
+    The first two transitions are the interesting ones::
+
+        DRAFT ──confirmed by a producer──> RESEARCHING ──> SOURCING ──> NEGOTIATING
+
+    Nothing is researched and nobody is emailed while an item is ``DRAFT``. The
+    agent has read the script and produced a list; a human still has to say
+    that list is right. Skipping that would mean a hallucinated prop quietly
+    turning into a real email to a real seller.
+    """
 
     DRAFT = "DRAFT"
+    """Found in the script, not yet confirmed by a person. Inert."""
+
     RESEARCHING = "RESEARCHING"
+    """Confirmed. Due for a reference band and supplier candidates."""
+
     SOURCING = "SOURCING"
+    """Researched. Due for negotiations to be opened."""
+
     NEGOTIATING = "NEGOTIATING"
     READY_FOR_HUMAN = "READY_FOR_HUMAN"
     ORDERED = "ORDERED"
     ABANDONED = "ABANDONED"
+    """Dropped by the producer at confirmation, or nothing could be sourced."""
+
+
+ITEM_TERMINAL_STATUSES: frozenset[ItemStatus] = frozenset(
+    {ItemStatus.ORDERED, ItemStatus.ABANDONED}
+)
 
 
 class ProjectRecord(_Record):
@@ -95,6 +117,16 @@ class ItemRecord(_Record):
     reference_band: ReferenceBand | None = None
     status: ItemStatus = ItemStatus.DRAFT
     chosen_quote: ExtractedQuote | None = None
+
+    next_action_due_at: datetime | None = None
+    """Drives the item side of the tick, exactly as it does for negotiations.
+
+    Absent while an item is ``DRAFT`` — an unconfirmed item must never be
+    picked up — and removed again once it is terminal, which drops it out of
+    the index rather than leaving a row to filter on every pass.
+    """
+
+    updated_at: datetime | None = None
 
 
 class SupplierRecord(_Record):

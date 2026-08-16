@@ -25,7 +25,9 @@ from google.cloud.firestore_v1.base_query import FieldFilter
 
 from orchestrator.clock import ClockState
 from orchestrator.records import (
+    ITEM_TERMINAL_STATUSES,
     ItemRecord,
+    ItemStatus,
     MessageRecord,
     NegotiationRecord,
     ProjectRecord,
@@ -74,6 +76,19 @@ class DueNegotiation:
     ) -> None:
         self.project_id = project_id
         self.negotiation_id = negotiation_id
+        self.record = record
+
+
+class DueItem:
+    """An item the tick loop should act on, with its location."""
+
+    project_id: str
+    item_id: str
+    record: ItemRecord
+
+    def __init__(self, project_id: str, item_id: str, record: ItemRecord) -> None:
+        self.project_id = project_id
+        self.item_id = item_id
         self.record = record
 
 
@@ -135,8 +150,19 @@ class FirestoreRepository:
     # ------------------------------------------------------------------ #
 
     async def save_item(self, project_id: str, item_id: str, rec: ItemRecord) -> None:
+        """Write an item, dropping the due field when it must not be picked up.
+
+        Same trick as negotiations: a missing field leaves the document out of
+        the index entirely. Two cases want that. Finished items are obvious.
+        ``DRAFT`` is the important one — an item the producer has not confirmed
+        yet must never be researched or emailed about, and enforcing that by
+        absence from the queue is stronger than remembering to filter on it.
+        """
+        payload = rec.to_firestore()
+        if rec.status in ITEM_TERMINAL_STATUSES or rec.status is ItemStatus.DRAFT:
+            _ = payload.pop("next_action_due_at", None)
         ref = self._project_ref(project_id).collection(ITEMS).document(item_id)
-        _ = await ref.set(rec.to_firestore())
+        _ = await ref.set(payload)
 
     async def get_item(self, project_id: str, item_id: str) -> ItemRecord | None:
         ref = self._project_ref(project_id).collection(ITEMS).document(item_id)
@@ -151,6 +177,38 @@ class FirestoreRepository:
             if data is not None:
                 found[snapshot.id] = ItemRecord.model_validate(data)
         return found
+
+    async def due_items(self, now: datetime, *, limit: int = 25) -> list[DueItem]:
+        """Confirmed items waiting on research or on having negotiations opened.
+
+        A second collection-group query alongside ``due_negotiations``, on the
+        same shape of field. Deliberately the same pattern rather than a
+        bespoke background job: one recovery story, one index shape, and the
+        research step inherits the tick's killability for free.
+        """
+        query = (
+            self._db.collection_group(ITEMS)
+            .where(filter=FieldFilter("next_action_due_at", "<=", now))
+            .order_by("next_action_due_at")
+            .limit(limit)
+        )
+
+        due: list[DueItem] = []
+        async for snapshot in query.stream():
+            data = snapshot.to_dict()
+            if data is None:
+                continue
+            project_ref = snapshot.reference.parent.parent
+            if project_ref is None:
+                continue
+            due.append(
+                DueItem(
+                    project_id=project_ref.id,
+                    item_id=snapshot.id,
+                    record=ItemRecord.model_validate(data),
+                )
+            )
+        return due
 
     async def save_supplier(
         self, project_id: str, supplier_id: str, rec: SupplierRecord
@@ -192,6 +250,27 @@ class FirestoreRepository:
         if rec.state in TERMINAL_STATES:
             _ = payload.pop("next_action_due_at", None)
         _ = await self._negotiation_ref(project_id, negotiation_id).set(payload)
+
+    async def create_negotiation(
+        self, project_id: str, negotiation_id: str, rec: NegotiationRecord
+    ) -> bool:
+        """Open a negotiation, or report that it already exists.
+
+        ``create()`` rather than ``set()``, against a caller-chosen id derived
+        from the item and supplier. Opening negotiations is the one step that
+        fans out — one item becomes several — so a tick killed midway through
+        would otherwise reopen the ones it had already created and email those
+        suppliers twice.
+
+        Returns False when the document was already there, which the caller
+        treats as "someone got here first, nothing to do".
+        """
+        ref = self._negotiation_ref(project_id, negotiation_id)
+        try:
+            _ = await ref.create(rec.to_firestore())
+        except AlreadyExists:
+            return False
+        return True
 
     async def get_negotiation(
         self, project_id: str, negotiation_id: str
