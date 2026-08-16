@@ -20,6 +20,9 @@ fmt: ## Format Python
 lint: ## Lint without changing anything
 	uv run ruff check .
 	uv run ruff format --check .
+	# The shell scripts stand up real infrastructure and neither can be run
+	# from CI, so a linter is the only automated check they will ever get.
+	uvx --from shellcheck-py shellcheck scripts/*.sh
 
 types: ## Type-check
 	uv run basedpyright
