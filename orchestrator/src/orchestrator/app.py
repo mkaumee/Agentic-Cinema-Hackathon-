@@ -1,9 +1,18 @@
 # Starlette's app.state is an untyped attribute bag, so services_of has to
 # reach through Any to get at what lifespan put there.
 # pyright: reportAny=false
-"""The HTTP surface. What Cloud Scheduler calls.
+"""The HTTP surface. What Cloud Scheduler calls, and what the UI posts to.
 
-Two endpoints for now: a health check, and the tick. Everything the loop needs
+    POST /projects                       create a production
+    POST /projects/{id}/script           read a screenplay for props
+    POST /projects/{id}/items/confirm    a producer signs the list off
+    POST /tick                           advance the world by one pass
+    GET  /healthz
+
+The upload and confirm steps are separate on purpose. Reading a script produces
+DRAFT items and nothing else happens; confirming is what starts research and,
+eventually, email. That gap is where a hallucinated prop gets caught before it
+becomes a message to a real seller. Everything the loop needs
 is assembled once in the lifespan and handed to the handler — nothing is stored
 in a module global, and nothing survives between requests except what is in
 Firestore. That is Hard Rule 3, and it is what lets Cloud Run reap this process
@@ -25,17 +34,20 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from cinema_contracts import AgentBrain
+from cinema_contracts import AgentBrain, Money, ScriptSource
 from cinema_contracts.testing import ScriptedBrain
 from fastapi import FastAPI, HTTPException, Request
+from google.api_core.exceptions import AlreadyExists
 from google.cloud.firestore_v1 import AsyncClient
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from orchestrator.clock import SimClock
+from orchestrator.clock import SimClock, initial_state
 from orchestrator.gmail import GmailTransport, build_credentials, token_store_for
 from orchestrator.mail import InMemoryMailbox, MailTransport
+from orchestrator.records import ItemRecord, ItemStatus, ProjectRecord
 from orchestrator.repository import FirestoreRepository
 from orchestrator.settings import MailBackend, Settings
+from orchestrator.sourcing import item_id_for
 from orchestrator.tick import TickLoop, TickReport
 
 log = logging.getLogger("orchestrator")
@@ -141,6 +153,9 @@ class TickResult(BaseModel):
 
     project_id: str
     sim_now: str
+    items_examined: int
+    items_researched: int
+    negotiations_opened: int
     replies_filed: int
     replies_skipped: int
     replies_after_stop: int
@@ -155,6 +170,9 @@ class TickResult(BaseModel):
         return cls(
             project_id=project_id,
             sim_now=report.sim_now.isoformat(),
+            items_examined=report.items_examined,
+            items_researched=report.items_researched,
+            negotiations_opened=report.negotiations_opened,
             replies_filed=report.replies_filed,
             replies_skipped=report.replies_skipped,
             replies_after_stop=report.replies_after_stop,
@@ -184,6 +202,182 @@ async def healthz(request: Request) -> Health:
         token_backend=settings.token_backend.value,
         project=settings.gcp_project,
     )
+
+
+class CreateProject(BaseModel):
+    project_id: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{1,60}$")
+    title: str
+    budget_baseline: Money | None = None
+    sim_start: datetime | None = None
+    """Where simulated time starts. Defaults to real now, which is what live
+    mode means. Tests and seeded demos set it explicitly."""
+
+
+class ProjectCreated(BaseModel):
+    project_id: str
+    sim_now: str
+
+
+class UploadScript(BaseModel):
+    filename: str = "script.txt"
+    mime_type: str = "text/plain"
+    text_content: str = Field(min_length=1)
+
+
+class FoundProp(BaseModel):
+    """One prop, as offered back to the producer for confirmation."""
+
+    item_id: str
+    name: str
+    category: str
+    qty: int
+    consumable: bool
+    confidence: float
+    scenes: list[str]
+    lines: list[str]
+    """The script lines it was found in. The receipt."""
+
+
+class ScriptRead(BaseModel):
+    props: list[FoundProp]
+
+
+class ConfirmedItem(BaseModel):
+    item_id: str
+    qty: int = Field(ge=1, default=1)
+    include: bool = True
+    floor_price: Money | None = None
+
+
+class ConfirmItems(BaseModel):
+    items: list[ConfirmedItem]
+
+
+class ItemsConfirmed(BaseModel):
+    confirmed: list[str]
+    abandoned: list[str]
+
+
+@app.post("/projects", status_code=201)
+async def create_project(request: Request, body: CreateProject) -> ProjectCreated:
+    services = services_of(request)
+    real_now = services.clock.real_now()
+    sim_start = body.sim_start or real_now
+
+    try:
+        await services.repo.create_project(
+            body.project_id,
+            ProjectRecord(
+                title=body.title,
+                clock=initial_state(sim_start, real_now),
+                budget_baseline=body.budget_baseline,
+                created_at=sim_start,
+            ),
+        )
+    except AlreadyExists as exc:
+        raise HTTPException(
+            status_code=409, detail=f"project {body.project_id} already exists"
+        ) from exc
+
+    return ProjectCreated(project_id=body.project_id, sim_now=sim_start.isoformat())
+
+
+@app.post("/projects/{project_id}/script")
+async def upload_script(
+    request: Request, project_id: str, body: UploadScript
+) -> ScriptRead:
+    """Read a screenplay and offer back the physical things the scenes need.
+
+    Persists what it finds as ``DRAFT`` items, which are inert: nothing is
+    researched and nobody is emailed until a producer confirms the list. That
+    gap is the point — it is where a hallucinated prop gets caught, before it
+    turns into a real message to a real seller.
+    """
+    services = services_of(request)
+    if await services.repo.get_project(project_id) is None:
+        raise HTTPException(status_code=404, detail=f"no project {project_id}")
+
+    now = await services.clock.now(project_id)
+    drafts = await services.brain.extract_props(
+        ScriptSource(
+            filename=body.filename,
+            mime_type=body.mime_type,
+            text_content=body.text_content,
+        )
+    )
+
+    found: list[FoundProp] = []
+    for draft in drafts:
+        item_id = item_id_for(draft.name)
+        scenes = [m.scene_number for m in draft.mentions]
+        await services.repo.save_item(
+            project_id,
+            item_id,
+            ItemRecord(
+                name=draft.name,
+                category=draft.category,
+                scenes=scenes,
+                qty=draft.qty,
+                notes=draft.notes,
+                mentions=list(draft.mentions),
+                consumable=draft.consumable,
+                status=ItemStatus.DRAFT,
+                updated_at=now,
+            ),
+        )
+        found.append(
+            FoundProp(
+                item_id=item_id,
+                name=draft.name,
+                category=draft.category,
+                qty=draft.qty,
+                consumable=draft.consumable,
+                confidence=draft.confidence,
+                scenes=scenes,
+                lines=[m.line for m in draft.mentions],
+            )
+        )
+
+    return ScriptRead(props=found)
+
+
+@app.post("/projects/{project_id}/items/confirm")
+async def confirm_items(
+    request: Request, project_id: str, body: ConfirmItems
+) -> ItemsConfirmed:
+    """The producer signs off the list. Only now does anything start moving.
+
+    Quantity is set here rather than by the agent because a consumable prop
+    needs one per take, and only a person knows how many takes the schedule
+    allows. Everything left out is abandoned rather than deleted, so the
+    breakdown still shows what the script asked for and what was dropped.
+    """
+    services = services_of(request)
+    now = await services.clock.now(project_id)
+
+    confirmed: list[str] = []
+    abandoned: list[str] = []
+
+    for choice in body.items:
+        item = await services.repo.get_item(project_id, choice.item_id)
+        if item is None:
+            raise HTTPException(status_code=404, detail=f"no item {choice.item_id}")
+
+        item.updated_at = now
+        if choice.include:
+            item.qty = choice.qty
+            item.floor_price = choice.floor_price
+            item.status = ItemStatus.RESEARCHING
+            item.next_action_due_at = now
+            confirmed.append(choice.item_id)
+        else:
+            item.status = ItemStatus.ABANDONED
+            item.next_action_due_at = None
+            abandoned.append(choice.item_id)
+
+        await services.repo.save_item(project_id, choice.item_id, item)
+
+    return ItemsConfirmed(confirmed=confirmed, abandoned=abandoned)
 
 
 @app.post("/tick")

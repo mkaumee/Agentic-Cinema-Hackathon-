@@ -118,6 +118,22 @@ class ItemRecord(_Record):
     status: ItemStatus = ItemStatus.DRAFT
     chosen_quote: ExtractedQuote | None = None
 
+    supplier_ids: list[str] = Field(default_factory=list)
+    """Sellers research found *for this item*.
+
+    Suppliers are stored per project because one company often sells several
+    things, but negotiations are opened from this list rather than from every
+    supplier in the project — otherwise finding a lighting hire firm for the
+    SkyPanel would open a negotiation with them about the smoke machine too.
+    """
+
+    floor_price: Money | None = None
+    """The producer's ceiling, set when they confirm the item.
+
+    Lives on the item rather than only on each negotiation so that every seller
+    approached for it inherits the same limit, including ones opened later.
+    """
+
     next_action_due_at: datetime | None = None
     """Drives the item side of the tick, exactly as it does for negotiations.
 

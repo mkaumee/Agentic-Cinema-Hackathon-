@@ -216,6 +216,15 @@ class FirestoreRepository:
         ref = self._project_ref(project_id).collection(SUPPLIERS).document(supplier_id)
         _ = await ref.set(rec.to_firestore())
 
+    async def list_suppliers(self, project_id: str) -> dict[str, SupplierRecord]:
+        collection = self._project_ref(project_id).collection(SUPPLIERS)
+        found: dict[str, SupplierRecord] = {}
+        async for snapshot in collection.stream():
+            data = snapshot.to_dict()
+            if data is not None:
+                found[snapshot.id] = SupplierRecord.model_validate(data)
+        return found
+
     async def get_supplier(
         self, project_id: str, supplier_id: str
     ) -> SupplierRecord | None:

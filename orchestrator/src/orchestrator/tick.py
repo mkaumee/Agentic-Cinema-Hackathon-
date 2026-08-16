@@ -50,6 +50,7 @@ from orchestrator.clock import SimClock
 from orchestrator.mail import MailTransport, RawInbound
 from orchestrator.records import MessageRecord, NegotiationRecord
 from orchestrator.repository import DueNegotiation, FirestoreRepository
+from orchestrator.sourcing import SourcingLoop
 from orchestrator.state_machine import (
     NegotiationEvent,
     allowed_events,
@@ -96,6 +97,9 @@ class TickReport:
     """What one pass did. Returned to the caller and logged; never persisted."""
 
     sim_now: datetime
+    items_examined: int = 0
+    items_researched: int = 0
+    negotiations_opened: int = 0
     replies_filed: int = 0
     replies_skipped: int = 0
     replies_after_stop: int = 0
@@ -107,7 +111,13 @@ class TickReport:
 
     @property
     def did_something(self) -> bool:
-        return bool(self.replies_filed or self.messages_sent or self.escalated)
+        return bool(
+            self.replies_filed
+            or self.messages_sent
+            or self.escalated
+            or self.items_researched
+            or self.negotiations_opened
+        )
 
 
 class TickLoop:
@@ -121,6 +131,7 @@ class TickLoop:
     _clock: SimClock
     _brain: AgentBrain
     _mail: MailTransport
+    _sourcing: SourcingLoop
 
     def __init__(
         self,
@@ -133,6 +144,7 @@ class TickLoop:
         self._clock = clock
         self._brain = brain
         self._mail = mail
+        self._sourcing = SourcingLoop(repo, brain)
 
     async def run_tick(self, project_id: str, *, limit: int = 50) -> TickReport:
         now = await self._clock.advance(project_id)
@@ -140,6 +152,14 @@ class TickLoop:
 
         for raw in await self._mail.poll():
             await self._file_reply(raw, now, report)
+
+        # Items first, so a negotiation opened by this pass gets its opening
+        # email in the same pass rather than waiting a minute for the next one.
+        sourcing = await self._sourcing.run(now, limit=limit)
+        report.items_examined = sourcing.items_examined
+        report.items_researched = sourcing.researched
+        report.negotiations_opened = sourcing.negotiations_opened
+        report.errors.extend(sourcing.errors)
 
         for due in await self._repo.due_negotiations(now, limit=limit):
             await self._advance_negotiation(due, now, report)
