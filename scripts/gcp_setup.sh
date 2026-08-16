@@ -218,34 +218,62 @@ itself — being an admin on the *project* is not enough. Either get that role,
 or ask whoever owns the billing account to link it from
 Billing > My Projects > Link a billing account.
 
-Nothing further has been changed. Re-run this script once billing is on.
+$(printf '\033[1mMeanwhile, most of this does not need billing:\033[0m')
+
+  WITHOUT_BILLING=1 PROJECT_ID=$PROJECT_ID $0
+
+That does the Firestore databases, the agent service account and the scoped
+IAM binding, and skips only Secret Manager. Refresh tokens stay in the
+gitignored file backend, which is where they already are.
+
+It leaves nothing to redo — re-run the script normally once billing lands and
+it adds the missing pieces.
+
+Nothing further has been changed.
 
 EOF
-    [[ "${FORCE:-}" == "1" ]] || exit 4
-    printf '\033[33mFORCE=1 — continuing regardless.\033[0m\n'
+    [[ "${WITHOUT_BILLING:-}" == "1" || "${FORCE:-}" == "1" ]] || exit 4
     ;;
 esac
+
+if [[ "${WITHOUT_BILLING:-}" == "1" ]]; then
+  printf '\n\033[33mWITHOUT_BILLING=1 — skipping everything that needs a billing account.\033[0m\n'
+fi
 
 # ---------------------------------------------------------------------------
 
 say "APIs"
-# gmail.googleapis.com is listed for completeness; you have already enabled it.
-for api in \
-  firestore.googleapis.com \
-  secretmanager.googleapis.com \
-  run.googleapis.com \
-  cloudscheduler.googleapis.com \
-  artifactregistry.googleapis.com \
-  cloudbuild.googleapis.com \
-  gmail.googleapis.com
-do
-  if gcloud services list --enabled --format='value(config.name)' | grep -qx "$api"; then
+
+# Split by whether the API refuses to activate without a billing account.
+# Firestore and Gmail do not care, which is what makes the whole email loop
+# reachable on an unbilled project.
+FREE_APIS=(firestore.googleapis.com gmail.googleapis.com)
+BILLED_APIS=(
+  secretmanager.googleapis.com
+  run.googleapis.com
+  cloudscheduler.googleapis.com
+  artifactregistry.googleapis.com
+  cloudbuild.googleapis.com
+)
+
+apis=("${FREE_APIS[@]}")
+if [[ "${WITHOUT_BILLING:-}" != "1" ]]; then
+  apis+=("${BILLED_APIS[@]}")
+fi
+
+enabled_now=$(gcloud services list --enabled --format='value(config.name)')
+for api in "${apis[@]}"; do
+  if grep -qx "$api" <<<"$enabled_now"; then
     skip "$api"
   else
     gcloud services enable "$api" >/dev/null
     ok "$api"
   fi
 done
+
+if [[ "${WITHOUT_BILLING:-}" == "1" ]]; then
+  printf '  \033[90m·\033[0m skipped (need billing): %s\n' "${BILLED_APIS[*]}"
+fi
 
 # ---------------------------------------------------------------------------
 
@@ -299,21 +327,27 @@ else
   ok "datastore.user, conditioned to (default)"
 fi
 
-if gcloud secrets describe "$TOKEN_SECRET" >/dev/null 2>&1; then
-  skip "secret $TOKEN_SECRET"
+if [[ "${WITHOUT_BILLING:-}" == "1" ]]; then
+  printf '  \033[90m·\033[0m secret %s skipped — Secret Manager needs billing.\n' \
+    "$TOKEN_SECRET"
+  printf '    Keep CINEMA_TOKEN_BACKEND=file until it is on.\n'
 else
-  gcloud secrets create "$TOKEN_SECRET" --replication-policy=automatic >/dev/null
-  ok "secret $TOKEN_SECRET (no version yet — the bootstrap script adds one)"
-fi
+  if gcloud secrets describe "$TOKEN_SECRET" >/dev/null 2>&1; then
+    skip "secret $TOKEN_SECRET"
+  else
+    gcloud secrets create "$TOKEN_SECRET" --replication-policy=automatic >/dev/null
+    ok "secret $TOKEN_SECRET (no version yet — the bootstrap script adds one)"
+  fi
 
-if gcloud secrets get-iam-policy "$TOKEN_SECRET" --format=json \
-     | grep -q "$AGENT_EMAIL"; then
-  skip "secretAccessor on $TOKEN_SECRET"
-else
-  gcloud secrets add-iam-policy-binding "$TOKEN_SECRET" \
-    --member="serviceAccount:${AGENT_EMAIL}" \
-    --role="roles/secretmanager.secretAccessor" >/dev/null
-  ok "secretAccessor on $TOKEN_SECRET"
+  if gcloud secrets get-iam-policy "$TOKEN_SECRET" --format=json \
+       | grep -q "$AGENT_EMAIL"; then
+    skip "secretAccessor on $TOKEN_SECRET"
+  else
+    gcloud secrets add-iam-policy-binding "$TOKEN_SECRET" \
+      --member="serviceAccount:${AGENT_EMAIL}" \
+      --role="roles/secretmanager.secretAccessor" >/dev/null
+    ok "secretAccessor on $TOKEN_SECRET"
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -325,6 +359,12 @@ gcloud projects get-iam-policy "$PROJECT_ID" \
   --filter="bindings.members:serviceAccount:${AGENT_EMAIL}" \
   --format='table(bindings.role, bindings.condition.expression)'
 
+if [[ "${WITHOUT_BILLING:-}" == "1" ]]; then
+  TOKEN_LINE="CINEMA_TOKEN_BACKEND=file            # secret-manager once billing is on"
+else
+  TOKEN_LINE="CINEMA_TOKEN_BACKEND=secret-manager"
+fi
+
 cat <<EOF
 
 $(printf '\033[1mNext\033[0m')
@@ -332,16 +372,19 @@ $(printf '\033[1mNext\033[0m')
   1. Put these in your .env (see .env.example):
 
        CINEMA_GCP_PROJECT=$PROJECT_ID
-       CINEMA_TOKEN_BACKEND=secret-manager
+       $TOKEN_LINE
        CINEMA_REFRESH_TOKEN_SECRET=$TOKEN_SECRET
 
   2. Deploy the rules and indexes:
 
-       make deploy-rules
+       make deploy-rules PROJECT_ID=$PROJECT_ID
 
   3. Mint a Gmail refresh token — see docs/oauth-runbook.md:
 
        uv run python scripts/oauth_bootstrap.py
+
+     Gmail needs no billing. The live email round-trip — the last unproven
+     piece of Phase 1 — can be done today regardless of the billing situation.
 
   Not done here: Cloud Run and Cloud Scheduler. They cost money to leave
   running and there is nothing for a deployed ticker to tick until the script
