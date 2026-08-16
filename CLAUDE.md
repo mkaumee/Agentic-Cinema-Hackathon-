@@ -60,7 +60,7 @@ screenplay ──> extract_props ──> research_item ──> negotiate over Gm
 | ---------------- | ------- | ------------------------------------------------------------ |
 | `contracts/`     | shared  | The A/B interface. Changes require both sides to agree.       |
 | `main-agent/`    | Role A  | The brain. LLM reasoning only, as pure functions.             |
-| `orchestrator/`  | Role B  | Clock, Firestore, Gmail, state machine, tick loop.            |
+| `orchestrator/`  | Role B  | Clock, Firestore, Gmail, state machine, tick loop, approvals. |
 | `supplier-sim/`  | Role B  | Adversary simulator. A later test fixture, not product code.  |
 | `web/`           | Role B  | React + Vite + TypeScript front end.                          |
 
@@ -138,9 +138,17 @@ gcloud projects get-iam-policy $PROJECT --flatten='bindings[].members' \
 
 In code the same line is drawn twice: `FirestoreRepository` has no method that
 writes an order, and `OrdersRepository` is never constructed by the tick
-service. The approval endpoint must therefore run somewhere else — a separate
-service account, or the producer's browser under rules. It cannot be bolted
-onto the tick service without undoing all of this.
+service. Approval therefore lives somewhere else — `orchestrator/approvals.py`,
+a second ASGI app with its own composition root, deployed as its own Cloud Run
+service under the one account that does have a binding on `orders`. It cannot
+be bolted onto the tick service without undoing all of this, and a test asserts
+the tick app exposes no route matching `/approve` so that failure is loud.
+
+What the rules files still do is govern the producer's browser: one order per
+item, `approved_by` matching the caller, no updates and no deletes ever.
+`make rules-test` executes both files against the emulator — the only thing in
+the repo that does, since everything else reaches Firestore through the admin
+SDK and bypasses them.
 
 ## Money and units
 

@@ -53,34 +53,35 @@ Verified, not assumed — every claim below is covered by a test in the repo.
 | `scripts/check_no_wallclock.py` — AST guard + its own tests | Done |
 | `orchestrator/state_machine.py` | Done, `ORDERED` proven unreachable by agent |
 | `orchestrator/records.py`, `repository.py` | Done, emulator-tested |
-| `firestore.rules`, `firestore.orders.rules`, indexes | **Written, rules untested** |
+| `firestore.rules`, `firestore.orders.rules`, indexes | Done, both files executed by `make rules-test` |
 | GCP setup script, two-database split | Done; script not yet run against a real project |
 | `orchestrator/mail.py` — transport seam + in-memory impl | Done |
 | `orchestrator/tick.py` — the loop | Done, kill-mid-run tested |
 | `scripts/run_e2e.py` / `make e2e` | Green, ends with 0 purchase orders |
+| `orchestrator/auth.py`, `approvals.py`, `scripts/grant_producer.py` | Done, emulator-tested |
 | **Phase 1** — settings, Gmail transport, HTTP service, OAuth bootstrap, runbook, CI | Done |
 | **Phase 2** — script upload, prop confirmation, research, negotiation creation | Done |
+| **Phase 4** — auth, approval service, rules tests | Done |
 
-156 tests. 46 of them need the Firestore emulator and skip without it; CI fails
-the build if they skip there.
+208 Python tests, 93 of which need an emulator and skip without one, plus 22
+rules tests in `web/`. CI fails the build if any Python test skips there, since
+a green run that skipped the guardrail tests is worse than a red one.
 
 **Not started**
 
-Deploy config, no Dockerfile (Phase 3) · auth and the approval endpoint
-(Phase 4) · `web/`, still empty (Phases 5–6) · `supplier-sim/`, scaffolding
-only (later).
+Deploy config, no Dockerfile (Phase 3) · `web/` has rules tests but no app yet
+(Phases 5–6) · `supplier-sim/`, scaffolding only (later).
 
 **Known debts, carried deliberately**
 
-- `firestore.rules` has no tests. The `create()` uniqueness guarantee is proven
-  in Python, but the admin SDK bypasses rules, so the rules themselves are
-  unverified → Phase 4. Note this is not a gap in the *agent* guardrail: rules
-  never constrained the agent at all, which is why orders moved to their own
-  database. Rules only govern the producer's browser path.
 - firebase-tools 15 does not load rules from the multi-database array form in
-  `firebase.json`, so the emulator now runs open. Harmless today — our Python
-  tests use the admin SDK and bypass rules regardless — and Phase 4's rules
-  tests load each file explicitly rather than through `firebase.json`.
+  `firebase.json`, so the emulator runs open. Harmless: the Python tests use the
+  admin SDK and bypass rules regardless, and the rules tests load each file
+  explicitly by path rather than through `firebase.json`.
+- The approval service is not deployed. It needs its own Cloud Run service and
+  its own service account — the one identity with an IAM binding on the orders
+  database — and that needs billing → Phase 3. Until then the split is real in
+  code and in tests but not yet in infrastructure.
 - Nothing protects against two ticks overlapping → Phase 3.
 - `/tick` is unauthenticated. It gets Scheduler OIDC and private ingress in
   Phase 3; a home-grown shared secret in the meantime would look like
@@ -231,11 +232,21 @@ we do not get back.
 
 - `Dockerfile` for `orchestrator` — build from repo root so the `contracts`
   path dependency resolves.
-- Cloud Run service. Min instances 0 is fine; the loop is killable by design.
-- Cloud Scheduler → `POST /tick` every minute with OIDC auth.
+- **Two** Cloud Run services from that one image, differing only in entrypoint
+  and service account:
+  - `orchestrator.app:app` as the tick account — `roles/datastore.user` on
+    `(default)` and **nothing at all** on `orders`.
+  - `orchestrator.approvals:app` as the approvals account — the only identity
+    in the system with a binding on `orders`.
+  Same image on purpose: one build, one set of dependencies, and the boundary
+  is the IAM grant rather than a fork of the code. Getting the accounts the
+  wrong way round is the one deployment mistake that silently undoes Phase 4,
+  so verify with `gcloud projects get-iam-policy` after deploying.
+- Cloud Scheduler → `POST /tick` every minute with OIDC auth. Nothing schedules
+  the approval service; it is called by a person.
 - Secret Manager for refresh tokens; service account with **no** `producer`
   claim.
-- Deploy `firestore.rules` and `firestore.indexes.json`.
+- Deploy both rules files and `firestore.indexes.json`.
 - Structured JSON logging of each `TickReport`.
 
 **Watch out for**
@@ -255,38 +266,47 @@ that advanced without anyone touching it.
 
 ---
 
-## Phase 4 — The money path
+## Phase 4 — The money path — DONE
 
 **Goal.** A human can approve a purchase, and nothing else can.
 
-**Build**
+**Shipped.** `orchestrator/auth.py` (Firebase ID token + `producer` claim),
+`orchestrator/approvals.py` (a second ASGI app with `approve`, `floor` and
+`cancel`), `scripts/grant_producer.py`, and `web/tests/rules.test.ts` — the
+first thing in the repo that has ever executed the rules files.
 
-- Firebase Auth, plus a small admin script that sets the `producer` custom
-  claim on a user.
-- `POST /items/{item_id}/approve` — verifies the ID token and the `producer`
-  claim, creates the purchase order via `create()`, transitions the negotiation
-  `READY_FOR_HUMAN → ORDERED`.
-  **This cannot live in the tick service.** That service's account has no IAM
-  binding on the orders database, which is the whole guardrail. Approval runs
-  as a separate service account, or straight from the producer's browser where
-  rules apply. Bolting it onto `app.py` would quietly undo the split.
-- `POST /negotiations/{nid}/floor` — the producer sets a floor and hands the
-  negotiation back (`HUMAN_RETURNED_WITH_FLOOR → NEGOTIATING`).
-- `POST /negotiations/{nid}/cancel` → `DEAD`.
-- **Rules tests** in `web/` using `@firebase/rules-unit-testing`:
-  - an agent identity (no `producer` claim) cannot create a purchase order
-  - a producer can, exactly once
-  - update and delete are refused for everyone, including producers
-  - both rules files are loaded explicitly; `firebase.json` is not consulted
-  - a payload whose `item_id` disagrees with the document key is refused
-  - negotiation messages cannot be rewritten
+**Two things came out differently from the sketch above.**
 
-**Done when.** The rules tests pass, and an approval attempt made with the
-agent's own credentials is refused by Firestore rather than by our code.
+*A separate app, not a separate account on the same app.* The plan said
+approval "cannot live in the tick service" and left the shape open. It is now a
+second `FastAPI()` instance with its own composition root, deployed as its own
+Cloud Run service under its own account. `test_app.py` asserts the tick app
+exposes no route matching `/approve` and holds no client for the orders
+database, so the split fails the build rather than eroding quietly.
 
-**Watch out for.** This is the phase where the strongest claim in the project
-stops being "we wrote it carefully" and becomes "here is the test". Do not let
-it slide to demo week.
+*Idempotency turned out to be the subtle part.* Approving writes to two
+databases with no transaction across them, so the order goes first: a crash
+between the writes leaves a real order and a negotiation still reading
+`READY_FOR_HUMAN`, which a retry can finish. The other order would leave
+something that looks bought and is not.
+
+But the retry and the guardrail both arrive as `DuplicateOrderError` and mean
+opposite things — same negotiation is a retry to complete, a different one is
+the second-supplier violation to refuse. Conflating them would either break
+retries or turn the guardrail into a shrug. Both directions have tests, and
+removing the discrimination fails exactly the two guardrail tests and nothing
+else.
+
+**Done when — met.** `make rules-test` runs both rules files, and an approval
+attempted by a signed-in identity with no `producer` claim is refused by
+Firestore. Deliberately mutating three rules (letting a signed-in caller
+create an order, reopening `update, delete`, and dropping the `ORDERED` guard
+on negotiations) fails five tests, so the suite is load-bearing rather than
+decorative.
+
+**Not in this phase.** Deploying the approval service — it needs billing and
+belongs with Phase 3's Cloud Run work. Until then the two-account split is real
+in code and in tests, but there is one process running both in development.
 
 ---
 
@@ -297,6 +317,9 @@ it slide to demo week.
 **Build.** React + Vite + TS, Firebase JS SDK, `onSnapshot` from the first
 line. One read-only screen: negotiations with state, next due time, latest
 quote, round count, message count, escalation reason. No design work at all.
+
+`web/` already exists with `package.json`, `tsconfig.json` and vitest — Phase 4
+put the rules tests there. Extend it; do not start a second npm project.
 
 **Done when.** A tick changes the screen with no refresh and no polling code.
 
