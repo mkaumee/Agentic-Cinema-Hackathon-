@@ -59,15 +59,16 @@ Verified, not assumed — every claim below is covered by a test in the repo.
 | `orchestrator/tick.py` — the loop | Done, kill-mid-run tested |
 | `scripts/run_e2e.py` / `make e2e` | Green, ends with 0 purchase orders |
 | **Phase 1** — settings, Gmail transport, HTTP service, OAuth bootstrap, runbook, CI | Done |
+| **Phase 2** — script upload, prop confirmation, research, negotiation creation | Done |
 
 156 tests. 46 of them need the Firestore emulator and skip without it; CI fails
 the build if they skip there.
 
 **Not started**
 
-Script upload → items → research → negotiation creation (Phase 2) · deploy
-config, no Dockerfile (Phase 3) · auth and the approval endpoint (Phase 4) ·
-`web/`, still empty (Phases 5–6) · `supplier-sim/`, scaffolding only (later).
+Deploy config, no Dockerfile (Phase 3) · auth and the approval endpoint
+(Phase 4) · `web/`, still empty (Phases 5–6) · `supplier-sim/`, scaffolding
+only (later).
 
 **Known debts, carried deliberately**
 
@@ -164,9 +165,24 @@ negotiation by thread ID. `make e2e` still green.
 
 ---
 
-## Phase 2 — Close the front half: script to negotiations
+## Phase 2 — Close the front half: script to negotiations — DONE
 
 **Goal.** An uploaded screenplay becomes live negotiations with no hand-seeding.
+
+**Shipped.** `POST /projects`, `POST /projects/{id}/script`,
+`POST /projects/{id}/items/confirm`, and `sourcing.py` running off a second
+due-queue on items — the same killable pattern negotiations use, rather than a
+background job with its own recovery story.
+
+`run_e2e.py` now starts from a screenplay. It used to create items, suppliers
+and negotiations itself, which is exactly why this gap stayed invisible: the
+test worked around the missing piece and the pipeline looked complete.
+
+Ids are derived rather than generated throughout — items from the prop name,
+suppliers from the email, negotiations from the item-supplier pair. That makes
+re-uploading a revised draft update rather than duplicate, and makes a tick
+killed midway through opening negotiations collide with its own earlier writes
+instead of emailing those sellers twice.
 
 **Why here.** This is the biggest hole in the system right now. `run_e2e.py`
 seeds items, suppliers and negotiations by hand because **nothing turns a
