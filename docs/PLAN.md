@@ -368,4 +368,22 @@ building.
   conversation available right now.
 - **Who publishes the OAuth consent screen**, and when. Blocks Phase 1 closing
   properly; testing-mode tokens will not survive a real negotiation.
-- **GCP project and billing.** Nothing in Phase 3 can start without it.
+- **Project access.** You were added to the project as a service admin, which
+  grants `iam.serviceAccounts.create` and little else that the setup needs.
+  `scripts/gcp_setup.sh` runs a preflight and names the exact roles to request;
+  expect four:
+
+      roles/serviceusage.serviceUsageAdmin
+      roles/datastore.owner
+      roles/secretmanager.admin
+      roles/resourcemanager.projectIamAdmin
+
+  The last one is not optional cosmetics. It is what lets the agent's service
+  account be granted `(default)` and denied `orders`. Without it the database
+  split is a convention in our code rather than something Google enforces, and
+  the strongest claim the project makes stops being true. `roles/editor` does
+  not include it.
+
+  If broad roles are a hard sell, the cheaper ask is for the project owner to
+  run `scripts/gcp_setup.sh` once themselves — it is idempotent, self-contained
+  and changes nothing else.

@@ -71,7 +71,87 @@ AGENT_EMAIL="${AGENT_SA}@${PROJECT_ID}.iam.gserviceaccount.com"
 
 say "Project"
 gcloud config set project "$PROJECT_ID" >/dev/null 2>&1
-ok "$PROJECT_ID"
+ok "$PROJECT_ID  (as $(gcloud config get-value account 2>/dev/null))"
+
+# ---------------------------------------------------------------------------
+# Preflight
+# ---------------------------------------------------------------------------
+#
+# Ask Google what this account may actually do, before changing anything.
+#
+# Worth the extra call: without it the script fails partway through and leaves
+# a project in a state nobody can describe — some APIs on, one database
+# created, no IAM binding. Being told the whole list up front means one access
+# request instead of five.
+
+declare -a NEEDED=(
+  "serviceusage.services.enable|enable the APIs|roles/serviceusage.serviceUsageAdmin"
+  "datastore.databases.create|create the two Firestore databases|roles/datastore.owner"
+  "iam.serviceAccounts.create|create the agent service account|roles/iam.serviceAccountAdmin"
+  "resourcemanager.projects.setIamPolicy|grant the agent its scoped role — THE GUARDRAIL|roles/resourcemanager.projectIamAdmin"
+  "secretmanager.secrets.create|create the refresh-token secret|roles/secretmanager.admin"
+)
+
+say "Preflight — what this account can do"
+
+perms=$(printf '%s\n' "${NEEDED[@]}" | cut -d'|' -f1 | paste -sd,)
+if ! probe=$(gcloud projects test-iam-permissions "$PROJECT_ID" \
+       --permissions="$perms" --format='value(permissions)' 2>&1); then
+  # Distinguish "you may not do these things" from "I could not even ask",
+  # which usually means the project id is wrong or gcloud is signed in as
+  # someone with no access to it at all.
+  echo "  Could not query permissions on $PROJECT_ID:" >&2
+  printf '    %s\n' "$probe" >&2
+  echo "  Check the project id and that gcloud is signed in as the right account." >&2
+  exit 3
+fi
+granted=" $(tr '\n' ' ' <<<"$probe") "
+
+missing=0
+declare -a ASK_FOR=()
+for entry in "${NEEDED[@]}"; do
+  perm="${entry%%|*}"
+  rest="${entry#*|}"
+  what="${rest%%|*}"
+  role="${rest##*|}"
+  if [[ "$granted" == *" $perm "* ]]; then
+    ok "$what"
+  else
+    printf '  \033[31m✗\033[0m %s\n' "$what"
+    ASK_FOR+=("$role")
+    missing=$((missing + 1))
+  fi
+done
+
+if (( missing > 0 )); then
+  # shellcheck disable=SC2207
+  unique_roles=($(printf '%s\n' "${ASK_FOR[@]}" | sort -u))
+  cat <<EOF
+
+$(printf '\033[1m%s permission(s) missing.\033[0m' "$missing") Nothing has been changed.
+
+Ask whoever owns the project to grant these on $PROJECT_ID:
+
+$(printf '  %s\n' "${unique_roles[@]}")
+
+  gcloud projects add-iam-policy-binding $PROJECT_ID \\
+    --member="user:\$YOUR_EMAIL" \\
+$(printf '    --role=%s \\\n' "${unique_roles[@]}" | sed '$ s/ \\$//')
+
+If roles/resourcemanager.projectIamAdmin is in that list, read this before
+asking for a substitute: it is the one that lets the agent's service account be
+granted access to (default) and denied access to orders. Without it the split
+between the two databases is a convention in our code rather than something
+Google enforces, and the strongest claim this project makes stops being true.
+roles/editor does NOT include it.
+
+Re-run this script once the roles land. It is idempotent.
+Set FORCE=1 to attempt anyway and see the raw errors.
+
+EOF
+  [[ "${FORCE:-}" == "1" ]] || exit 3
+  printf '\033[33mFORCE=1 — continuing regardless.\033[0m\n'
+fi
 
 # ---------------------------------------------------------------------------
 
