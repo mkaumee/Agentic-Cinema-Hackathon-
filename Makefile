@@ -1,6 +1,10 @@
 # Everything here runs offline. No GCP credentials, no live project.
 
-.PHONY: help setup fmt lint types guard test rules-test check emulator e2e clean gcp-setup deploy-rules
+# `test-all` pipes pytest through tee and needs the pipeline's exit status, not
+# tee's. /bin/sh is dash on Debian and has no `pipefail`, so ask for bash.
+SHELL := /bin/bash
+
+.PHONY: help setup fmt lint types guard test test-all rules-test check emulator e2e clean gcp-setup deploy-rules
 
 help:
 	@grep -E '^[a-z-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
@@ -23,8 +27,23 @@ types: ## Type-check
 guard: ## Fail if anything outside the clock module reads real time
 	uv run python scripts/check_no_wallclock.py
 
-test: ## Unit tests
+test: ## Unit tests, fast. Skips anything needing an emulator.
 	uv run pytest -q
+
+# What CI runs, and what `check` runs. The emulators are booted here rather
+# than assumed, and a skip is a failure: the emulator-backed tests skip
+# themselves when nothing is listening, which is right for the inner loop above
+# and unacceptable in a gate. A green run that quietly skipped every guardrail
+# test looks like coverage.
+test-all: ## Every test, with the emulators up. Fails if any test skips.
+	@set -o pipefail; \
+	firebase emulators:exec --only firestore,auth --project demo-cinema \
+		"uv run pytest -q" 2>&1 | tee .pytest-all.out; \
+	if grep -qE "[0-9]+ skipped" .pytest-all.out; then \
+		echo "FAIL: tests skipped — an emulator did not come up."; \
+		rm -f .pytest-all.out; exit 1; \
+	fi; \
+	rm -f .pytest-all.out
 
 # Runs the rules files themselves. The Python suite goes through the admin SDK,
 # which bypasses security rules entirely, so this is the only thing in the repo
@@ -35,7 +54,7 @@ rules-test: ## Execute firestore.rules and firestore.orders.rules
 	firebase emulators:exec --only firestore --project demo-cinema \
 		"cd web && npm test"
 
-check: lint types guard test rules-test ## Everything that must pass before a merge
+check: lint types guard test-all rules-test ## Everything that must pass before a merge
 
 emulator: ## Start the Firestore + Auth emulators (leave running while you work)
 	firebase emulators:start --only firestore,auth --project demo-cinema

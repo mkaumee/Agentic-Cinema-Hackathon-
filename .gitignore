@@ -49,3 +49,4 @@ emulator-data/
 .idea/
 .vscode/
 *.swp
+.pytest-all.out
