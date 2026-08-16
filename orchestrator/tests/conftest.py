@@ -15,6 +15,7 @@ actually execute.
 
 import os
 from collections.abc import AsyncIterator, Iterator
+from typing import ClassVar
 
 import httpx
 import pytest
@@ -131,6 +132,8 @@ class TokenMinter:
     the signature check, but every other claim is checked for real.
     """
 
+    PASSWORD: ClassVar[str] = "correct-horse-battery-staple"
+
     _base: str
     _key: str
 
@@ -138,41 +141,56 @@ class TokenMinter:
         self._base = f"http://{AUTH_HOST}/identitytoolkit.googleapis.com/v1"
         self._key = api_key
 
-    def mint(self, email: str, *, role: str = "") -> str:
-        """Create a user, optionally make them a producer, return their token.
+    def create(self, email: str) -> str:
+        """Sign a new user up. Returns their uid."""
+        response = httpx.post(
+            f"{self._base}/accounts:signUp",
+            params={"key": self._key},
+            json={
+                "email": email,
+                "password": self.PASSWORD,
+                "returnSecureToken": True,
+            },
+            timeout=10.0,
+        )
+        _ = response.raise_for_status()
+        uid: str = response.json()["localId"]
+        return uid
 
-        The claim has to be set between signup and sign-in: custom claims are
-        baked into the token when it is issued, so a token minted before the
-        claim was set would not carry it.
+    def sign_in(self, email: str) -> str:
+        """Get a fresh ID token for an existing user.
+
+        Separate from ``create`` because whatever claims a user has are baked
+        into the token at issue time. Testing that a claim granted after signup
+        actually reaches the API means signing in again afterwards, which is the
+        same thing a real producer has to do.
         """
+        response = httpx.post(
+            f"{self._base}/accounts:signInWithPassword",
+            params={"key": self._key},
+            json={
+                "email": email,
+                "password": self.PASSWORD,
+                "returnSecureToken": True,
+            },
+            timeout=10.0,
+        )
+        _ = response.raise_for_status()
+        token: str = response.json()["idToken"]
+        return token
+
+    def mint(self, email: str, *, role: str = "") -> str:
+        """Create a user, optionally give them a role, return their token."""
         import firebase_admin
         from firebase_admin import auth as firebase_auth
 
-        password = "correct-horse-battery-staple"
-        signup = httpx.post(
-            f"{self._base}/accounts:signUp",
-            params={"key": self._key},
-            json={"email": email, "password": password, "returnSecureToken": True},
-            timeout=10.0,
-        )
-        _ = signup.raise_for_status()
-        uid: str = signup.json()["localId"]
-
+        uid = self.create(email)
         if role:
             assert firebase_admin._apps, (  # pyright: ignore[reportPrivateUsage]
                 "init_firebase must run before setting custom claims"
             )
             firebase_auth.set_custom_user_claims(uid, {"role": role})
-
-        signin = httpx.post(
-            f"{self._base}/accounts:signInWithPassword",
-            params={"key": self._key},
-            json={"email": email, "password": password, "returnSecureToken": True},
-            timeout=10.0,
-        )
-        _ = signin.raise_for_status()
-        token: str = signin.json()["idToken"]
-        return token
+        return self.sign_in(email)
 
 
 @pytest.fixture
