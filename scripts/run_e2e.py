@@ -40,12 +40,13 @@ from orchestrator.records import (
     ProjectRecord,
     SupplierRecord,
 )
-from orchestrator.repository import FirestoreRepository
+from orchestrator.repository import FirestoreRepository, OrdersRepository
 from orchestrator.tick import TickLoop
 
 EMULATOR_HOST = os.environ.get("FIRESTORE_EMULATOR_HOST", "127.0.0.1:8080")
 PROJECT_ID = os.environ.get("FIRESTORE_PROJECT_ID", "demo-cinema")
 PID = "e2e-project"
+ORDERS_DATABASE = "orders"
 
 SIM_START = datetime(2026, 3, 1, 9, 0, tzinfo=UTC)
 REAL_ANCHOR = datetime(2026, 8, 12, 14, 0, tzinfo=UTC)
@@ -118,12 +119,19 @@ ITEMS = [
 ]
 
 
-def _wipe() -> None:
-    url = (
+def _wipe(database: str) -> None:
+    """Empty one database. Both need clearing independently.
+
+    Wiping only (default) would leave a purchase order behind in `orders`, and
+    the final assertion of this run is that no order exists — a stale one would
+    fail it for the wrong reason, or worse, a missing wipe would let a real bug
+    hide behind a clean-looking run.
+    """
+    _ = httpx.delete(
         f"http://{EMULATOR_HOST}/emulator/v1/projects/{PROJECT_ID}"
-        f"/databases/(default)/documents"
+        f"/databases/{database}/documents",
+        timeout=10.0,
     )
-    _ = httpx.delete(url, timeout=10.0)
 
 
 def _emulator_up() -> bool:
@@ -183,10 +191,20 @@ async def run() -> int:
         return 2
 
     os.environ["FIRESTORE_EMULATOR_HOST"] = EMULATOR_HOST
-    _wipe()
+    _wipe("(default)")
+    _wipe(ORDERS_DATABASE)
 
     client = AsyncClient(project=PROJECT_ID, credentials=AnonymousCredentials())
+    # A second client, on the database the tick loop has no access to. The loop
+    # below is never handed this one — it exists purely so the final check can
+    # look at where orders would land if the guardrail ever failed.
+    orders_client = AsyncClient(
+        project=PROJECT_ID,
+        credentials=AnonymousCredentials(),
+        database=ORDERS_DATABASE,
+    )
     repo = FirestoreRepository(client)
+    orders = OrdersRepository(orders_client)
     clock = SimClock(repo, FrozenRealTime(REAL_ANCHOR))
     mail = InMemoryMailbox()
     loop = TickLoop(repo, clock, ScriptedBrain(), mail)
@@ -227,12 +245,15 @@ async def run() -> int:
 
             moment += timedelta(hours=HOURS_PER_TICK)
 
-        return await verify(repo, mail)
+        return await verify(repo, orders, mail)
     finally:
         client.close()
+        orders_client.close()
 
 
-async def verify(repo: FirestoreRepository, mail: InMemoryMailbox) -> int:
+async def verify(
+    repo: FirestoreRepository, orders: OrdersRepository, mail: InMemoryMailbox
+) -> int:
     negotiations = await repo.list_negotiations(PID)
 
     print("\n  final state")
@@ -259,7 +280,7 @@ async def verify(repo: FirestoreRepository, mail: InMemoryMailbox) -> int:
     }:
         failures.append(f"the ghost negotiation hung in {ghost.state.value}")
 
-    ordered = await repo.total_ordered()
+    ordered = await orders.total_ordered()
     if ordered is not None:
         failures.append(f"the agent created a purchase order: {ordered}")
 

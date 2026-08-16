@@ -34,7 +34,7 @@ from orchestrator.records import (
     ProjectRecord,
     SupplierRecord,
 )
-from orchestrator.repository import FirestoreRepository
+from orchestrator.repository import FirestoreRepository, OrdersRepository
 from orchestrator.tick import TickLoop
 
 PID = "proj1"
@@ -303,7 +303,9 @@ async def test_a_supplier_who_keeps_emailing_after_the_stop_changes_nothing(
 # --------------------------------------------------------------------------- #
 
 
-async def test_a_full_run_never_creates_a_purchase_order(harness: _Harness) -> None:
+async def test_a_full_run_never_creates_a_purchase_order(
+    harness: _Harness, orders_firestore: AsyncClient
+) -> None:
     """Drive a negotiation all the way to its stop and check the database.
 
     Asserted against ``purchase_orders`` rather than against the state field,
@@ -323,8 +325,12 @@ async def test_a_full_run_never_creates_a_purchase_order(harness: _Harness) -> N
         moment += timedelta(hours=6)
 
     assert await harness.state_of() is NegotiationState.READY_FOR_HUMAN
-    assert await harness.repo.get_purchase_order("item1") is None
-    assert await harness.repo.total_ordered() is None
+
+    # Checked against the orders database, which the tick loop has no client
+    # for and no method to reach. If this ever fails, the separation is gone.
+    orders = OrdersRepository(orders_firestore)
+    assert await orders.get_purchase_order("item1") is None
+    assert await orders.total_ordered() is None
 
 
 async def test_an_attachment_escalates_rather_than_guessing(harness: _Harness) -> None:

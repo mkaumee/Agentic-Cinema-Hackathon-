@@ -65,6 +65,24 @@ class Settings(BaseSettings):
     agent_email: str = "agent@example.invalid"
     agent_display_name: str = "Agentic Cinema"
 
+    # -- databases ---------------------------------------------------------- #
+
+    default_database: str = "(default)"
+    """Projects, items, suppliers, negotiations, messages."""
+
+    orders_database: str = "orders"
+    """Purchase orders, and nothing else.
+
+    A separate database because Firestore security rules do not apply to server
+    SDKs, and Firestore IAM has no collection-level granularity. Those two facts
+    together mean a single database cannot express "this service account may
+    write negotiations but not orders" — ``roles/datastore.user`` is all or
+    nothing across a database.
+
+    So the boundary is the database. The tick service is granted access to
+    ``default_database`` only, and never constructs a client for this one.
+    """
+
     # -- transports -------------------------------------------------------- #
 
     mail_backend: MailBackend = MailBackend.MEMORY

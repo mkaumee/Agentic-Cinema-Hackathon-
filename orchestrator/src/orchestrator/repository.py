@@ -319,9 +319,43 @@ class FirestoreRepository:
                 found.append(MessageRecord.model_validate(data))
         return found
 
-    # ------------------------------------------------------------------ #
-    # Purchase orders — the guardrail
-    # ------------------------------------------------------------------ #
+    # Purchase orders are deliberately absent from this class. They live in
+    # OrdersRepository, against a different database. See its docstring.
+
+
+class OrdersRepository:
+    """Purchase orders. A separate class against a separate database.
+
+    ## Why this is not a method on FirestoreRepository
+
+    Two facts about Firestore, which only bite once deployed:
+
+    1. **Security rules do not apply to server SDKs.** They govern the Firebase
+       client SDKs — a browser holding a Firebase Auth token. A service account
+       going through ``google-cloud-firestore`` bypasses ``firestore.rules``
+       entirely, so a rule denying order writes constrains a producer's browser
+       and constrains nothing whatsoever about the agent.
+    2. **Firestore IAM has no collection-level granularity.**
+       ``roles/datastore.user`` is all or nothing across a whole database.
+
+    Together those mean a single database simply cannot express "this service
+    account may write negotiations but not purchase orders". The smallest thing
+    IAM can talk about is a database, so the boundary has to be a database.
+
+    The tick service is granted access to ``(default)`` under an IAM condition
+    and never constructs a client for this one. That makes Hard Rule 5 an
+    infrastructure fact you can check with a single ``gcloud`` command, rather
+    than a promise about our own code.
+
+    Splitting the class as well as the database is belt and braces: the tick
+    loop is handed a ``FirestoreRepository``, which has no method that could
+    write an order even if the IAM binding were wrong.
+    """
+
+    _db: AsyncClient
+
+    def __init__(self, client: AsyncClient) -> None:
+        self._db = client
 
     async def create_purchase_order(self, rec: PurchaseOrderRecord) -> None:
         """File a purchase order, or refuse because one already exists.
