@@ -59,18 +59,24 @@ Verified, not assumed — every claim below is covered by a test in the repo.
 | `orchestrator/tick.py` — the loop | Done, kill-mid-run tested |
 | `scripts/run_e2e.py` / `make e2e` | Green, ends with 0 purchase orders |
 | `orchestrator/auth.py`, `approvals.py`, `scripts/grant_producer.py` | Done, emulator-tested |
+| `orchestrator/logs.py` — JSON for Cloud Logging | Done |
+| Row claiming — overlapping ticks cannot double-email | Done, proven by a concurrent test |
+| `Dockerfile` | Written; **built and smoke-tested by CI**, never by hand |
+| `scripts/deploy.sh` | Written; **never run** — needs billing |
 | **Phase 1** — settings, Gmail transport, HTTP service, OAuth bootstrap, runbook, CI | Done |
 | **Phase 2** — script upload, prop confirmation, research, negotiation creation | Done |
 | **Phase 4** — auth, approval service, rules tests | Done |
+| **Phase 3** — the code half | Done. The deploy itself is blocked on billing |
 
-208 Python tests, 93 of which need an emulator and skip without one, plus 22
-rules tests in `web/`. CI fails the build if any Python test skips there, since
-a green run that skipped the guardrail tests is worse than a red one.
+228 Python tests, plus 22 rules tests in `web/`. CI fails the build if any
+Python test skips, since a green run that skipped the guardrail tests is worse
+than a red one — `make check` runs the same `test-all` target for that reason,
+so a green laptop and a green CI mean the same thing.
 
 **Not started**
 
-Deploy config, no Dockerfile (Phase 3) · `web/` has rules tests but no app yet
-(Phases 5–6) · `supplier-sim/`, scaffolding only (later).
+The deploy itself (Phase 3, blocked on billing) · `web/` has rules tests but no
+app yet (Phases 5–6) · `supplier-sim/`, scaffolding only (later).
 
 **Known debts, carried deliberately**
 
@@ -78,17 +84,23 @@ Deploy config, no Dockerfile (Phase 3) · `web/` has rules tests but no app yet
   `firebase.json`, so the emulator runs open. Harmless: the Python tests use the
   admin SDK and bypass rules regardless, and the rules tests load each file
   explicitly by path rather than through `firebase.json`.
-- The approval service is not deployed. It needs its own Cloud Run service and
-  its own service account — the one identity with an IAM binding on the orders
-  database — and that needs billing → Phase 3. Until then the split is real in
-  code and in tests but not yet in infrastructure.
-- Nothing protects against two ticks overlapping → Phase 3.
-- `/tick` is unauthenticated. It gets Scheduler OIDC and private ingress in
-  Phase 3; a home-grown shared secret in the meantime would look like
-  protection without being any.
+- **Nothing is deployed.** Both services, the Scheduler job and the second
+  service account are written into `scripts/deploy.sh` and none of it has ever
+  executed — no billing, and no `gcloud` on the machine it was written on.
+  Assume the first run needs fixing. The image half is verified: CI builds it
+  and curls `/healthz` on every push.
+- `/tick` is still unauthenticated *in code*. The protection is deployment-side
+  — private ingress plus a Scheduler OIDC token, both in `deploy.sh` — so it is
+  real only once deployed. A home-grown shared secret in the meantime would
+  look like protection without being any.
 - The live email round-trip is unproven — it needs two mailboxes and a consent
   screen that do not exist yet. The transport is covered offline; the runbook
   is the checklist.
+- Contention on a hot item can abort one of two concurrent writes
+  (`409 Transaction lock timeout` from Firestore). The work is not lost: the
+  row is claimed, the error is reported, and the lease brings it back. Both
+  halves have tests. If it ever becomes common rather than occasional, the
+  answer is fewer overlapping ticks, not a retry loop.
 
 ---
 
@@ -219,7 +231,7 @@ emails go out to researched suppliers. No hand-seeded documents anywhere.
 
 ---
 
-## Phase 3 — Deploy, and start the clock for real
+## Phase 3 — Deploy, and start the clock for real — CODE DONE, DEPLOY BLOCKED
 
 **Goal.** Cloud Scheduler ticking every minute against a real project, with a
 real negotiation in flight.
@@ -227,6 +239,47 @@ real negotiation in flight.
 **Why here.** See the constraint at the top. The day this ships is the day
 elapsed time starts counting for us. Every day it slips is a day of negotiation
 we do not get back.
+
+**Shipped.** Row claiming in `repository.py`, `logs.py`, the `Dockerfile`, and
+`scripts/deploy.sh`. Everything that can be proven without billing is proven;
+the deploy is the only thing left, and it is waiting on an account link rather
+than on code.
+
+**The bug that turned out to be the point of this phase.** `/tick` was about to
+be called every 60 seconds by something that does not wait for the previous
+call to finish. Two overlapping ticks would both read the same due negotiation,
+both ask the brain, and **both email the supplier** — indistinguishable, from
+the seller's inbox, from the pestering bug already fixed in `tick.py`, and with
+an entirely different cause.
+
+Everything else in the loop was already safe by accident of design: filing a
+reply, opening a negotiation and writing an order are all `create()` against a
+derived key. Sending an email was the one uncovered path, and researching an
+item was the one expensive one.
+
+The fix is a compare-and-swap on Firestore's own `update_time`: both ticks hold
+the same read, both attempt the conditional write, and the storage engine
+admits exactly one. Same argument as the purchase-order guardrail — refused by
+the database, not by our code — and it holds at any clock speed, so `DEMO` mode
+needs no special case. The lease that comes with it is not what makes it safe;
+it only bounds how long a row waits if the winner is then killed mid-work.
+
+Proven by two ticks racing through an `asyncio.Barrier` so the race is certain
+rather than probable, and by mutation: removing the precondition fails exactly
+four tests.
+
+**What the concurrency test taught us.** Its first version asserted that every
+researched item is also *counted* as researched, and it failed one run in five
+with `409 Transaction lock timeout` — Firestore aborting one of two genuinely
+concurrent writes. That is not a test artifact and not something to retry
+around. What the system owes under contention is not that every item succeeds,
+but that none is silently dropped: each either completes or is reported, and a
+reported one comes back when its lease expires. Both are now asserted.
+
+**Still to do — needs billing.** Run `scripts/deploy.sh`, then work through the
+five checks it prints. The fourth is the one that matters: impersonate the tick
+service account and try to read the orders database. A `PERMISSION_DENIED`
+there is the whole of Hard Rule 5.
 
 **Build**
 
@@ -251,15 +304,19 @@ we do not get back.
 
 **Watch out for**
 
-- **Overlapping ticks.** Scheduler does not guarantee a run finishes before the
-  next fires. Two ticks can pick up the same due negotiation and both email the
-  supplier — which looks exactly like the pestering bug already fixed in the
-  loop, but from a different cause. Fix by claiming: write
-  `next_action_due_at` forward *before* calling the brain, so a concurrent tick
-  no longer sees the row. Cheap, and it uses the index already there.
+- ~~Overlapping ticks.~~ Done — see above. Note the ordering that made it work:
+  the claim goes *after* the terminal check, because claiming writes
+  `next_action_due_at` and doing that to a finished negotiation would put it
+  back into the queue `save_negotiation` deliberately drops it from.
 - Tick timeout shorter than the Scheduler interval, so a wedged tick cannot
-  pile up.
+  pile up. `deploy.sh` sets `--timeout=50s` under a 60s schedule, which is only
+  safe *because* of the claiming: a truncated tick leaves leased rows for the
+  next pass rather than half-finished ones.
 - Cold-start latency is irrelevant here — nothing is waiting on a response.
+- **Getting the two service accounts the wrong way round.** The single
+  deployment mistake that silently undoes Phase 4 — every test still passes and
+  the guardrail is gone. `deploy.sh` ends by printing both IAM policies instead
+  of reporting success, for exactly this reason.
 
 **Done when.** You can leave it alone overnight and come back to a negotiation
 that advanced without anyone touching it.

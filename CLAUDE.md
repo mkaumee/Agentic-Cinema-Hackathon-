@@ -37,6 +37,10 @@ any replies against their negotiation by Gmail thread ID, and acts on whatever
 is due. Writing a reply to Firestore is what pushes it live to the UI, so the
 screens update on their own.
 
+It calls again in a minute whether or not the last one finished, so two ticks
+overlapping is ordinary rather than exotic. That is why the tick claims each row
+before it works on it — see Hard Rule 3.
+
 A compressed replay — five days of negotiation in sixty seconds — is a **test
 harness we will build later**, not the product. The clock supports it already
 and that costs us nothing, but nothing in the system depends on it, and "it
@@ -104,6 +108,14 @@ process that reads the reply will be gone before the counter-offer is answered.
 Nothing may be held between ticks that is not in Firestore. Kill any handler
 halfway and the next tick must resume cleanly — not as a nicety, but because it
 *will* happen, repeatedly, over a five-day negotiation.
+
+Killable is only half of it, though. Cloud Scheduler does not wait for one tick
+to finish before firing the next, so **claim a row before acting on it.** Every
+due-queue handler pushes `next_action_due_at` forward with a conditional write
+on Firestore's `update_time` before it calls the brain or sends anything. Two
+ticks holding the same read both try; the storage engine admits exactly one.
+Skip that and the second tick emails a supplier who has already been emailed —
+which reads, from their inbox, exactly like an agent that pesters.
 
 **`create()` keyed by `item_id`.** This is the guardrail, and it is enforced by
 the storage engine rather than by prompt design. `create()` fails if the
