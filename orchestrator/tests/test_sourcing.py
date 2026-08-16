@@ -416,6 +416,18 @@ async def test_two_overlapping_ticks_research_an_item_once(
     ``research_item`` is a slow LLM call, and two ticks arriving together would
     both make it and then write identical results — the damage invisible in the
     data and visible only on the bill.
+
+    Note the third assertion, which was written the wrong way round first. It
+    originally required that every researched item also be *counted* as
+    researched, and it failed roughly one run in five with
+    ``409 Transaction lock timeout`` — Firestore aborting one of two genuinely
+    concurrent writes to the same document. That is not a test artifact and not
+    something to retry around: it is what contention looks like, and it will
+    happen on Cloud Run for the same reason it happens here.
+
+    What the system owes us under contention is not that every item succeeds.
+    It is that no item is silently dropped: each one either completes or is
+    reported, and a reported one comes back when its lease runs out.
     """
     await _new_project(api)
     _ = await _confirm_everything(api)
@@ -438,5 +450,49 @@ async def test_two_overlapping_ticks_research_an_item_once(
     assert len(researched) == len(set(researched)), (
         "no item may be researched twice across two overlapping ticks"
     )
-    assert sum(r.items_researched for r in reports) == len(set(researched))
     assert sum(r.claims_lost for r in reports) > 0, "the ticks did actually race"
+
+    counted = sum(r.items_researched for r in reports)
+    reported = sum(len(r.errors) for r in reports)
+    assert counted + reported == len(set(researched)), (
+        "every item is either finished or reported — none vanish"
+    )
+
+
+async def test_an_item_lost_to_contention_comes_back(
+    api: httpx.AsyncClient, firestore: AsyncClient
+) -> None:
+    """The other half of the promise above: reported is not the same as dropped.
+
+    Whatever the two racing ticks failed to finish is claimed, so it is quiet
+    until the lease expires and then due again. A later tick completes it, and
+    every confirmed item ends up sourced.
+    """
+    await _new_project(api)
+    props = await _confirm_everything(api)
+
+    barrier = asyncio.Barrier(2)
+    loops = [
+        TickLoop(
+            repo := _RendezvousRepository(firestore, barrier),
+            SimClock(repo, FrozenRealTime(REAL0)),
+            ScriptedBrain(),
+            InMemoryMailbox(),
+        )
+        for _ in range(2)
+    ]
+    _ = await asyncio.gather(*(loop.run_tick(PID) for loop in loops))
+
+    # Past the lease, with a single tick this time.
+    repo = FirestoreRepository(firestore)
+    clock = SimClock(repo, FrozenRealTime(REAL0))
+    _ = await clock.set_sim_now(PID, REAL0 + timedelta(hours=1))
+    settled = TickLoop(repo, clock, ScriptedBrain(), InMemoryMailbox())
+    for _ in range(3):
+        _ = await settled.run_tick(PID)
+
+    items = await repo.list_items(PID)
+    assert len(items) == len(props)
+    assert all(i.status is ItemStatus.NEGOTIATING for i in items.values()), {
+        k: v.status for k, v in items.items()
+    }

@@ -4,7 +4,7 @@
 # tee's. /bin/sh is dash on Debian and has no `pipefail`, so ask for bash.
 SHELL := /bin/bash
 
-.PHONY: help setup fmt lint types guard test test-all rules-test check emulator e2e clean gcp-setup deploy-rules
+.PHONY: help setup fmt lint types guard test test-all rules-test check emulator e2e image clean gcp-setup deploy-rules
 
 help:
 	@grep -E '^[a-z-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
@@ -68,6 +68,9 @@ gcp-setup: ## Stand up the Google Cloud project (run once; needs gcloud + PROJEC
 
 deploy-rules: ## Push firestore.rules and the indexes to the real project
 	firebase deploy --only firestore --project $(PROJECT_ID)
+
+image: ## Build the Cloud Run image (context is the repo root, deliberately)
+	docker build -t agentic-cinema:local .
 
 clean:
 	rm -rf .pytest_cache .ruff_cache **/__pycache__ web/dist

@@ -97,8 +97,9 @@ def build_approval_services(settings: Settings | None = None) -> ApprovalService
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
-    services = build_approval_services()
-    configure_logging(services.settings)
+    settings = Settings()
+    configure_logging(settings)
+    services = build_approval_services(settings)
     init_firebase(services.settings)
     app.state.services = services
     log.info(

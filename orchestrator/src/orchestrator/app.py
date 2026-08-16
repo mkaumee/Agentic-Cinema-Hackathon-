@@ -146,8 +146,13 @@ def build_services(settings: Settings | None = None) -> Services:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
-    services = build_services()
-    configure_logging(services.settings)
+    # Logging first, then the services. Composition emits the loudest warning
+    # in the system — that the fake brain is live — and it would otherwise go
+    # out through the default handler, unstructured, and be the one line in the
+    # stream a severity filter cannot find.
+    settings = Settings()
+    configure_logging(settings)
+    services = build_services(settings)
     app.state.services = services
     log.info(
         "orchestrator up",
