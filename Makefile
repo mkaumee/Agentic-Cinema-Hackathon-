@@ -1,6 +1,6 @@
 # Everything here runs offline. No GCP credentials, no live project.
 
-.PHONY: help setup fmt lint types guard test check emulator e2e clean
+.PHONY: help setup fmt lint types guard test check emulator e2e clean gcp-setup deploy-rules
 
 help:
 	@grep -E '^[a-z-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
@@ -34,6 +34,12 @@ emulator: ## Start the Firestore emulator on :8080 (leave running while you work
 e2e: ## The daily ten-minute habit: boot the emulator, run the loop end to end
 	firebase emulators:exec --only firestore --project demo-cinema \
 		"uv run python scripts/run_e2e.py"
+
+gcp-setup: ## Stand up the Google Cloud project (run once; needs gcloud + PROJECT_ID)
+	PROJECT_ID=$(PROJECT_ID) ./scripts/gcp_setup.sh
+
+deploy-rules: ## Push firestore.rules and the indexes to the real project
+	firebase deploy --only firestore --project $(PROJECT_ID)
 
 clean:
 	rm -rf .pytest_cache .ruff_cache **/__pycache__ web/dist
