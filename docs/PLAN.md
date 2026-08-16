@@ -368,22 +368,14 @@ building.
   conversation available right now.
 - **Who publishes the OAuth consent screen**, and when. Blocks Phase 1 closing
   properly; testing-mode tokens will not survive a real negotiation.
-- **Project access.** You were added to the project as a service admin, which
-  grants `iam.serviceAccounts.create` and little else that the setup needs.
-  `scripts/gcp_setup.sh` runs a preflight and names the exact roles to request;
-  expect four:
+- **Billing.** Project `encoded-phalanx-505503-v8` has no billing account
+  linked. IAM access turned out to be fine — the preflight passes all five
+  permissions — but Secret Manager, Cloud Run and Cloud Scheduler refuse to
+  enable without billing. Firestore enables regardless, which is why this
+  presents as a half-finished setup rather than a clean refusal.
 
-      roles/serviceusage.serviceUsageAdmin
-      roles/datastore.owner
-      roles/secretmanager.admin
-      roles/resourcemanager.projectIamAdmin
+      gcloud billing projects link encoded-phalanx-505503-v8 \
+        --billing-account=ACCOUNT_ID
 
-  The last one is not optional cosmetics. It is what lets the agent's service
-  account be granted `(default)` and denied `orders`. Without it the database
-  split is a convention in our code rather than something Google enforces, and
-  the strongest claim the project makes stops being true. `roles/editor` does
-  not include it.
-
-  If broad roles are a hard sell, the cheaper ask is for the project owner to
-  run `scripts/gcp_setup.sh` once themselves — it is idempotent, self-contained
-  and changes nothing else.
+  Linking needs Billing Account Administrator on the *billing account*, which
+  is a separate grant from anything on the project.

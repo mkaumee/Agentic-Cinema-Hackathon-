@@ -174,6 +174,59 @@ EOF
 fi
 
 # ---------------------------------------------------------------------------
+# Billing
+# ---------------------------------------------------------------------------
+#
+# Checked separately from permissions because it is a different kind of "no".
+# You can hold every IAM role on a project and still be unable to enable
+# Secret Manager, Cloud Run or Scheduler, because those refuse to activate
+# without a billing account attached. Firestore enables happily either way,
+# which is what makes this fail halfway rather than up front.
+
+say "Preflight — billing"
+
+billing_state=$(gcloud billing projects describe "$PROJECT_ID" \
+  --format='value(billingEnabled)' 2>/dev/null || echo "unknown")
+
+case "$billing_state" in
+  True|true)
+    ok "a billing account is linked"
+    ;;
+  unknown)
+    printf '  \033[33m?\033[0m could not read billing status — continuing anyway\n'
+    printf '    (needs billing.resourceAssociations.list; if the API enables\n'
+    printf '     below fail with UREQ_PROJECT_BILLING_NOT_FOUND, this is why)\n'
+    ;;
+  *)
+    printf '  \033[31m✗\033[0m no billing account linked\n'
+    cat <<EOF
+
+$(printf '\033[1mBilling is not enabled on %s.\033[0m' "$PROJECT_ID")
+
+Firestore will enable without it. Secret Manager, Cloud Run and Cloud
+Scheduler will not — so the setup would stop partway through.
+
+If you already have credits, the billing account exists and simply is not
+attached to this project:
+
+  gcloud billing accounts list
+  gcloud billing projects link $PROJECT_ID --billing-account=ACCOUNT_ID
+
+If that returns nothing, or linking is refused, the billing account belongs
+to someone else. Linking needs Billing Account Administrator on the account
+itself — being an admin on the *project* is not enough. Either get that role,
+or ask whoever owns the billing account to link it from
+Billing > My Projects > Link a billing account.
+
+Nothing further has been changed. Re-run this script once billing is on.
+
+EOF
+    [[ "${FORCE:-}" == "1" ]] || exit 4
+    printf '\033[33mFORCE=1 — continuing regardless.\033[0m\n'
+    ;;
+esac
+
+# ---------------------------------------------------------------------------
 
 say "APIs"
 # gmail.googleapis.com is listed for completeness; you have already enabled it.
