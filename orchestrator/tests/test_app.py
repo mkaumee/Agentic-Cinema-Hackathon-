@@ -17,7 +17,7 @@ from cinema_contracts import ClockMode, NegotiationState
 from cinema_contracts.testing import ScriptedBrain
 from fastapi import HTTPException
 from google.cloud.firestore_v1 import AsyncClient
-from orchestrator.app import Services, app, build_mail, services_of
+from orchestrator.app import Services, app, build_brain, build_mail, services_of
 from orchestrator.clock import ClockState, FrozenRealTime, SimClock
 from orchestrator.mail import InMemoryMailbox
 from orchestrator.records import (
@@ -27,7 +27,7 @@ from orchestrator.records import (
     SupplierRecord,
 )
 from orchestrator.repository import FirestoreRepository
-from orchestrator.settings import MailBackend, Settings
+from orchestrator.settings import BrainBackend, MailBackend, Settings
 from orchestrator.tick import TickLoop
 
 T0 = datetime(2026, 3, 1, 9, 0, tzinfo=UTC)
@@ -104,6 +104,7 @@ async def test_health_says_which_transports_are_wired(api: httpx.AsyncClient) ->
     body = (await api.get("/healthz")).json()
 
     assert body["status"] == "ok"
+    assert body["brain_backend"] == "scripted"
     assert body["mail_backend"] == "memory"
     assert body["token_backend"] == "file"
 
@@ -200,6 +201,26 @@ async def test_the_report_carries_simulated_time_not_real_time(
 
 def test_mail_defaults_to_memory_so_nothing_emails_a_real_seller() -> None:
     assert isinstance(build_mail(SETTINGS), InMemoryMailbox)
+
+
+def test_the_brain_defaults_to_the_fake_and_says_so() -> None:
+    """Role A's brain is on another branch, so the fake is the only option.
+
+    It is reported on /healthz rather than assumed, because a keyword matcher
+    writing negotiation emails looks like a working system right up until
+    somebody reads one.
+    """
+    assert isinstance(build_brain(SETTINGS), ScriptedBrain)
+
+
+def test_selecting_the_real_brain_before_it_exists_fails_loudly() -> None:
+    """Not a silent fallback. Shipping the fake by accident is the failure mode."""
+    real = Settings(
+        _env_file=None,  # pyright: ignore[reportCallIssue]
+        brain_backend=BrainBackend.MAIN_AGENT,
+    )
+    with pytest.raises(RuntimeError, match="main_agent is not importable"):
+        _ = build_brain(real)
 
 
 def test_choosing_gmail_is_explicit_and_needs_a_token(tmp_path: Path) -> None:

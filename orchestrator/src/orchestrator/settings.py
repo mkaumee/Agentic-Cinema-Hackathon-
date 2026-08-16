@@ -28,6 +28,19 @@ either; the agent has no business deleting anything.
 """
 
 
+class BrainBackend(StrEnum):
+    SCRIPTED = "scripted"
+    """Role B's deterministic fake. No LLM, no network, and not the product.
+
+    The default only because ``main-agent`` lives on the other branch. It is a
+    regex and a short noun list — good enough to prove the loop runs, nowhere
+    near good enough to show anyone.
+    """
+
+    MAIN_AGENT = "main-agent"
+    """Role A's real brain. Selected once role_a merges."""
+
+
 class MailBackend(StrEnum):
     MEMORY = "memory"
     """No network. The default, so nothing accidentally emails a real supplier."""
@@ -84,6 +97,15 @@ class Settings(BaseSettings):
     """
 
     # -- transports -------------------------------------------------------- #
+
+    brain_backend: BrainBackend = BrainBackend.SCRIPTED
+    """Which reasoning implementation to run.
+
+    Defaults to the fake because Role A's ``main-agent`` is not on this branch
+    yet. That default is a liability rather than a convenience: a fake that
+    ships looks exactly like a working system until someone reads a negotiation
+    email. ``/healthz`` reports which one is live for that reason.
+    """
 
     mail_backend: MailBackend = MailBackend.MEMORY
     """Defaults to memory on purpose.

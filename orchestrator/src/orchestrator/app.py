@@ -28,6 +28,7 @@ noted here rather than half-built, because a home-grown shared secret would
 look like protection without being any.
 """
 
+import importlib
 import logging
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -46,7 +47,7 @@ from orchestrator.gmail import GmailTransport, build_credentials, token_store_fo
 from orchestrator.mail import InMemoryMailbox, MailTransport
 from orchestrator.records import ItemRecord, ItemStatus, ProjectRecord
 from orchestrator.repository import FirestoreRepository
-from orchestrator.settings import MailBackend, Settings
+from orchestrator.settings import BrainBackend, MailBackend, Settings
 from orchestrator.sourcing import item_id_for
 from orchestrator.tick import TickLoop, TickReport
 
@@ -85,13 +86,42 @@ def build_mail(settings: Settings) -> MailTransport:
     return InMemoryMailbox()
 
 
-def build_brain() -> AgentBrain:
-    """The reasoning half.
+def build_brain(settings: Settings) -> AgentBrain:
+    """The reasoning half. Role A's, or the fake standing in for it.
 
-    ``ScriptedBrain`` until Role A's ``main-agent`` is merged onto this branch.
-    Swapping it is a one-line change here and nowhere else, which is the whole
-    point of the contract.
+    ``main-agent`` is Role A's package and does not exist on this branch, so
+    the default is Role B's deterministic fake. The import is deliberately
+    late and deliberately loud: selecting the real brain before that code is
+    merged fails at startup with an explanation, rather than silently falling
+    back to a keyword matcher that would look like it was working.
     """
+    if settings.brain_backend is BrainBackend.MAIN_AGENT:
+        # Resolved by name rather than imported statically: the package is on
+        # Role A's branch and genuinely is not here, so a static import would
+        # be a permanent lie to the type checker. The protocol check below is
+        # what actually guarantees it fits.
+        try:
+            module = importlib.import_module("main_agent")
+        except ImportError as exc:
+            raise RuntimeError(
+                "CINEMA_BRAIN_BACKEND=main-agent, but main_agent is not "
+                "importable. That package is Role A's and lives on the role_a "
+                "branch; add it to the uv workspace members after merging."
+            ) from exc
+
+        brain: object = module.Brain()
+        if not isinstance(brain, AgentBrain):
+            raise RuntimeError(
+                "main_agent.Brain does not satisfy the AgentBrain protocol. "
+                "Checked at startup rather than on the first tick, because a "
+                "missing method would otherwise surface days into a negotiation."
+            )
+        return brain
+
+    log.warning(
+        "running on the SCRIPTED brain — a regex and a word list, not the "
+        "product. Set CINEMA_BRAIN_BACKEND=main-agent once role_a is merged."
+    )
     return ScriptedBrain()
 
 
@@ -100,7 +130,7 @@ def build_services(settings: Settings | None = None) -> Services:
     client = AsyncClient(project=resolved.gcp_project)
     repo = FirestoreRepository(client)
     clock = SimClock(repo)
-    brain = build_brain()
+    brain = build_brain(resolved)
     mail = build_mail(resolved)
     return Services(
         settings=resolved,
@@ -143,6 +173,7 @@ def services_of(request: Request) -> Services:
 
 class Health(BaseModel):
     status: str
+    brain_backend: str
     mail_backend: str
     token_backend: str
     project: str
@@ -190,14 +221,15 @@ class TickResponse(BaseModel):
 
 @app.get("/healthz")
 async def healthz(request: Request) -> Health:
-    """Says which transports are wired, not just that the process is alive.
+    """Says what is actually wired, not just that the process is alive.
 
-    "Up" is not the interesting question — "is this about to email a real
-    supplier" is.
+    "Up" is not the interesting question. "Is this about to email a real
+    seller" and "is this the real brain or the fake" are.
     """
     settings = services_of(request).settings
     return Health(
         status="ok",
+        brain_backend=settings.brain_backend.value,
         mail_backend=settings.mail_backend.value,
         token_backend=settings.token_backend.value,
         project=settings.gcp_project,
