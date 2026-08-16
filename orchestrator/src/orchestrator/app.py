@@ -44,6 +44,7 @@ from pydantic import BaseModel, Field
 
 from orchestrator.clock import SimClock, initial_state
 from orchestrator.gmail import GmailTransport, build_credentials, token_store_for
+from orchestrator.logs import configure_logging
 from orchestrator.mail import InMemoryMailbox, MailTransport
 from orchestrator.records import ItemRecord, ItemStatus, ProjectRecord
 from orchestrator.repository import FirestoreRepository
@@ -146,6 +147,7 @@ def build_services(settings: Settings | None = None) -> Services:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     services = build_services()
+    configure_logging(services.settings)
     app.state.services = services
     log.info(
         "orchestrator up",
@@ -442,6 +444,19 @@ async def tick(request: Request, project_id: str | None = None) -> TickResponse:
                 TickResult.of(pid, TickReport(sim_now=NEVER, errors=[str(exc)]))
             )
             continue
-        results.append(TickResult.of(pid, report))
+
+        result = TickResult.of(pid, report)
+        # The only record that this minute happened. Logged whether or not
+        # anything moved: a run of empty ticks is how you tell "nothing was due"
+        # apart from "the scheduler stopped calling", and those look identical
+        # if only the interesting ticks are logged.
+        log.info(
+            "tick",
+            extra=result.model_dump(exclude={"errors"})
+            | {"error_count": len(report.errors)},
+        )
+        for message in report.errors:
+            log.warning("tick error", extra={"project_id": pid, "detail": message})
+        results.append(result)
 
     return TickResponse(projects=results)

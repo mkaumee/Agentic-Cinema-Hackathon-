@@ -49,6 +49,20 @@ class MailBackend(StrEnum):
     """The real thing. Requires a refresh token to have been bootstrapped."""
 
 
+class LogFormat(StrEnum):
+    JSON = "json"
+    """One object per line, with the keys Cloud Logging reads.
+
+    The default. Not because it is nicer to read locally — it plainly is not —
+    but because it is the format anyone will be reading at 3am when a
+    negotiation has gone wrong on a deployed service, and a format only
+    exercised in production is a format nobody has tested.
+    """
+
+    TEXT = "text"
+    """Plain lines, for working at a terminal."""
+
+
 class TokenBackend(StrEnum):
     FILE = "file"
     """A gitignored directory on disk. The default while there is no GCP project."""
@@ -140,6 +154,11 @@ class Settings(BaseSettings):
     or trusting the emulator's unsigned tokens. That is not a detail to have to
     infer from which terminal you are looking at.
     """
+
+    # -- observability ------------------------------------------------------ #
+
+    log_format: LogFormat = LogFormat.JSON
+    log_level: str = "INFO"
 
     # -- loop -------------------------------------------------------------- #
 

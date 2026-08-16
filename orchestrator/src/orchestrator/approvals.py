@@ -49,6 +49,7 @@ from pydantic import BaseModel
 
 from orchestrator.auth import Producer, init_firebase, require_producer
 from orchestrator.clock import SimClock
+from orchestrator.logs import configure_logging
 from orchestrator.records import ItemStatus, PurchaseOrderRecord
 from orchestrator.repository import (
     DuplicateOrderError,
@@ -97,6 +98,7 @@ def build_approval_services(settings: Settings | None = None) -> ApprovalService
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     services = build_approval_services()
+    configure_logging(services.settings)
     init_firebase(services.settings)
     app.state.services = services
     log.info(
