@@ -38,6 +38,9 @@ from orchestrator.repository import DueItem, FirestoreRepository
 RESEARCH_RETRY_HOURS = 6.0
 """How long to wait before retrying an item whose research produced nothing."""
 
+CLAIM_LEASE_HOURS = 0.25
+"""How far ahead claiming an item parks it. See ``tick.CLAIM_LEASE_HOURS``."""
+
 MAX_SUPPLIERS_PER_ITEM = 3
 """How many sellers to approach for one item.
 
@@ -58,6 +61,7 @@ class SourcingReport:
     negotiations_opened: int = 0
     suppliers_written: int = 0
     abandoned: int = 0
+    claims_lost: int = 0
     errors: list[str] = field(default_factory=list)
 
 
@@ -117,6 +121,13 @@ class SourcingLoop:
         report = SourcingReport()
         for due in await self._repo.due_items(now, limit=limit):
             report.items_examined += 1
+            if not await self._repo.claim_item(
+                due, now + timedelta(hours=CLAIM_LEASE_HOURS)
+            ):
+                # Another overlapping tick has this item. Letting both through
+                # would mean paying for the same research_item call twice.
+                report.claims_lost += 1
+                continue
             try:
                 if due.record.status is ItemStatus.RESEARCHING:
                     await self._research(due, now, report)

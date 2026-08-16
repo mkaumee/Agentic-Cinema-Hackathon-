@@ -10,6 +10,7 @@ The test worth reading is
 ``test_a_screenplay_becomes_negotiations_without_anything_hand_seeded``.
 """
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any, override
 
@@ -22,7 +23,7 @@ from orchestrator.app import Services, app
 from orchestrator.clock import FrozenRealTime, SimClock
 from orchestrator.mail import InMemoryMailbox
 from orchestrator.records import ItemStatus
-from orchestrator.repository import FirestoreRepository
+from orchestrator.repository import DueItem, FirestoreRepository
 from orchestrator.settings import Settings
 from orchestrator.sourcing import item_id_for, negotiation_id_for, supplier_id_for
 from orchestrator.tick import TickLoop
@@ -73,6 +74,17 @@ async def _upload(api: httpx.AsyncClient) -> list[dict[str, Any]]:
     response = await api.post(f"/projects/{PID}/script", json={"text_content": SCRIPT})
     assert response.status_code == 200, response.text
     return response.json()["props"]
+
+
+async def _confirm_everything(api: httpx.AsyncClient) -> list[dict[str, Any]]:
+    """Producer signs off the whole list, which is what puts items in the queue."""
+    props = await _upload(api)
+    response = await api.post(
+        f"/projects/{PID}/items/confirm",
+        json={"items": [{"item_id": p["item_id"], "qty": 1} for p in props]},
+    )
+    assert response.status_code == 200, response.text
+    return props
 
 
 # --------------------------------------------------------------------------- #
@@ -358,3 +370,73 @@ async def test_an_empty_script_is_rejected(api: httpx.AsyncClient) -> None:
     await _new_project(api)
     response = await api.post(f"/projects/{PID}/script", json={"text_content": ""})
     assert response.status_code == 422
+
+
+# --------------------------------------------------------------------------- #
+# Overlapping ticks
+# --------------------------------------------------------------------------- #
+
+
+class _CountingBrain(ScriptedBrain):
+    """Counts research calls. The thing overlapping ticks would pay for twice."""
+
+    researched: list[str]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.researched = []
+
+    @override
+    async def research_item(self, brief: ItemBrief) -> ItemResearch:
+        self.researched.append(brief.item_id)
+        return await super().research_item(brief)
+
+
+class _RendezvousRepository(FirestoreRepository):
+    """Holds both ticks at the due-item read, so they genuinely race."""
+
+    _barrier: asyncio.Barrier
+
+    def __init__(self, client: AsyncClient, barrier: asyncio.Barrier) -> None:
+        super().__init__(client)
+        self._barrier = barrier
+
+    @override
+    async def due_items(self, now: datetime, *, limit: int = 25) -> list[DueItem]:
+        due = await super().due_items(now, limit=limit)
+        _ = await self._barrier.wait()
+        return due
+
+
+async def test_two_overlapping_ticks_research_an_item_once(
+    api: httpx.AsyncClient, firestore: AsyncClient
+) -> None:
+    """Losing this race costs money rather than a supplier's goodwill.
+
+    ``research_item`` is a slow LLM call, and two ticks arriving together would
+    both make it and then write identical results — the damage invisible in the
+    data and visible only on the bill.
+    """
+    await _new_project(api)
+    _ = await _confirm_everything(api)
+
+    barrier = asyncio.Barrier(2)
+    brains = [_CountingBrain(), _CountingBrain()]
+    loops = [
+        TickLoop(
+            repo := _RendezvousRepository(firestore, barrier),
+            SimClock(repo, FrozenRealTime(REAL0)),
+            brain,
+            InMemoryMailbox(),
+        )
+        for brain in brains
+    ]
+
+    reports = await asyncio.gather(*(loop.run_tick(PID) for loop in loops))
+
+    researched = brains[0].researched + brains[1].researched
+    assert len(researched) == len(set(researched)), (
+        "no item may be researched twice across two overlapping ticks"
+    )
+    assert sum(r.items_researched for r in reports) == len(set(researched))
+    assert sum(r.claims_lost for r in reports) > 0, "the ticks did actually race"

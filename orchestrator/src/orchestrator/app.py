@@ -192,6 +192,7 @@ class TickResult(BaseModel):
     replies_after_stop: int
     unmatched_replies: int
     negotiations_examined: int
+    claims_lost: int
     messages_sent: int
     escalated: int
     errors: list[str]
@@ -209,6 +210,7 @@ class TickResult(BaseModel):
             replies_after_stop=report.replies_after_stop,
             unmatched_replies=report.unmatched_replies,
             negotiations_examined=report.negotiations_examined,
+            claims_lost=report.claims_lost,
             messages_sent=report.messages_sent,
             escalated=report.escalated,
             errors=report.errors,

@@ -19,7 +19,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from cinema_contracts import TERMINAL_STATES, Money
-from google.api_core.exceptions import AlreadyExists
+from google.api_core.exceptions import Aborted, AlreadyExists, FailedPrecondition
 from google.cloud.firestore_v1 import AsyncClient
 from google.cloud.firestore_v1.base_query import FieldFilter
 
@@ -65,18 +65,29 @@ class DuplicateOrderError(RuntimeError):
 
 
 class DueNegotiation:
-    """A negotiation the tick loop should act on, with its location."""
+    """A negotiation the tick loop should act on, with its location.
+
+    ``update_time`` is Firestore's version stamp for the document as it was
+    read. It is what ``claim_negotiation`` compares against, and the reason a
+    second overlapping tick cannot act on the same row.
+    """
 
     project_id: str
     negotiation_id: str
     record: NegotiationRecord
+    update_time: datetime
 
     def __init__(
-        self, project_id: str, negotiation_id: str, record: NegotiationRecord
+        self,
+        project_id: str,
+        negotiation_id: str,
+        record: NegotiationRecord,
+        update_time: datetime,
     ) -> None:
         self.project_id = project_id
         self.negotiation_id = negotiation_id
         self.record = record
+        self.update_time = update_time
 
 
 class DueItem:
@@ -85,11 +96,19 @@ class DueItem:
     project_id: str
     item_id: str
     record: ItemRecord
+    update_time: datetime
 
-    def __init__(self, project_id: str, item_id: str, record: ItemRecord) -> None:
+    def __init__(
+        self,
+        project_id: str,
+        item_id: str,
+        record: ItemRecord,
+        update_time: datetime,
+    ) -> None:
         self.project_id = project_id
         self.item_id = item_id
         self.record = record
+        self.update_time = update_time
 
 
 class FirestoreRepository:
@@ -104,6 +123,63 @@ class FirestoreRepository:
 
     def __init__(self, client: AsyncClient) -> None:
         self._db = client
+
+    # ------------------------------------------------------------------ #
+    # Claiming
+    # ------------------------------------------------------------------ #
+
+    async def _claim(
+        self, ref: AsyncDocumentReference, update_time: datetime, until: datetime
+    ) -> bool:
+        """Push a due row forward, but only if nobody has touched it since.
+
+        Cloud Scheduler does not wait for one ``/tick`` to finish before firing
+        the next, so two ticks routinely read the same due row. Without this
+        they would both ask the brain and both email the supplier — which looks
+        exactly like the pestering bug already fixed in ``tick.py``, from an
+        entirely different cause.
+
+        The protection is Firestore's, not ours. Both ticks read the document at
+        the same ``update_time`` and both attempt this conditional write; the
+        storage engine admits exactly one and refuses the other with
+        ``FAILED_PRECONDITION``. Same argument as ``create()`` on purchase
+        orders: a check-then-write in our own code would have a race between the
+        two halves, and this does not.
+
+        Note what the *lease* is and is not. It is not what makes this safe —
+        the compare-and-swap above is, at any clock speed, which is why DEMO
+        mode needs no special handling. The lease only bounds how long a row
+        sits idle if the winner is then killed mid-work.
+        """
+        try:
+            _ = await ref.update(
+                {"next_action_due_at": until},
+                option=self._db.write_option(last_update_time=update_time),
+            )
+        except FailedPrecondition, Aborted:
+            return False
+        return True
+
+    async def claim_negotiation(self, due: DueNegotiation, until: datetime) -> bool:
+        """Take a negotiation for this tick. False means another tick has it."""
+        return await self._claim(
+            self._negotiation_ref(due.project_id, due.negotiation_id),
+            due.update_time,
+            until,
+        )
+
+    async def claim_item(self, due: DueItem, until: datetime) -> bool:
+        """Take an item for this tick. False means another tick has it.
+
+        Duplicated research is a wasted LLM call rather than a duplicated
+        email, so the cost of losing this race is money instead of a supplier's
+        goodwill. Worth claiming anyway, for the same reason.
+        """
+        return await self._claim(
+            self._project_ref(due.project_id).collection(ITEMS).document(due.item_id),
+            due.update_time,
+            until,
+        )
 
     # ------------------------------------------------------------------ #
     # Clock (implements ClockStore)
@@ -206,6 +282,7 @@ class FirestoreRepository:
                     project_id=project_ref.id,
                     item_id=snapshot.id,
                     record=ItemRecord.model_validate(data),
+                    update_time=snapshot.update_time,
                 )
             )
         return due
@@ -329,6 +406,7 @@ class FirestoreRepository:
                     project_id=project_ref.id,
                     negotiation_id=snapshot.id,
                     record=NegotiationRecord.model_validate(data),
+                    update_time=snapshot.update_time,
                 )
             )
         return due
@@ -356,6 +434,7 @@ class FirestoreRepository:
                 project_id=project_ref.id,
                 negotiation_id=snapshot.id,
                 record=NegotiationRecord.model_validate(data),
+                update_time=snapshot.update_time,
             )
         return None
 

@@ -21,6 +21,7 @@ from google.cloud.firestore_v1 import AsyncClient
 from orchestrator.clock import ClockState, SimClock
 from orchestrator.records import (
     ItemRecord,
+    ItemStatus,
     MessageRecord,
     NegotiationRecord,
     ProjectRecord,
@@ -261,6 +262,92 @@ async def test_due_query_spans_projects(firestore: AsyncClient) -> None:
     due = await repo.due_negotiations(T0)
 
     assert {d.project_id for d in due} == {"projA", "projB"}
+
+
+# --------------------------------------------------------------------------- #
+# Claiming
+# --------------------------------------------------------------------------- #
+
+
+async def test_claiming_takes_a_row_out_of_the_queue(firestore: AsyncClient) -> None:
+    repo = FirestoreRepository(firestore)
+    await repo.create_project(PID, _project())
+    await repo.save_negotiation(PID, "n1", _negotiation(due=T0 - timedelta(hours=1)))
+
+    (due,) = await repo.due_negotiations(T0)
+    claimed = await repo.claim_negotiation(due, T0 + timedelta(minutes=15))
+
+    assert claimed
+    assert await repo.due_negotiations(T0) == []
+    assert len(await repo.due_negotiations(T0 + timedelta(hours=1))) == 1
+
+
+async def test_only_one_of_two_ticks_can_claim_the_same_row(
+    firestore: AsyncClient,
+) -> None:
+    """The whole point. Both hold the same read; Firestore admits one.
+
+    This is the deterministic version — both callers genuinely share one
+    ``update_time``, with no reliance on how the event loop happens to
+    interleave. ``test_tick.py`` has the realistic counterpart.
+    """
+    repo = FirestoreRepository(firestore)
+    await repo.create_project(PID, _project())
+    await repo.save_negotiation(PID, "n1", _negotiation(due=T0 - timedelta(hours=1)))
+
+    (first,) = await repo.due_negotiations(T0)
+    (second,) = await repo.due_negotiations(T0)
+    assert first.update_time == second.update_time, "both ticks read the same version"
+
+    won = await repo.claim_negotiation(first, T0 + timedelta(minutes=15))
+    lost = await repo.claim_negotiation(second, T0 + timedelta(minutes=15))
+
+    assert won
+    assert not lost, "the second claim must be refused by Firestore, not by us"
+
+
+async def test_any_intervening_write_invalidates_a_claim(
+    firestore: AsyncClient,
+) -> None:
+    """Not just a competing claim — any write at all.
+
+    A producer setting a floor from the approval service also bumps the version,
+    and a tick still holding the older read must not overwrite that decision
+    with a stale record.
+    """
+    repo = FirestoreRepository(firestore)
+    await repo.create_project(PID, _project())
+    await repo.save_negotiation(PID, "n1", _negotiation(due=T0 - timedelta(hours=1)))
+
+    (due,) = await repo.due_negotiations(T0)
+    record = await repo.get_negotiation(PID, "n1")
+    assert record is not None
+    record.floor_price = Money(amount=600)
+    await repo.save_negotiation(PID, "n1", record)
+
+    assert not await repo.claim_negotiation(due, T0 + timedelta(minutes=15))
+
+
+async def test_items_are_claimed_the_same_way(firestore: AsyncClient) -> None:
+    repo = FirestoreRepository(firestore)
+    await repo.create_project(PID, _project())
+    await repo.save_item(
+        PID,
+        "mirror",
+        ItemRecord(
+            name="Mirror",
+            category="prop",
+            status=ItemStatus.RESEARCHING,
+            next_action_due_at=T0 - timedelta(hours=1),
+        ),
+    )
+
+    (first,) = await repo.due_items(T0)
+    (second,) = await repo.due_items(T0)
+
+    assert await repo.claim_item(first, T0 + timedelta(minutes=15))
+    assert not await repo.claim_item(second, T0 + timedelta(minutes=15))
+    assert await repo.due_items(T0) == []
 
 
 # --------------------------------------------------------------------------- #

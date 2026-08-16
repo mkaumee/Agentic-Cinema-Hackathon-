@@ -72,6 +72,16 @@ production, and a suggestion of zero would spin the loop.
 SILENCE_HOURS = 48.0
 """Simulated hours of supplier silence before the loop raises SILENCE_TIMEOUT."""
 
+CLAIM_LEASE_HOURS = 0.25
+"""How far ahead claiming a row parks it before anyone may retry.
+
+Not a correctness knob. Two overlapping ticks are separated by the
+compare-and-swap in ``FirestoreRepository._claim``, which holds however long
+this is. What the lease decides is how long a row sits idle when the tick that
+won it is then killed mid-work — fifteen simulated minutes, which in live mode
+is fifteen real ones.
+"""
+
 
 def _references(record: NegotiationRecord) -> str:
     """The ``References`` header: thread root first, then the latest message.
@@ -105,6 +115,9 @@ class TickReport:
     replies_after_stop: int = 0
     unmatched_replies: int = 0
     negotiations_examined: int = 0
+    claims_lost: int = 0
+    """Rows another tick was already working on. Zero unless ticks overlap, and
+    a number that climbs is the signal that ticks are running long."""
     messages_sent: int = 0
     escalated: int = 0
     errors: list[str] = field(default_factory=list)
@@ -159,10 +172,21 @@ class TickLoop:
         report.items_examined = sourcing.items_examined
         report.items_researched = sourcing.researched
         report.negotiations_opened = sourcing.negotiations_opened
+        report.claims_lost += sourcing.claims_lost
         report.errors.extend(sourcing.errors)
 
         for due in await self._repo.due_negotiations(now, limit=limit):
-            await self._advance_negotiation(due, now, report)
+            try:
+                await self._advance_negotiation(due, now, report)
+            except Exception as exc:
+                # One negotiation must not take the rest of the project down
+                # with it — over five days, a project that stops being ticked is
+                # a negotiation that dies. The sourcing half already does this.
+                #
+                # Safe to swallow only because the row has been claimed by now:
+                # it is parked for the lease rather than retried on every tick,
+                # so a permanently broken negotiation cannot spin.
+                report.errors.append(f"{due.negotiation_id}: {exc}")
 
         return report
 
@@ -277,7 +301,19 @@ class TickLoop:
         record = due.record
         report.negotiations_examined += 1
 
+        # Before the claim, deliberately. A terminal negotiation returns here
+        # without saving, and claiming writes next_action_due_at — which would
+        # put a finished negotiation back into the very queue that
+        # save_negotiation drops it from.
         if is_terminal(record.state):
+            return
+
+        if not await self._repo.claim_negotiation(
+            due, now + timedelta(hours=CLAIM_LEASE_HOURS)
+        ):
+            # Another tick is already working on this row. Not an error, and
+            # not worth retrying — that tick will finish it.
+            report.claims_lost += 1
             return
 
         if self._awaiting_reply(record):
@@ -306,6 +342,10 @@ class TickLoop:
 
         context = await self._build_context(due, now)
         if context is None:
+            # Returning without saving leaves the claim's lease in place, which
+            # is what we want: a negotiation whose item or supplier has gone
+            # backs off instead of being re-examined every sixty seconds
+            # forever.
             report.errors.append(
                 f"{due.negotiation_id}: item or supplier missing; cannot decide"
             )
@@ -331,6 +371,7 @@ class TickLoop:
         }:
             supplier = await self._repo.get_supplier(due.project_id, record.supplier_id)
             if supplier is None:
+                # Leased, as above.
                 report.errors.append(f"{due.negotiation_id}: supplier record vanished")
                 return
 
