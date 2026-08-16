@@ -130,6 +130,17 @@ class Settings(BaseSettings):
     refresh_token_secret: str = "gmail-agent-refresh-token"
     """Secret Manager secret name, used only when token_backend is secret-manager."""
 
+    # -- approvals ---------------------------------------------------------- #
+
+    auth_emulator_host: str = ""
+    """Mirrors FIREBASE_AUTH_EMULATOR_HOST, for reporting on /healthz.
+
+    firebase-admin reads the environment variable itself; this exists so the
+    approval service can say out loud whether it is verifying real signatures
+    or trusting the emulator's unsigned tokens. That is not a detail to have to
+    infer from which terminal you are looking at.
+    """
+
     # -- loop -------------------------------------------------------------- #
 
     tick_limit: int = 50
