@@ -1,3 +1,7 @@
+# firebase-admin ships no type information, and an emulator's JSON response is
+# Any by nature. Both are about the libraries rather than this code.
+# pyright: reportAny=false, reportMissingTypeStubs=false
+# pyright: reportUnknownMemberType=false
 """Fixtures for tests that need a real Firestore.
 
 Real meaning the emulator, never a live project. Start it with
@@ -10,7 +14,7 @@ actually execute.
 """
 
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 
 import httpx
 import pytest
@@ -18,6 +22,7 @@ from google.auth.credentials import AnonymousCredentials
 from google.cloud.firestore_v1 import AsyncClient
 
 EMULATOR_HOST = os.environ.get("FIRESTORE_EMULATOR_HOST", "127.0.0.1:8080")
+AUTH_HOST = os.environ.get("FIREBASE_AUTH_EMULATOR_HOST", "127.0.0.1:9099")
 PROJECT_ID = os.environ.get("FIRESTORE_PROJECT_ID", "demo-cinema")
 ORDERS_DATABASE = "orders"
 
@@ -100,3 +105,92 @@ async def orders_firestore() -> AsyncIterator[AsyncClient]:
         yield client
     finally:
         client.close()
+
+
+# --------------------------------------------------------------------------- #
+# Auth
+# --------------------------------------------------------------------------- #
+
+
+def _auth_emulator_running() -> bool:
+    try:
+        response = httpx.get(f"http://{AUTH_HOST}/", timeout=1.0)
+    except httpx.HTTPError:
+        return False
+    return response.status_code < 500
+
+
+class TokenMinter:
+    """Issues real Firebase ID tokens from the Auth emulator.
+
+    Real matters here. The alternative — overriding the FastAPI dependency and
+    injecting a ``Producer`` straight into the route — would test the money
+    logic while quietly skipping the part that decides who is allowed to reach
+    it. These tokens go through ``firebase_admin.verify_id_token`` exactly as a
+    browser's would; the emulator leaves them unsigned and firebase-admin skips
+    the signature check, but every other claim is checked for real.
+    """
+
+    _base: str
+    _key: str
+
+    def __init__(self, api_key: str = "fake-api-key") -> None:
+        self._base = f"http://{AUTH_HOST}/identitytoolkit.googleapis.com/v1"
+        self._key = api_key
+
+    def mint(self, email: str, *, role: str = "") -> str:
+        """Create a user, optionally make them a producer, return their token.
+
+        The claim has to be set between signup and sign-in: custom claims are
+        baked into the token when it is issued, so a token minted before the
+        claim was set would not carry it.
+        """
+        import firebase_admin
+        from firebase_admin import auth as firebase_auth
+
+        password = "correct-horse-battery-staple"
+        signup = httpx.post(
+            f"{self._base}/accounts:signUp",
+            params={"key": self._key},
+            json={"email": email, "password": password, "returnSecureToken": True},
+            timeout=10.0,
+        )
+        _ = signup.raise_for_status()
+        uid: str = signup.json()["localId"]
+
+        if role:
+            assert firebase_admin._apps, (  # pyright: ignore[reportPrivateUsage]
+                "init_firebase must run before setting custom claims"
+            )
+            firebase_auth.set_custom_user_claims(uid, {"role": role})
+
+        signin = httpx.post(
+            f"{self._base}/accounts:signInWithPassword",
+            params={"key": self._key},
+            json={"email": email, "password": password, "returnSecureToken": True},
+            timeout=10.0,
+        )
+        _ = signin.raise_for_status()
+        token: str = signin.json()["idToken"]
+        return token
+
+
+@pytest.fixture
+def tokens() -> Iterator[TokenMinter]:
+    """A clean Auth emulator, and a way to get tokens out of it.
+
+    Skips rather than fails when the emulator is absent, matching the Firestore
+    fixtures — but CI asserts that nothing skipped, because a green run that
+    quietly skipped every approval test is worse than a red one.
+    """
+    if not _auth_emulator_running():
+        pytest.skip(
+            f"Auth emulator not reachable at {AUTH_HOST}. "
+            f"Start it with `make emulator`."
+        )
+
+    os.environ["FIREBASE_AUTH_EMULATOR_HOST"] = AUTH_HOST
+    _ = httpx.delete(
+        f"http://{AUTH_HOST}/emulator/v1/projects/{PROJECT_ID}/accounts", timeout=10.0
+    )
+    yield TokenMinter()

@@ -242,6 +242,39 @@ async def test_services_are_built_once_and_shared(api: httpx.AsyncClient) -> Non
     assert app.state.services is first
 
 
+# --------------------------------------------------------------------------- #
+# The separation that makes Hard Rule 5 true
+# --------------------------------------------------------------------------- #
+
+
+def test_the_tick_service_exposes_no_way_to_spend_money() -> None:
+    """The cheapest guard in the repo, against the easiest mistake.
+
+    Approval lives in ``orchestrator.approvals``, deployed as its own Cloud Run
+    service under the one account that has an IAM binding on the ``orders``
+    database. Moving a route onto this app would mean granting that binding
+    here, and "the agent cannot spend money" would stop being true while every
+    other test still passed.
+    """
+    paths = [getattr(route, "path", "") for route in app.routes]
+
+    assert not [p for p in paths if "approve" in p or "purchase" in p], paths
+
+
+def test_the_tick_service_holds_no_client_for_the_orders_database() -> None:
+    """Belt and braces on the same rule, one layer down.
+
+    Even with a wrong IAM binding there is nothing in this service's
+    composition root that could reach purchase orders — no orders client, and a
+    repository class with no method that writes one.
+    """
+    fields = set(Services.__dataclass_fields__)
+
+    assert "orders" not in fields
+    assert "orders_client" not in fields
+    assert not [m for m in dir(FirestoreRepository) if "purchase_order" in m]
+
+
 def test_a_request_without_startup_is_refused_rather_than_crashing() -> None:
     bare = type("R", (), {"app": type("A", (), {"state": type("S", (), {})()})()})()
     with pytest.raises(HTTPException) as caught:

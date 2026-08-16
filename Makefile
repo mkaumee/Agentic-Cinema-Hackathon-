@@ -28,11 +28,11 @@ test: ## Unit tests
 
 check: lint types guard test ## Everything that must pass before a merge
 
-emulator: ## Start the Firestore emulator on :8080 (leave running while you work)
-	firebase emulators:start --only firestore --project demo-cinema
+emulator: ## Start the Firestore + Auth emulators (leave running while you work)
+	firebase emulators:start --only firestore,auth --project demo-cinema
 
-e2e: ## The daily ten-minute habit: boot the emulator, run the loop end to end
-	firebase emulators:exec --only firestore --project demo-cinema \
+e2e: ## The daily ten-minute habit: boot the emulators, run the loop end to end
+	firebase emulators:exec --only firestore,auth --project demo-cinema \
 		"uv run python scripts/run_e2e.py"
 
 gcp-setup: ## Stand up the Google Cloud project (run once; needs gcloud + PROJECT_ID)
