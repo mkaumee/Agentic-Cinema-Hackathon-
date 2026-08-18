@@ -4,7 +4,7 @@
 # tee's. /bin/sh is dash on Debian and has no `pipefail`, so ask for bash.
 SHELL := /bin/bash
 
-.PHONY: help setup fmt lint types guard test test-all rules-test check emulator e2e image clean gcp-setup deploy-rules
+.PHONY: help setup fmt lint types guard test test-all rules-test check emulator e2e image clean gcp-setup deploy-rules deploy verify-deploy
 
 help:
 	@grep -E '^[a-z-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
@@ -69,8 +69,14 @@ e2e: ## The daily ten-minute habit: boot the emulators, run the loop end to end
 gcp-setup: ## Stand up the Google Cloud project (run once; needs gcloud + PROJECT_ID)
 	PROJECT_ID=$(PROJECT_ID) ./scripts/gcp_setup.sh
 
-deploy-rules: ## Push firestore.rules and the indexes to the real project
+deploy-rules: ## Push both rules files and the indexes to the real project
 	firebase deploy --only firestore --project $(PROJECT_ID)
+
+deploy: ## Deploy both Cloud Run services and the Scheduler job (needs PROJECT_ID)
+	PROJECT_ID=$(PROJECT_ID) ./scripts/deploy.sh
+
+verify-deploy: ## Check a deployment — read-only, and the real definition of done
+	PROJECT_ID=$(PROJECT_ID) ./scripts/verify_deploy.sh
 
 image: ## Build the Cloud Run image (context is the repo root, deliberately)
 	docker build -t agentic-cinema:local .
