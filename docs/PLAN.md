@@ -84,9 +84,12 @@ but no app yet (Phases 5–6) · `supplier-sim/`, scaffolding only (later).
 **Known debts, carried deliberately**
 
 - firebase-tools 15 does not load rules from the multi-database array form in
-  `firebase.json`, so the emulator runs open. Harmless: the Python tests use the
-  admin SDK and bypass rules regardless, and the rules tests load each file
-  explicitly by path rather than through `firebase.json`.
+  `firebase.json` **for the emulator**, so the emulator runs open. Harmless: the
+  Python tests use the admin SDK and bypass rules regardless, and the rules tests
+  load each file explicitly by path rather than through `firebase.json`.
+  Settled for real deploys — `firebase deploy --only firestore` against
+  `encoded-phalanx-505503-v8` on 18 Aug compiled and released *both* files, so
+  the array form is honoured there. The gap is emulator-only.
 - **Nothing is deployed yet**, but the credit has landed and the script has
   been audited against the code it deploys. Four things that would each have
   cost an hour are fixed: the service would not have booted (mail configured

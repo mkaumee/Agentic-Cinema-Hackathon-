@@ -8,9 +8,20 @@ Budget half an hour for the first run, most of it waiting for the first build.
 
 ## Before you start
 
-- `scripts/gcp_setup.sh` has been run against the project.
 - Billing is linked. Cloud Run and Scheduler simply refuse to exist without it,
   unlike Firestore — which is what lets an unbilled project look half-working.
+- `scripts/gcp_setup.sh` has been run **to completion**, and there are two
+  Firestore databases:
+
+  ```bash
+  gcloud firestore databases list --format='table(name,locationId,type)'
+  ```
+
+  Check this rather than assume it. `firebase deploy` will create `(default)`
+  on its own if it is missing, which makes a half-set-up project look set up —
+  and the guardrail is that `orders` is a *separate* database the agent has no
+  binding on. One database means no guardrail, and nothing about a successful
+  rules deploy would tell you.
 
 ## The order matters
 
