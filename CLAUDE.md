@@ -178,8 +178,12 @@ different.
 
 Because the loop is real, **OAuth token lifetime is an operational concern, not
 a demo-day chore.** A consent screen in testing mode issues refresh tokens that
-die after seven days, which is shorter than a negotiation. Publish the consent
-screen, or plan the re-auth. See `docs/oauth-runbook.md`.
+die after seven days, which is shorter than a negotiation.
+
+Publishing is not the way out, despite being the obvious one: `gmail.modify` is
+a restricted scope, so publishing forces Google's verification plus a CASA
+security assessment. Re-auth weekly is the strategy, not the fallback. See
+`docs/oauth-runbook.md`.
 
 ## The stop condition
 

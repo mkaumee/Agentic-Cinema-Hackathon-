@@ -62,11 +62,13 @@ Verified, not assumed — every claim below is covered by a test in the repo.
 | `orchestrator/logs.py` — JSON for Cloud Logging | Done |
 | Row claiming — overlapping ticks cannot double-email | Done, proven by a concurrent test |
 | `Dockerfile` | Written; **built and smoke-tested by CI**, never by hand |
-| `scripts/deploy.sh` | Written; **never run** — needs billing |
+| `scripts/deploy.sh` | Written and audited; **never run**. Cloud Build, mail off by default |
+| `scripts/verify_deploy.sh` | Written; the real definition of "deployed" |
+| `docs/deploy-runbook.md` | The order to do it in, and what each failure means |
 | **Phase 1** — settings, Gmail transport, HTTP service, OAuth bootstrap, runbook, CI | Done |
 | **Phase 2** — script upload, prop confirmation, research, negotiation creation | Done |
 | **Phase 4** — auth, approval service, rules tests | Done |
-| **Phase 3** — the code half | Done. The deploy itself is blocked on billing |
+| **Phase 3** — the code half | Done. The deploy is unblocked and waiting to be run |
 
 228 Python tests, plus 22 rules tests in `web/`. CI fails the build if any
 Python test skips, since a green run that skipped the guardrail tests is worse
@@ -75,8 +77,9 @@ so a green laptop and a green CI mean the same thing.
 
 **Not started**
 
-The deploy itself (Phase 3, blocked on billing) · `web/` has rules tests but no
-app yet (Phases 5–6) · `supplier-sim/`, scaffolding only (later).
+Running the deploy — no longer blocked; the $100 credit landed, so this is the
+next thing to do and it needs a human with Cloud Shell · `web/` has rules tests
+but no app yet (Phases 5–6) · `supplier-sim/`, scaffolding only (later).
 
 **Known debts, carried deliberately**
 
@@ -84,18 +87,29 @@ app yet (Phases 5–6) · `supplier-sim/`, scaffolding only (later).
   `firebase.json`, so the emulator runs open. Harmless: the Python tests use the
   admin SDK and bypass rules regardless, and the rules tests load each file
   explicitly by path rather than through `firebase.json`.
-- **Nothing is deployed.** Both services, the Scheduler job and the second
-  service account are written into `scripts/deploy.sh` and none of it has ever
-  executed — no billing, and no `gcloud` on the machine it was written on.
-  Assume the first run needs fixing. The image half is verified: CI builds it
-  and curls `/healthz` on every push.
+- **Nothing is deployed yet**, but the credit has landed and the script has
+  been audited against the code it deploys. Four things that would each have
+  cost an hour are fixed: the service would not have booted (mail configured
+  before a token existed), Gmail would have failed later anyway (no OAuth client
+  in the environment), `docker` was required where Cloud Shell has none, and
+  `.secrets/` was not actually gitignored — so a refresh token could have been
+  committed, or uploaded to Cloud Build. Still never executed; assume the first
+  run finds something. The image half is verified: CI builds it and curls
+  `/healthz` on every push.
 - `/tick` is still unauthenticated *in code*. The protection is deployment-side
   — private ingress plus a Scheduler OIDC token, both in `deploy.sh` — so it is
   real only once deployed. A home-grown shared secret in the meantime would
   look like protection without being any.
-- The live email round-trip is unproven — it needs two mailboxes and a consent
-  screen that do not exist yet. The transport is covered offline; the runbook
-  is the checklist.
+- The live email round-trip is unproven — it needs two mailboxes and the OAuth
+  bootstrap. The transport is covered offline; `docs/oauth-runbook.md` is the
+  checklist.
+- **The consent screen stays in Testing, permanently.** Publishing looks like
+  the fix for seven-day refresh tokens and is not available to us:
+  `gmail.modify` is a restricted scope, so publishing forces Google's
+  verification plus a CASA security assessment, and "Internal" needs a Workspace
+  org that a `@gmail.com` account does not have. Re-auth weekly is the strategy.
+  The old runbook advised the opposite and cost an afternoon; it has been
+  corrected.
 - Contention on a hot item can abort one of two concurrent writes
   (`409 Transaction lock timeout` from Firestore). The work is not lost: the
   row is claimed, the error is reported, and the lease brings it back. Both
@@ -276,10 +290,12 @@ around. What the system owes under contention is not that every item succeeds,
 but that none is silently dropped: each either completes or is reported, and a
 reported one comes back when its lease expires. Both are now asserted.
 
-**Still to do — needs billing.** Run `scripts/deploy.sh`, then work through the
-five checks it prints. The fourth is the one that matters: impersonate the tick
-service account and try to read the orders database. A `PERMISSION_DENIED`
-there is the whole of Hard Rule 5.
+**Still to do — now unblocked.** Follow `docs/deploy-runbook.md`: rules first,
+then `make deploy` with mail off, then `make verify-deploy`. The check that
+matters is the guardrail pair — impersonate the tick account, read `(default)`
+successfully, then fail to read `orders`. Only the pair means anything, because
+impersonation itself denies identically when you lack
+`serviceAccountTokenCreator`.
 
 **Build**
 
@@ -361,9 +377,10 @@ create an order, reopening `update, delete`, and dropping the `ORDERED` guard
 on negotiations) fails five tests, so the suite is load-bearing rather than
 decorative.
 
-**Not in this phase.** Deploying the approval service — it needs billing and
-belongs with Phase 3's Cloud Run work. Until then the two-account split is real
-in code and in tests, but there is one process running both in development.
+**Not in this phase.** Deploying the approval service — it belongs with Phase
+3's Cloud Run work, and `scripts/deploy.sh` now carries it. Until that runs, the
+two-account split is real in code and in tests but there is one process running
+both in development.
 
 ---
 

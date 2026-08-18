@@ -17,15 +17,34 @@ and the agent silently stops replying to a seller who is waiting. Nothing
 crashes. The negotiation just goes quiet, which looks exactly like a supplier
 who lost interest.
 
-Two ways out, in order of preference:
+**Do not try to solve this by publishing the consent screen.** An earlier
+version of this runbook recommended exactly that, and it is wrong — following it
+costs an afternoon and ends in a dead end.
 
-1. **Publish the consent screen.** Refresh tokens then last until they are
-   revoked. Publishing an app that only requests Gmail scopes for your own
-   accounts does not require Google's verification review as long as you keep
-   the user cap low — you will see an "unverified app" interstitial when
-   consenting, which you can click through.
-2. **Re-run the bootstrap every few days**, and put a calendar reminder on it.
-   Workable, but it means someone has to remember during the week that matters.
+`gmail.modify` is a **restricted** scope, not merely a sensitive one.
+Publishing an External app that requests a restricted scope forces Google's full
+verification *plus* a third-party CASA security assessment: weeks of calendar
+time and real money. It is also what makes the console start demanding an
+application home page, a privacy policy link and verified authorized domains —
+fields that are **optional while the app stays in Testing**, and that you cannot
+satisfy with a `*.run.app` URL anyway, because those are Google-owned and cannot
+be verified as your domain.
+
+The "Internal" user type sidesteps all of it, but requires a Google Workspace
+organisation. A `@gmail.com` account does not have one.
+
+So the seven-day token is not a problem to engineer around. It is the operating
+condition:
+
+1. **Stay in Testing.** Leave home page, privacy policy, terms and authorized
+   domains blank. Add both mailboxes under **Test users**.
+2. **Re-run the bootstrap weekly**, and put a calendar reminder on it. During
+   the week that matters, do it on the morning of the demo whether or not it
+   looks like it needs it.
+
+What makes this survivable is noticing quickly. An expired token surfaces as
+`invalid_grant`, which the tick reports as an error rather than a crash — so
+check `/healthz` and the tick logs, not just whether the service is up.
 
 ## The mailboxes
 
@@ -45,10 +64,12 @@ poor choice for it.
 2. **APIs & Services → Library →** enable **Gmail API**.
 3. **APIs & Services → OAuth consent screen**
    - User type: External.
-   - Add both mailboxes under **Test users** while it is in testing mode.
+   - Add both mailboxes under **Test users**. Leave it in Testing — see above.
    - Add scopes `gmail.send` and `gmail.modify`. Nothing wider — the agent has
      no business deleting mail, so `mail.google.com` is not requested.
-   - Publish it when you are ready to stop re-authing every seven days.
+   - Leave the app home page, privacy policy and authorized domains **blank**.
+     They are optional in Testing, and filling them in is the first step down
+     the publishing path that does not lead anywhere.
 4. **APIs & Services → Credentials → Create credentials → OAuth client ID**
    - Application type: **Desktop app**.
    - Download the JSON and save it as `.secrets/client_secret.json`.
@@ -129,7 +150,8 @@ notices when that goes wrong because our own routing uses Gmail's thread ID.
 | Symptom | Cause |
 | --- | --- |
 | `No refresh token at .secrets/...` | Bootstrap has not been run on this machine. |
-| `invalid_grant` on a tick | Token expired (testing mode, seven days) or was revoked. Re-run the bootstrap. |
+| `invalid_grant` on a tick | Token expired (testing mode, seven days) or was revoked. Re-run the bootstrap. This is the expected weekly failure, not a bug. |
+| Console demands a home page or privacy policy URL | You have started publishing. Go back to Testing; those fields are optional there. |
 | Every tick refiles the same replies | The `gmail.modify` scope is missing, so `UNREAD` is never cleared. Re-consent with both scopes. |
 | The agent replies to itself | `CINEMA_AGENT_EMAIL` does not match the authorised mailbox, so `-from:me` no longer excludes our own sent mail. |
 | Replies land in a fresh thread each time | Threading headers. See step 5 above. |
