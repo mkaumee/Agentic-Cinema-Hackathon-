@@ -4,7 +4,8 @@
 # tee's. /bin/sh is dash on Debian and has no `pipefail`, so ask for bash.
 SHELL := /bin/bash
 
-.PHONY: help setup fmt lint types guard test test-all rules-test check emulator e2e image clean gcp-setup deploy-rules deploy verify-deploy
+.PHONY: help setup fmt lint types guard test test-all rules-test check emulator e2e image clean
+.PHONY: gcp-setup deploy-rules deploy verify-deploy require-firebase require-gcloud require-project
 
 help:
 	@grep -E '^[a-z-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
@@ -66,16 +67,40 @@ e2e: ## The daily ten-minute habit: boot the emulators, run the loop end to end
 	firebase emulators:exec --only firestore,auth --project demo-cinema \
 		"uv run python scripts/run_e2e.py"
 
-gcp-setup: ## Stand up the Google Cloud project (run once; needs gcloud + PROJECT_ID)
+gcp-setup: require-gcloud require-project ## Stand up the Google Cloud project (run once)
 	PROJECT_ID=$(PROJECT_ID) ./scripts/gcp_setup.sh
 
-deploy-rules: ## Push both rules files and the indexes to the real project
+# Rules and indexes need firebase-tools; the Cloud Run half needs gcloud. Both
+# are pre-installed in Cloud Shell, which is why docs/deploy-runbook.md assumes
+# it. Checked here because `make: firebase: No such file or directory` tells you
+# nothing about what to do next.
+require-firebase:
+	@command -v firebase >/dev/null || { \
+	  echo "firebase CLI not found."; \
+	  echo "  Cloud Shell has it already — see docs/deploy-runbook.md."; \
+	  echo "  Locally:  npm install -g firebase-tools && firebase login"; \
+	  exit 2; }
+
+require-gcloud:
+	@command -v gcloud >/dev/null || { \
+	  echo "gcloud not found."; \
+	  echo "  Cloud Shell has it already — see docs/deploy-runbook.md."; \
+	  echo "  Locally:  https://cloud.google.com/sdk/docs/install"; \
+	  exit 2; }
+
+require-project:
+	@[ -n "$(PROJECT_ID)" ] || { \
+	  echo "PROJECT_ID is not set."; \
+	  echo "  make $(MAKECMDGOALS) PROJECT_ID=your-project-id"; \
+	  exit 2; }
+
+deploy-rules: require-firebase require-project ## Push both rules files and the indexes to the real project
 	firebase deploy --only firestore --project $(PROJECT_ID)
 
-deploy: ## Deploy both Cloud Run services and the Scheduler job (needs PROJECT_ID)
+deploy: require-gcloud require-project ## Deploy both Cloud Run services and the Scheduler job
 	PROJECT_ID=$(PROJECT_ID) ./scripts/deploy.sh
 
-verify-deploy: ## Check a deployment — read-only, and the real definition of done
+verify-deploy: require-gcloud require-project ## Check a deployment — read-only, and the real definition of done
 	PROJECT_ID=$(PROJECT_ID) ./scripts/verify_deploy.sh
 
 image: ## Build the Cloud Run image (context is the repo root, deliberately)
