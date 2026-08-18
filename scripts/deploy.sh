@@ -82,6 +82,11 @@ TOKEN_SECRET="${TOKEN_SECRET:-gmail-agent-refresh-token}"
 TICK_SERVICE="${TICK_SERVICE:-cinema-tick}"
 APPROVALS_SERVICE="${APPROVALS_SERVICE:-cinema-approvals}"
 
+# `memory` unless explicitly asked otherwise. See the header.
+MAIL_BACKEND="${MAIL_BACKEND:-memory}"
+OAUTH_CLIENT_ID="${CINEMA_OAUTH_CLIENT_ID:-}"
+OAUTH_CLIENT_SECRET="${CINEMA_OAUTH_CLIENT_SECRET:-}"
+
 if [[ -z "$PROJECT_ID" ]]; then
   echo "PROJECT_ID is not set." >&2
   echo "  PROJECT_ID=your-project-id $0" >&2
@@ -130,6 +135,61 @@ EOF
   exit 4
 fi
 ok "billing is linked"
+
+# ---------------------------------------------------------------------------
+say "Preflight — mail"
+# ---------------------------------------------------------------------------
+#
+# The one failure this script exists to prevent. build_services() constructs the
+# mail transport during startup, so `gmail` with nothing behind it is not a
+# degraded service — it is a container that raises before it can serve
+# /healthz, a Cloud Run revision that never goes ready, and a deploy that fails
+# at the last and most expensive step. Every condition is checkable up front, so
+# check it up front.
+
+case "$MAIL_BACKEND" in
+  memory)
+    ok "mail is off (MAIL_BACKEND=memory) — nothing will email a real seller"
+    ;;
+  gmail)
+    problems=()
+    versions=$(gcloud secrets versions list "$TOKEN_SECRET" \
+      --filter='state:ENABLED' --format='value(name)' 2>/dev/null | wc -l | tr -d ' ')
+    [[ "$versions" -gt 0 ]] \
+      || problems+=("secret '$TOKEN_SECRET' has no enabled version — the refresh token has not been bootstrapped into it")
+    [[ -n "$OAUTH_CLIENT_ID" ]] \
+      || problems+=("CINEMA_OAUTH_CLIENT_ID is not set — token refresh fails with invalid_client")
+    [[ -n "$OAUTH_CLIENT_SECRET" ]] \
+      || problems+=("CINEMA_OAUTH_CLIENT_SECRET is not set")
+
+    if (( ${#problems[@]} > 0 )); then
+      printf '  \033[31m✗\033[0m %s\n' "${problems[@]}" >&2
+      cat >&2 <<EOF
+
+  MAIL_BACKEND=gmail cannot work yet, and deploying it would produce a service
+  that fails its health check rather than one that runs without email.
+
+  Either deploy without mail first — the loop still ticks and negotiates:
+
+    PROJECT_ID=$PROJECT_ID $0
+
+  or finish the Gmail side first (docs/oauth-runbook.md):
+
+    CINEMA_TOKEN_BACKEND=secret-manager CINEMA_GCP_PROJECT=$PROJECT_ID \\
+      uv run python scripts/oauth_bootstrap.py
+
+  Nothing has been changed.
+EOF
+      exit 5
+    fi
+    ok "refresh token present ($versions version(s)) and OAuth client configured"
+    printf '  \033[33m!\033[0m this deploy WILL email real sellers once it ticks\n'
+    ;;
+  *)
+    echo "  ✗ MAIL_BACKEND must be 'memory' or 'gmail', got '$MAIL_BACKEND'" >&2
+    exit 2
+    ;;
+esac
 
 # ---------------------------------------------------------------------------
 say "APIs"
@@ -253,6 +313,27 @@ ok "$IMAGE"
 say "Cloud Run"
 # ---------------------------------------------------------------------------
 
+# Assembled rather than inlined because the OAuth pair is only present when the
+# Gmail side is configured, and an empty client id is worse than an absent one:
+# it produces a credential that looks valid and fails at refresh.
+#
+# The `^@^` prefix switches gcloud's list delimiter from comma to `@`. An OAuth
+# client secret can legitimately contain a comma, and with the default delimiter
+# that would split one variable into two malformed ones.
+TICK_ENV="CINEMA_GCP_PROJECT=${PROJECT_ID}"
+TICK_ENV="${TICK_ENV}@CINEMA_ORDERS_DATABASE=${ORDERS_DB}"
+TICK_ENV="${TICK_ENV}@CINEMA_MAIL_BACKEND=${MAIL_BACKEND}"
+TICK_ENV="${TICK_ENV}@CINEMA_TOKEN_BACKEND=secret-manager"
+TICK_ENV="${TICK_ENV}@CINEMA_REFRESH_TOKEN_SECRET=${TOKEN_SECRET}"
+TICK_ENV="${TICK_ENV}@CINEMA_LOG_FORMAT=json"
+if [[ -n "$OAUTH_CLIENT_ID" ]]; then
+  TICK_ENV="${TICK_ENV}@CINEMA_OAUTH_CLIENT_ID=${OAUTH_CLIENT_ID}"
+  TICK_ENV="${TICK_ENV}@CINEMA_OAUTH_CLIENT_SECRET=${OAUTH_CLIENT_SECRET}"
+fi
+if [[ -n "${CINEMA_AGENT_EMAIL:-}" ]]; then
+  TICK_ENV="${TICK_ENV}@CINEMA_AGENT_EMAIL=${CINEMA_AGENT_EMAIL}"
+fi
+
 # --timeout is under the one-minute schedule on purpose, so a wedged tick
 # cannot still be running when the next one fires. That is only safe because
 # the tick claims each row before working on it — a truncated tick leaves
@@ -267,9 +348,9 @@ gcloud run deploy "$TICK_SERVICE" \
   --max-instances=2 \
   --min-instances=0 \
   --memory=512Mi \
-  --set-env-vars="CINEMA_GCP_PROJECT=${PROJECT_ID},CINEMA_ORDERS_DATABASE=${ORDERS_DB},CINEMA_MAIL_BACKEND=gmail,CINEMA_TOKEN_BACKEND=secret-manager,CINEMA_LOG_FORMAT=json" \
+  --set-env-vars="^@^${TICK_ENV}" \
   --quiet >/dev/null
-ok "$TICK_SERVICE  (orchestrator.app:app, as $AGENT_SA)"
+ok "$TICK_SERVICE  (orchestrator.app:app, as $AGENT_SA, mail=$MAIL_BACKEND)"
 
 # Same image, different command and a different account. The command override
 # is the entire difference between the service that cannot spend money and the
@@ -291,7 +372,7 @@ gcloud run deploy "$APPROVALS_SERVICE" \
   --timeout=60s \
   --max-instances=2 \
   --memory=512Mi \
-  --set-env-vars="CINEMA_GCP_PROJECT=${PROJECT_ID},CINEMA_ORDERS_DATABASE=${ORDERS_DB},CINEMA_LOG_FORMAT=json" \
+  --set-env-vars="^@^CINEMA_GCP_PROJECT=${PROJECT_ID}@CINEMA_ORDERS_DATABASE=${ORDERS_DB}@CINEMA_LOG_FORMAT=json" \
   --quiet >/dev/null
 ok "$APPROVALS_SERVICE  (orchestrator.approvals:app, as $APPROVALS_SA)"
 
@@ -350,6 +431,18 @@ gcloud projects get-iam-policy "$PROJECT_ID" \
   --filter="bindings.members:serviceAccount:${APPROVALS_EMAIL}" \
   --format='table(bindings.role, bindings.condition.expression)'
 
+if [[ "$MAIL_BACKEND" == "memory" ]]; then
+  NEXT_MAIL="  Mail is off. The loop will tick, research and open negotiations, and
+  send nothing. To turn real email on once the token is bootstrapped:
+
+    CINEMA_OAUTH_CLIENT_ID=... CINEMA_OAUTH_CLIENT_SECRET=... \\
+      MAIL_BACKEND=gmail PROJECT_ID=$PROJECT_ID ./scripts/deploy.sh
+"
+else
+  NEXT_MAIL="  Mail is ON. The next tick emails whatever suppliers research finds.
+"
+fi
+
 cat <<EOF
 
 $(printf '\033[1mDeployed\033[0m')
@@ -357,34 +450,23 @@ $(printf '\033[1mDeployed\033[0m')
   tick       $TICK_URL      (private; Scheduler only)
   approvals  $APPROVALS_URL
 
-$(printf '\033[1mCheck it, in this order\033[0m')
+$(printf '\033[1mNow verify it\033[0m')
 
-  1. The tick is genuinely private — this must fail with 403:
+  This script exiting 0 means the gcloud calls succeeded. It does not mean the
+  deploy is correct — in particular it says nothing about whether the tick
+  account can still reach the orders database, which is the one thing that
+  would quietly undo Phase 4.
 
-       curl -s -o /dev/null -w '%{http_code}\\n' -XPOST $TICK_URL/tick
+    PROJECT_ID=$PROJECT_ID ./scripts/verify_deploy.sh
 
-  2. It answers a real caller:
+$(printf '\033[1mThen\033[0m')
 
-       curl -H "Authorization: Bearer \$(gcloud auth print-identity-token)" \\
-         $TICK_URL/healthz
+$NEXT_MAIL
+  Leave it alone overnight. Come back to a negotiation that advanced with
+  nobody touching it, and one JSON line per minute:
 
-  3. The approval service is up and says which databases it holds:
-
-       curl $APPROVALS_URL/healthz
-
-  4. THE ONE THAT MATTERS. The tick account must be unable to reach the orders
-     database at all. Impersonate it and try — a PERMISSION_DENIED here is the
-     whole of Hard Rule 5, and a success means the deploy silently undid Phase 4:
-
-       gcloud firestore documents list --database=$ORDERS_DB \\
-         --collection-ids=purchase_orders \\
-         --impersonate-service-account=$AGENT_EMAIL
-
-  5. Leave it alone overnight. Come back to a negotiation that advanced with
-     nobody touching it, and one JSON line per minute in Cloud Logging:
-
-       gcloud logging read \\
-         'resource.labels.service_name="$TICK_SERVICE" jsonPayload.message="tick"' \\
-         --limit=20 --format='value(jsonPayload)'
+    gcloud logging read \\
+      'resource.labels.service_name="$TICK_SERVICE" jsonPayload.message="tick"' \\
+      --limit=20 --format='value(jsonPayload)'
 
 EOF
