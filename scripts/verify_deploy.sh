@@ -161,11 +161,23 @@ if impersonate_read "(default)"; then
     pass "the tick account cannot touch '$ORDERS_DB' — Hard Rule 5 holds"
   fi
 else
-  huh "could not impersonate $AGENT_SA, so the guardrail is untested"
-  note "This is NOT a pass. Grant yourself the right to impersonate and re-run:"
-  note "  gcloud iam service-accounts add-iam-policy-binding $AGENT_EMAIL \\"
-  note "    --member=\"user:\$(gcloud config get-value account)\" \\"
-  note "    --role=roles/iam.serviceAccountTokenCreator"
+  huh "$AGENT_SA could not read '(default)', so the guardrail is untested"
+  note "This is NOT a pass. Two different causes look identical here:"
+  note ""
+  note "  a) the account has no datastore.user binding at all — check with"
+  note "     gcloud projects get-iam-policy $PROJECT_ID \\"
+  note "       --flatten='bindings[].members' \\"
+  note "       --filter='bindings.members:serviceAccount:$AGENT_EMAIL' \\"
+  note "       --format='table(bindings.role, bindings.condition.expression)'"
+  note "     An empty table means gcp_setup.sh has not run. Run it."
+  note ""
+  note "  b) you may not impersonate it — grant yourself the right:"
+  note "     gcloud iam service-accounts add-iam-policy-binding $AGENT_EMAIL \\"
+  note "       --member=\"user:\$(gcloud config get-value account)\" \\"
+  note "       --role=roles/iam.serviceAccountTokenCreator"
+  note ""
+  note "Either way the agent cannot reach 'orders' because it cannot reach"
+  note "anything, which is a broken deploy that happens to look safe."
 fi
 
 # The other half of the split: the approvals account must reach both.
