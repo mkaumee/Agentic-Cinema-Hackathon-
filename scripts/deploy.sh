@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 #
 # Deploy the two Cloud Run services and the Scheduler job. Run by a human,
-# after scripts/gcp_setup.sh, from a machine with gcloud and Docker.
+# after scripts/gcp_setup.sh. Needs gcloud and git; deliberately not Docker.
 #
 #   PROJECT_ID=your-project-id ./scripts/deploy.sh
+#
+# Cloud Shell is the intended home: gcloud is already there and authenticated,
+# and the image is built by Cloud Build rather than a local daemon.
 #
 # Idempotent, in the same style as gcp_setup.sh: every step checks before it
 # creates, and re-running after a failure is safe.
@@ -12,11 +15,32 @@
 # NOT YET RUN AGAINST A REAL PROJECT
 # ---------------------------------------------------------------------------
 #
-# Written before billing was linked, on a machine with neither gcloud nor a
-# Docker daemon. The image it deploys is built and smoke-tested by CI on every
-# push, so that half is verified; the gcloud half below is not. Expect to fix
-# something the first time. Treat a clean run as the beginning of the check,
-# not the end of it — the verification block at the bottom is the real test.
+# Written on a machine with neither gcloud nor a Docker daemon. The image it
+# deploys is built and smoke-tested by CI on every push, so that half is
+# verified; every gcloud call below is not. Expect to fix something the first
+# time.
+#
+# A clean run is the beginning of the check, not the end of it. What decides
+# whether the deploy is correct is scripts/verify_deploy.sh — in particular
+# whether the tick account can still reach the orders database, which no amount
+# of green output here can tell you.
+#
+# ---------------------------------------------------------------------------
+# Mail is off unless you ask for it
+# ---------------------------------------------------------------------------
+#
+# MAIL_BACKEND defaults to `memory`. That is not timidity: build_services()
+# constructs the mail transport at startup, so deploying with `gmail` before a
+# refresh token exists in Secret Manager means the container raises during
+# startup and the Cloud Run health check never passes. A deploy with no mail
+# configured is a perfectly useful deploy — the loop ticks, researches and opens
+# negotiations, it just posts into an in-memory mailbox.
+#
+# Turn it on afterwards, once oauth_bootstrap.py has written a token:
+#
+#   MAIL_BACKEND=gmail PROJECT_ID=... ./scripts/deploy.sh
+#
+# which preflights the secret and the OAuth client before touching anything.
 #
 # ---------------------------------------------------------------------------
 # The thing this script must not get wrong
@@ -64,7 +88,10 @@ if [[ -z "$PROJECT_ID" ]]; then
   exit 2
 fi
 
-for tool in gcloud docker git; do
+# No docker. The image is built by Cloud Build, which is what Cloud Run does
+# internally anyway — and it means this runs in Cloud Shell, where there is
+# gcloud and no daemon.
+for tool in gcloud git; do
   command -v "$tool" >/dev/null || { echo "$tool is not installed." >&2; exit 2; }
 done
 
@@ -194,12 +221,32 @@ else
   ok "artifact registry $REPO"
 fi
 
-gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet >/dev/null
+# Since Google's 2024 Cloud Build service-account change, builds on newer
+# projects run as the Compute Engine default service account rather than the
+# legacy cloudbuild one, and that account does not get push or logging rights by
+# default. The failure is a permission error deep in a build log, which is a
+# miserable thing to diagnose, so grant both up front. Idempotent.
+PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')
+BUILD_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+
+for role in roles/artifactregistry.writer roles/logging.logWriter; do
+  if has_role "$BUILD_SA" "$role"; then
+    skip "$role for the build account"
+  else
+    gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+      --member="serviceAccount:${BUILD_SA}" --role="$role" >/dev/null
+    ok "$role for the build account"
+  fi
+done
 
 # Context is the repository root: `contracts` is a uv workspace path dependency
 # and a context of orchestrator/ cannot see it. See the Dockerfile.
-docker build -t "$IMAGE" "$(git rev-parse --show-toplevel)"
-docker push "$IMAGE"
+#
+# What actually leaves this machine is decided by .gcloudignore, which exists so
+# that is an explicit list rather than whatever .gitignore happens to say.
+say "Building — this takes a few minutes the first time"
+gcloud builds submit "$(git rev-parse --show-toplevel)" \
+  --tag="$IMAGE" --quiet
 ok "$IMAGE"
 
 # ---------------------------------------------------------------------------
