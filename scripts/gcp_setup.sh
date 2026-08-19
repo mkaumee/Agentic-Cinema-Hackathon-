@@ -155,7 +155,7 @@ Ask whoever owns the project to grant these on $PROJECT_ID:
 $(printf '  %s\n' "${unique_roles[@]}")
 
   gcloud projects add-iam-policy-binding $PROJECT_ID \\
-    --member="user:\$YOUR_EMAIL" \\
+    --member="user:\$YOUR_EMAIL" --condition=None \\
 $(printf '    --role=%s \\\n' "${unique_roles[@]}" | sed '$ s/ \\$//')
 
 If roles/resourcemanager.projectIamAdmin is in that list, read this before

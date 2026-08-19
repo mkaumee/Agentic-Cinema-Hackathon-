@@ -244,9 +244,15 @@ has_role() {
 if has_role "$APPROVALS_EMAIL" "roles/datastore.user"; then
   skip "datastore.user for $APPROVALS_SA"
 else
+  # --condition=None is not decoration. Once a policy holds any conditional
+  # binding — and ours does, the agent's scoped datastore.user — gcloud refuses
+  # to add an unconditioned one non-interactively and prompts for a choice.
+  # With stdout piped to /dev/null that prompt is invisible and the script
+  # simply appears to hang.
   gcloud projects add-iam-policy-binding "$PROJECT_ID" \
     --member="serviceAccount:${APPROVALS_EMAIL}" \
-    --role="roles/datastore.user" >/dev/null
+    --role="roles/datastore.user" \
+    --condition=None >/dev/null
   ok "datastore.user for $APPROVALS_SA — both databases, deliberately"
 fi
 
@@ -294,7 +300,8 @@ for role in roles/artifactregistry.writer roles/logging.logWriter; do
     skip "$role for the build account"
   else
     gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-      --member="serviceAccount:${BUILD_SA}" --role="$role" >/dev/null
+      --member="serviceAccount:${BUILD_SA}" --role="$role" \
+      --condition=None >/dev/null
     ok "$role for the build account"
   fi
 done

@@ -150,6 +150,7 @@ thing to look at the morning after — `messages_sent`, `claims_lost`,
 | `/tick` returns 200 but every project has an error | Indexes. Run `make deploy-rules`. |
 | `FAILED_PRECONDITION` with an index-creation link | Same, and the link builds it by hand if you are in a hurry. |
 | Cloud Build fails on push permissions | The build account needs `artifactregistry.writer`. `deploy.sh` grants it; if you built by hand, it did not. |
+| A script hangs with no output during an IAM step | gcloud is prompting for a condition. Once the project policy holds any conditional binding — ours does, the agent's scoped `datastore.user` — an unconditioned `add-iam-policy-binding` becomes interactive. Every call in our scripts passes `--condition=None`; if you are running one by hand, add it. |
 | `provisioning for project is taking too long` creating the Artifact Registry repo | First-use provisioning, and transient. Re-run `make deploy` — it is idempotent and picks up where it stopped. Seen on the very first deploy to a fresh project. |
 | `cinema-agent` shows no roles at the end of a deploy | `gcp_setup.sh` has not run. Every tick will fail `PERMISSION_DENIED`, and the guardrail will look like it holds because the agent cannot reach anything. Run `make gcp-setup`. |
 | `invalid_grant` after about a week | The testing-mode token expired. Expected. Re-run the bootstrap. |
