@@ -249,6 +249,12 @@ try_read() {
   esac
 }
 
+# Every branch that reports a problem prints what the tool actually said.
+# Twice in this project a check reported a confident, wrong diagnosis because
+# the underlying error was discarded: a gcloud subcommand that did not exist
+# read as a permission denial, and an impersonation failure gave no clue which
+# of several causes applied. The error text costs one line and is usually the
+# whole answer.
 grant_hint() {
   note "Grant yourself the right to impersonate, then re-run:"
   note "  gcloud iam service-accounts add-iam-policy-binding $1 \\"
@@ -285,6 +291,7 @@ case $? in
   2)
     huh "cannot impersonate $AGENT_SA, so the guardrail is untested"
     note "This is NOT a pass — it says nothing about what the agent can reach."
+    note "gcloud said: $LAST_ERR"
     grant_hint "$AGENT_EMAIL"
     ;;
 esac
@@ -305,6 +312,7 @@ case $? in
     ;;
   2)
     huh "cannot impersonate $APPROVALS_SA — untested"
+    note "gcloud said: $LAST_ERR"
     grant_hint "$APPROVALS_EMAIL"
     ;;
 esac
