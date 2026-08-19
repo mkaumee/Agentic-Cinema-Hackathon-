@@ -89,22 +89,55 @@ say "2. The tick is private, and answers an authorised caller"
 # ---------------------------------------------------------------------------
 #
 # Public would mean anyone on the internet can drive the agent's mailbox.
+#
+# The body matters as much as the code. A 404 from Cloud Run's front end ("The
+# requested URL was not found on this server") and a 404 from FastAPI
+# ({"detail":"Not Found"}) mean completely different things — wrong hostname
+# versus wrong route — and the status code alone cannot tell them apart.
+
+http() {
+  # Prints "CODE<TAB>first 160 bytes of body, newlines squashed".
+  local out code body
+  if ! out=$(curl -sS -w $'\n%{http_code}' "$@" 2>&1); then
+    printf '000\tcurl failed: %s\n' "$(head -c 120 <<<"$out" | tr '\n' ' ')"
+    return
+  fi
+  code=$(tail -n1 <<<"$out")
+  body=$(sed '$d' <<<"$out" | tr -d '\r' | tr '\n' ' ' | head -c 160)
+  printf '%s\t%s\n' "$code" "$body"
+}
+
+check_http() {
+  # check_http <label> <expected-code> <curl args...>
+  local label="$1" want="$2"; shift 2
+  local result code body
+  result=$(http "$@")
+  code=${result%%$'\t'*}
+  body=${result#*$'\t'}
+  if [[ "$code" == "$want" ]]; then
+    pass "$label ($code)"
+  else
+    fail "$label returned $code, expected $want"
+    [[ -n "$body" ]] && note "body: $body"
+  fi
+}
 
 if [[ -n "$TICK_URL" ]]; then
-  anon=$(curl -s -o /dev/null -w '%{http_code}' -XPOST "$TICK_URL/tick" || echo 000)
-  case "$anon" in
-    401|403) pass "an anonymous POST /tick is refused ($anon)" ;;
+  anon=$(http -XPOST "$TICK_URL/tick")
+  case "${anon%%$'\t'*}" in
+    401|403) pass "an anonymous POST /tick is refused (${anon%%$'\t'*})" ;;
     000)     huh "could not reach $TICK_URL at all" ;;
-    *)       fail "anonymous POST /tick returned $anon — the tick is PUBLIC" ;;
+    *)       fail "anonymous POST /tick returned ${anon%%$'\t'*} — the tick is PUBLIC"
+             note "body: ${anon#*$'\t'}" ;;
   esac
 
-  authed=$(curl -s -o /dev/null -w '%{http_code}' \
-    -H "Authorization: Bearer $(gcloud auth print-identity-token 2>/dev/null)" \
-    "$TICK_URL/healthz" || echo 000)
-  if [[ "$authed" == "200" ]]; then
-    pass "an authorised GET /healthz is served (200)"
+  token=$(gcloud auth print-identity-token 2>/dev/null || true)
+  if [[ -z "$token" ]]; then
+    huh "could not mint an identity token, so the authorised path is untested"
+    note "  gcloud auth login"
   else
-    fail "authorised GET /healthz returned $authed"
+    check_http "an authorised GET /healthz" 200 \
+      -H "Authorization: Bearer $token" "$TICK_URL/healthz"
   fi
 fi
 
@@ -112,23 +145,12 @@ if [[ -n "$APPROVALS_URL" ]]; then
   # Public on purpose: Cloud Run IAM cannot validate a Firebase ID token, so
   # the gate is auth.py. What must be true is that it refuses an anonymous
   # approval — a 401, not a 200.
-  health=$(curl -s -o /dev/null -w '%{http_code}' "$APPROVALS_URL/healthz" \
-    || echo 000)
-  if [[ "$health" == "200" ]]; then
-    pass "approvals /healthz is served (200)"
-  else
-    fail "approvals /healthz returned $health"
-  fi
+  check_http "approvals /healthz" 200 "$APPROVALS_URL/healthz"
 
-  approve=$(curl -s -o /dev/null -w '%{http_code}' -XPOST \
+  check_http "an unauthenticated approval is refused" 401 -XPOST \
     -H 'Content-Type: application/json' \
     -d '{"project_id":"none","negotiation_id":"none"}' \
-    "$APPROVALS_URL/items/none/approve" || echo 000)
-  if [[ "$approve" == "401" ]]; then
-    pass "an unauthenticated approval is refused (401)"
-  else
-    fail "unauthenticated approval returned $approve — expected 401"
-  fi
+    "$APPROVALS_URL/items/none/approve"
 fi
 
 # ---------------------------------------------------------------------------
@@ -137,64 +159,89 @@ say "3. THE GUARDRAIL — can the tick account reach the orders database?"
 #
 # The pair described at the top of this file. Read both results together or
 # neither of them means anything.
+#
+# One classifier, used for both accounts. An earlier version had two, written
+# differently, and they disagreed about the same underlying cause: the agent
+# check reported "unknown" while the approvals check reported "failed", from
+# what was almost certainly one missing permission. A verifier that describes
+# one fact two ways is worse than useless.
 
-impersonate_read() {
-  # Returns 0 when the read succeeded. Stderr is captured, not shown, because
-  # the interesting part is which of the two calls failed, not the wording.
-  local database="$1"
-  gcloud firestore documents list \
-    --database="$database" \
-    --collection-ids=purchase_orders \
-    --impersonate-service-account="$AGENT_EMAIL" \
-    --limit=1 >/dev/null 2>&1
+LAST_ERR=""
+
+try_read() {
+  # 0 = read succeeded
+  # 1 = impersonation worked, Firestore said no
+  # 2 = could not impersonate at all — tells us nothing about Firestore
+  local who="$1" database="$2" err
+  if err=$(gcloud firestore documents list \
+        --database="$database" \
+        --collection-ids=purchase_orders \
+        --impersonate-service-account="$who" \
+        --limit=1 2>&1); then
+    LAST_ERR=""
+    return 0
+  fi
+  LAST_ERR=$(tr '\n' ' ' <<<"$err" | head -c 240)
+  case "$err" in
+    *serviceAccountTokenCreator*|*getAccessToken*|*"Unable to acquire impersonated credentials"*)
+      return 2 ;;
+    *) return 1 ;;
+  esac
 }
 
-if impersonate_read "(default)"; then
-  note "impersonation works — a denial below is Firestore's, not IAM's"
+grant_hint() {
+  note "Grant yourself the right to impersonate, then re-run:"
+  note "  gcloud iam service-accounts add-iam-policy-binding $1 \\"
+  note "    --member=\"user:\$(gcloud config get-value account)\" \\"
+  note "    --role=roles/iam.serviceAccountTokenCreator"
+}
 
-  if impersonate_read "$ORDERS_DB"; then
-    fail "the tick account CAN read the '$ORDERS_DB' database"
-    note "Hard Rule 5 is not true in this deployment. The agent has a binding"
-    note "it must not have. Check which service account deploy.sh used, and"
-    note "look for an unconditioned roles/datastore.user on $AGENT_SA."
-  else
-    pass "the tick account cannot touch '$ORDERS_DB' — Hard Rule 5 holds"
-  fi
-else
-  huh "$AGENT_SA could not read '(default)', so the guardrail is untested"
-  note "This is NOT a pass. Two different causes look identical here:"
-  note ""
-  note "  a) the account has no datastore.user binding at all — check with"
-  note "     gcloud projects get-iam-policy $PROJECT_ID \\"
-  note "       --flatten='bindings[].members' \\"
-  note "       --filter='bindings.members:serviceAccount:$AGENT_EMAIL' \\"
-  note "       --format='table(bindings.role, bindings.condition.expression)'"
-  note "     An empty table means gcp_setup.sh has not run. Run it."
-  note ""
-  note "  b) you may not impersonate it — grant yourself the right:"
-  note "     gcloud iam service-accounts add-iam-policy-binding $AGENT_EMAIL \\"
-  note "       --member=\"user:\$(gcloud config get-value account)\" \\"
-  note "       --role=roles/iam.serviceAccountTokenCreator"
-  note ""
-  note "Either way the agent cannot reach 'orders' because it cannot reach"
-  note "anything, which is a broken deploy that happens to look safe."
-fi
+try_read "$AGENT_EMAIL" "(default)"
+case $? in
+  0)
+    note "impersonation works — a denial below is Firestore's, not IAM's"
+    if try_read "$AGENT_EMAIL" "$ORDERS_DB"; then
+      fail "the tick account CAN read the '$ORDERS_DB' database"
+      note "Hard Rule 5 is not true in this deployment. Look for an"
+      note "unconditioned roles/datastore.user on $AGENT_SA."
+    else
+      pass "the tick account cannot touch '$ORDERS_DB' — Hard Rule 5 holds"
+    fi
+    ;;
+  1)
+    huh "$AGENT_SA cannot read '(default)' either, so the guardrail is untested"
+    note "It should be able to. Either scripts/gcp_setup.sh has not run, or the"
+    note "conditioned binding has not propagated yet — IAM can take a few"
+    note "minutes. Check what it actually holds:"
+    note "  gcloud projects get-iam-policy $PROJECT_ID \\"
+    note "    --flatten='bindings[].members' \\"
+    note "    --filter='bindings.members:serviceAccount:$AGENT_EMAIL' \\"
+    note "    --format='table(bindings.role, bindings.condition.expression)'"
+    note "firestore said: $LAST_ERR"
+    ;;
+  2)
+    huh "cannot impersonate $AGENT_SA, so the guardrail is untested"
+    note "This is NOT a pass — it says nothing about what the agent can reach."
+    grant_hint "$AGENT_EMAIL"
+    ;;
+esac
 
 # The other half of the split: the approvals account must reach both.
-if impersonate_read_approvals=$(gcloud firestore documents list \
-     --database="$ORDERS_DB" --collection-ids=purchase_orders \
-     --impersonate-service-account="$APPROVALS_EMAIL" --limit=1 2>&1); then
-  pass "the approvals account can reach '$ORDERS_DB' — approval will work"
-else
-  case "$impersonate_read_approvals" in
-    *serviceAccountTokenCreator*|*iam.serviceAccounts.getAccessToken*)
-      huh "could not impersonate $APPROVALS_SA — untested" ;;
-    *)
-      fail "the approvals account CANNOT reach '$ORDERS_DB'"
-      note "Approving will fail at the point of writing the order. It needs an" 
-      note "unconditioned roles/datastore.user." ;;
-  esac
-fi
+try_read "$APPROVALS_EMAIL" "$ORDERS_DB"
+case $? in
+  0) pass "the approvals account can reach '$ORDERS_DB' — approval will work" ;;
+  1)
+    fail "the approvals account CANNOT reach '$ORDERS_DB'"
+    note "Approving will fail at the point of writing the order. It needs an"
+    note "unconditioned roles/datastore.user. If gcp_setup.sh only just ran,"
+    note "give IAM a few minutes and try again before changing anything."
+    note "firestore said: $LAST_ERR"
+    ;;
+  2)
+    huh "cannot impersonate $APPROVALS_SA — untested"
+    grant_hint "$APPROVALS_EMAIL"
+    ;;
+esac
 
 # ---------------------------------------------------------------------------
 say "4. Rules and indexes reached the real project"
