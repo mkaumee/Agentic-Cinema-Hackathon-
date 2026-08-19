@@ -726,7 +726,7 @@ async def test_health_says_whether_tokens_are_really_being_verified(
     """Trusting unsigned tokens is fine locally and alarming anywhere else, so
     the service says which it is doing rather than leaving it to be inferred
     from which terminal you are looking at."""
-    body = (await api.get("/healthz")).json()
+    body = (await api.get("/health")).json()
 
     assert body["status"] == "ok"
     assert body["orders_database"] == "orders"

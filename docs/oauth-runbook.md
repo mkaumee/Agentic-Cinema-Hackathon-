@@ -44,7 +44,7 @@ condition:
 
 What makes this survivable is noticing quickly. An expired token surfaces as
 `invalid_grant`, which the tick reports as an error rather than a crash — so
-check `/healthz` and the tick logs, not just whether the service is up.
+check `/health` and the tick logs, not just whether the service is up.
 
 ## The mailboxes
 
@@ -122,7 +122,7 @@ export CINEMA_OAUTH_CLIENT_SECRET="..."
 Confirm what is wired before trusting it:
 
 ```bash
-curl -s localhost:8000/healthz
+curl -s localhost:8000/health
 # {"status":"ok","mail_backend":"gmail","token_backend":"file",...}
 ```
 
@@ -155,4 +155,4 @@ notices when that goes wrong because our own routing uses Gmail's thread ID.
 | Every tick refiles the same replies | The `gmail.modify` scope is missing, so `UNREAD` is never cleared. Re-consent with both scopes. |
 | The agent replies to itself | `CINEMA_AGENT_EMAIL` does not match the authorised mailbox, so `-from:me` no longer excludes our own sent mail. |
 | Replies land in a fresh thread each time | Threading headers. See step 5 above. |
-| Nothing arrives, no error | `mail_backend` is still `memory`. Check `/healthz`. |
+| Nothing arrives, no error | `mail_backend` is still `memory`. Check `/health`. |

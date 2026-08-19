@@ -118,7 +118,7 @@ class Settings(BaseSettings):
     Defaults to the fake because Role A's ``main-agent`` is not on this branch
     yet. That default is a liability rather than a convenience: a fake that
     ships looks exactly like a working system until someone reads a negotiation
-    email. ``/healthz`` reports which one is live for that reason.
+    email. ``/health`` reports which one is live for that reason.
     """
 
     mail_backend: MailBackend = MailBackend.MEMORY
@@ -147,7 +147,7 @@ class Settings(BaseSettings):
     # -- approvals ---------------------------------------------------------- #
 
     auth_emulator_host: str = ""
-    """Mirrors FIREBASE_AUTH_EMULATOR_HOST, for reporting on /healthz.
+    """Mirrors FIREBASE_AUTH_EMULATOR_HOST, for reporting on /health.
 
     firebase-admin reads the environment variable itself; this exists so the
     approval service can say out loud whether it is verifying real signatures

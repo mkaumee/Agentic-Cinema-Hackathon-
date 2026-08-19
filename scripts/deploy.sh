@@ -143,7 +143,7 @@ say "Preflight — mail"
 # The one failure this script exists to prevent. build_services() constructs the
 # mail transport during startup, so `gmail` with nothing behind it is not a
 # degraded service — it is a container that raises before it can serve
-# /healthz, a Cloud Run revision that never goes ready, and a deploy that fails
+# /health, a Cloud Run revision that never goes ready, and a deploy that fails
 # at the last and most expensive step. Every condition is checkable up front, so
 # check it up front.
 

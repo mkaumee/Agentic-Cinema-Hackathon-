@@ -7,7 +7,7 @@
     POST /projects/{id}/script           read a screenplay for props
     POST /projects/{id}/items/confirm    a producer signs the list off
     POST /tick                           advance the world by one pass
-    GET  /healthz
+    GET  /health
 
 The upload and confirm steps are separate on purpose. Reading a script produces
 DRAFT items and nothing else happens; confirming is what starts research and,
@@ -228,9 +228,17 @@ class TickResponse(BaseModel):
     projects: list[TickResult]
 
 
-@app.get("/healthz")
-async def healthz(request: Request) -> Health:
+@app.get("/health")
+async def health(request: Request) -> Health:
     """Says what is actually wired, not just that the process is alive.
+
+    Named ``/health`` and not ``/healthz``, which is the reflex. On Cloud Run,
+    ``/healthz`` never reaches the container: Google's front end answers it
+    with its own HTML 404 while every neighbouring path is served normally.
+    Confirmed on the deployed service — ``/openapi.json`` returned 200 and
+    listed ``/healthz`` as a route, an unknown path returned our own JSON 404,
+    and ``/healthz`` alone returned Google's. Nothing in the app or in
+    ``deploy.sh`` can fix that; the path is simply not ours to use.
 
     "Up" is not the interesting question. "Is this about to email a real
     seller" and "is this the real brain or the fake" are.

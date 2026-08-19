@@ -5,7 +5,7 @@
     POST /items/{item_id}/approve        create the order, mark it ORDERED
     POST /negotiations/{nid}/floor       set a ceiling and hand it back
     POST /negotiations/{nid}/cancel      stop it
-    GET  /healthz
+    GET  /health
 
 ## Why this is not a route on app.py
 
@@ -190,8 +190,8 @@ class NegotiationUpdated(BaseModel):
 # --------------------------------------------------------------------------- #
 
 
-@app.get("/healthz")
-async def healthz(request: Request) -> Health:
+@app.get("/health")
+async def health(request: Request) -> Health:
     settings = services_of(request).settings
     return Health(
         status="ok",

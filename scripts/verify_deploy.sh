@@ -168,8 +168,8 @@ if [[ -n "$TICK_URL" ]]; then
     huh "could not mint an identity token, so the authorised path is untested"
     note "  gcloud auth login"
   else
-    check_http "an authorised GET /healthz" 200 \
-      -H "Authorization: Bearer $token" "$TICK_URL/healthz"
+    check_http "an authorised GET /health" 200 \
+      -H "Authorization: Bearer $token" "$TICK_URL/health"
   fi
 fi
 
@@ -177,7 +177,7 @@ if [[ -n "$APPROVALS_URL" ]]; then
   # Public on purpose: Cloud Run IAM cannot validate a Firebase ID token, so
   # the gate is auth.py. What must be true is that it refuses an anonymous
   # approval — a 401, not a 200.
-  check_http "approvals /healthz" 200 "$APPROVALS_URL/healthz"
+  check_http "approvals /health" 200 "$APPROVALS_URL/health"
 
   check_http "an unauthenticated approval is refused" 401 -XPOST \
     -H 'Content-Type: application/json' \

@@ -101,7 +101,7 @@ async def api(firestore: AsyncClient) -> httpx.AsyncClient:
 
 async def test_health_says_which_transports_are_wired(api: httpx.AsyncClient) -> None:
     """ "Alive" is not the useful question — "about to email a real seller" is."""
-    body = (await api.get("/healthz")).json()
+    body = (await api.get("/health")).json()
 
     assert body["status"] == "ok"
     assert body["brain_backend"] == "scripted"
@@ -206,7 +206,7 @@ def test_mail_defaults_to_memory_so_nothing_emails_a_real_seller() -> None:
 def test_the_brain_defaults_to_the_fake_and_says_so() -> None:
     """Role A's brain is on another branch, so the fake is the only option.
 
-    It is reported on /healthz rather than assumed, because a keyword matcher
+    It is reported on /health rather than assumed, because a keyword matcher
     writing negotiation emails looks like a working system right up until
     somebody reads one.
     """
@@ -236,9 +236,9 @@ def test_choosing_gmail_is_explicit_and_needs_a_token(tmp_path: Path) -> None:
 
 async def test_services_are_built_once_and_shared(api: httpx.AsyncClient) -> None:
     """Nothing per-request, nothing cached between ticks beyond Firestore."""
-    _ = await api.get("/healthz")
+    _ = await api.get("/health")
     first = app.state.services
-    _ = await api.get("/healthz")
+    _ = await api.get("/health")
     assert app.state.services is first
 
 
