@@ -472,4 +472,12 @@ async def tick(request: Request, project_id: str | None = None) -> TickResponse:
             log.warning("tick error", extra={"project_id": pid, "detail": message})
         results.append(result)
 
+    if not results:
+        # A tick with no projects to tick used to log nothing at all, which made
+        # the comment above a lie: a freshly deployed service and a Scheduler
+        # that had stopped firing produced identical silence. Found on the real
+        # deployment — Scheduler was running every minute and Cloud Logging had
+        # not a single line, because nobody had uploaded a screenplay yet.
+        log.info("tick", extra={"projects": 0, "note": "no projects exist yet"})
+
     return TickResponse(projects=results)

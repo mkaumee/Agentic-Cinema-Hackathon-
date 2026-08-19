@@ -220,11 +220,21 @@ try_read() {
   # subcommand exists first:  gcloud firestore --help
   local who="$1" database="$2" token code body encoded
 
+  # stderr to a file, NOT merged into the token. gcloud prints a WARNING about
+  # impersonation on every successful call, and folding that into $token gives
+  # an Authorization header containing a newline — which curl rejects with
+  # error 43, indistinguishable at a glance from a permissions problem.
+  local errfile
+  errfile=$(mktemp)
   if ! token=$(gcloud auth print-access-token \
-        --impersonate-service-account="$who" 2>&1); then
-    LAST_ERR=$(tr '\n' ' ' <<<"$token" | head -c 240)
+        --impersonate-service-account="$who" 2>"$errfile"); then
+    LAST_ERR=$(tr '\n' ' ' <"$errfile" | head -c 240)
+    rm -f "$errfile"
     return 2
   fi
+  rm -f "$errfile"
+  # Belt and braces: a token is one opaque word, so anything else is contamination.
+  token=$(tr -d '[:space:]' <<<"$token")
 
   # Parentheses are legal in a URL path, but encoding (default) settles it.
   encoded=${database//\(/%28}

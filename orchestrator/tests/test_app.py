@@ -8,6 +8,7 @@ directly, so these are as fast as unit tests while exercising the real routing,
 validation and response models.
 """
 
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -280,3 +281,22 @@ def test_a_request_without_startup_is_refused_rather_than_crashing() -> None:
     with pytest.raises(HTTPException) as caught:
         _ = services_of(bare)  # pyright: ignore[reportArgumentType]
     assert caught.value.status_code == 503
+
+
+async def test_a_tick_with_no_projects_still_logs(
+    api: httpx.AsyncClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Silence and "the scheduler stopped calling" must not look the same.
+
+    Found on the real deployment: Cloud Scheduler was firing every minute,
+    `lastAttemptTime` proved it, and Cloud Logging held not one line — because
+    the log statement lived inside the per-project loop and no screenplay had
+    been uploaded yet. An empty tick is a fact worth recording.
+    """
+    with caplog.at_level(logging.INFO, logger="orchestrator"):
+        body = (await api.post("/tick")).json()
+
+    assert body["projects"] == []
+    ticks = [r for r in caplog.records if r.getMessage() == "tick"]
+    assert len(ticks) == 1, "an empty tick must still produce a line"
+    assert getattr(ticks[0], "projects", None) == 0
