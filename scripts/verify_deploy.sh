@@ -107,6 +107,22 @@ http() {
   printf '%s\t%s\n' "$code" "$body"
 }
 
+whose_error() {
+  # Google's front end and our app both emit 404s and they mean opposite
+  # things. The front end answers in HTML with a robot picture and "That's all
+  # we know"; FastAPI answers {"detail":"Not Found"}. Telling them apart is the
+  # difference between "the request never reached the container" and "the route
+  # is wrong", and no status code carries that.
+  case "$1" in
+    *"That’s all we know"*|*"That's all we know"*|*"Error 404 (Not Found)"*|*"<!DOCTYPE html>"*)
+      echo "google" ;;
+    *'"detail"'*)
+      echo "app" ;;
+    *)
+      echo "unclear" ;;
+  esac
+}
+
 check_http() {
   # check_http <label> <expected-code> <curl args...>
   local label="$1" want="$2"; shift 2
@@ -116,10 +132,26 @@ check_http() {
   body=${result#*$'\t'}
   if [[ "$code" == "$want" ]]; then
     pass "$label ($code)"
-  else
-    fail "$label returned $code, expected $want"
-    [[ -n "$body" ]] && note "body: $body"
+    return
   fi
+  fail "$label returned $code, expected $want"
+  case "$(whose_error "$body")" in
+    google)
+      note "This is Google's front end, not our app — the request never"
+      note "reached the container. Usual causes, in order of likelihood:"
+      note "  · ingress is internal-only (Cloud Run 404s rather than 403s so"
+      note "    it does not leak that the service exists). Check with:"
+      note "      gcloud run services describe <svc> --region=$REGION \\"
+      note "        --format='value(spec.template.metadata.annotations)'"
+      note "  · the service or revision was deleted"
+      note "  · the hostname is stale — compare status.url against the URL"
+      note "    'gcloud run deploy' printed" ;;
+    app)
+      note "This came from our app, so the container is running and the route"
+      note "is the problem. body: $body" ;;
+    *)
+      note "body: $body" ;;
+  esac
 }
 
 if [[ -n "$TICK_URL" ]]; then

@@ -155,4 +155,6 @@ thing to look at the morning after — `messages_sent`, `claims_lost`,
 | `invalid_grant` after about a week | The testing-mode token expired. Expected. Re-run the bootstrap. |
 | `invalid_client` on the first send | `CINEMA_OAUTH_CLIENT_ID` / `_SECRET` are not set on the service. |
 | Anonymous `POST /tick` returns 200 | The tick is public. It should be `--no-allow-unauthenticated`; redeploy. |
+| An HTML 404 with a robot picture and "That's all we know" | Google's front end, not our app — the request never reached the container. Check ingress first: `gcloud run services describe <svc> --region=us-central1 --format='value(spec.template.metadata.annotations)'`. An `internal` ingress 404s rather than 403s, deliberately, so it does not leak that the service exists. |
+| A JSON 404 (`{"detail":"Not Found"}`) | Our app answered, so the container is fine and the route is wrong. |
 | Verifier says the tick account can read `orders` | The service accounts are the wrong way round. This is the one that silently undoes Phase 4 — fix before anything else. |
