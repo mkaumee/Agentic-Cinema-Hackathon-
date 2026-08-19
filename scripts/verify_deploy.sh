@@ -201,23 +201,51 @@ say "3. THE GUARDRAIL — can the tick account reach the orders database?"
 LAST_ERR=""
 
 try_read() {
-  # 0 = read succeeded
-  # 1 = impersonation worked, Firestore said no
-  # 2 = could not impersonate at all — tells us nothing about Firestore
-  local who="$1" database="$2" err
-  if err=$(gcloud firestore documents list \
-        --database="$database" \
-        --collection-ids=purchase_orders \
-        --impersonate-service-account="$who" \
-        --limit=1 2>&1); then
-    LAST_ERR=""
-    return 0
+  # Can this service account read this database?
+  #
+  #   0 = yes
+  #   1 = impersonation worked, Firestore said no
+  #   2 = could not impersonate — tells us nothing about Firestore
+  #   3 = the database does not exist
+  #
+  # Straight to the Firestore REST API with an impersonated access token.
+  #
+  # The obvious-looking `gcloud firestore documents list` DOES NOT EXIST. It
+  # was in an earlier version of this script and made the whole guardrail check
+  # meaningless: gcloud answers an unknown subcommand with "Invalid choice" and
+  # a non-zero exit, which reads exactly like a permission denial. Two runs
+  # reported FAIL on a check that had never once contacted Firestore.
+  #
+  # If you are tempted to swap this back to a gcloud subcommand, confirm the
+  # subcommand exists first:  gcloud firestore --help
+  local who="$1" database="$2" token code body encoded
+
+  if ! token=$(gcloud auth print-access-token \
+        --impersonate-service-account="$who" 2>&1); then
+    LAST_ERR=$(tr '\n' ' ' <<<"$token" | head -c 240)
+    return 2
   fi
-  LAST_ERR=$(tr '\n' ' ' <<<"$err" | head -c 240)
-  case "$err" in
-    *serviceAccountTokenCreator*|*getAccessToken*|*"Unable to acquire impersonated credentials"*)
-      return 2 ;;
-    *) return 1 ;;
+
+  # Parentheses are legal in a URL path, but encoding (default) settles it.
+  encoded=${database//\(/%28}
+  encoded=${encoded//\)/%29}
+
+  if ! body=$(curl -sS -w $'\n%{http_code}' \
+      -H "Authorization: Bearer $token" \
+      "https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/${encoded}/documents/purchase_orders?pageSize=1" \
+      2>&1); then
+    LAST_ERR="curl failed: $(tr '\n' ' ' <<<"$body" | head -c 200)"
+    return 2
+  fi
+
+  code=$(tail -n1 <<<"$body")
+  LAST_ERR=$(sed '$d' <<<"$body" | tr '\n' ' ' | head -c 240)
+
+  case "$code" in
+    200) LAST_ERR=""; return 0 ;;
+    403) return 1 ;;
+    404) return 3 ;;
+    *)   return 1 ;;
   esac
 }
 
@@ -230,6 +258,9 @@ grant_hint() {
 
 try_read "$AGENT_EMAIL" "(default)"
 case $? in
+  3)
+    fail "the '(default)' database does not exist"
+    note "Run scripts/gcp_setup.sh." ;;&
   0)
     note "impersonation works — a denial below is Firestore's, not IAM's"
     if try_read "$AGENT_EMAIL" "$ORDERS_DB"; then
@@ -261,6 +292,9 @@ esac
 # The other half of the split: the approvals account must reach both.
 try_read "$APPROVALS_EMAIL" "$ORDERS_DB"
 case $? in
+  3)
+    fail "the '$ORDERS_DB' database does not exist"
+    note "Run scripts/gcp_setup.sh." ;;&
   0) pass "the approvals account can reach '$ORDERS_DB' — approval will work" ;;
   1)
     fail "the approvals account CANNOT reach '$ORDERS_DB'"
