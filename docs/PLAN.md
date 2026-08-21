@@ -54,32 +54,37 @@ Verified, not assumed — every claim below is covered by a test in the repo.
 | `orchestrator/state_machine.py` | Done, `ORDERED` proven unreachable by agent |
 | `orchestrator/records.py`, `repository.py` | Done, emulator-tested |
 | `firestore.rules`, `firestore.orders.rules`, indexes | Done, both files executed by `make rules-test` |
-| GCP setup script, two-database split | Done; script not yet run against a real project |
+| GCP setup script, two-database split | Run against the real project; both databases live |
 | `orchestrator/mail.py` — transport seam + in-memory impl | Done |
 | `orchestrator/tick.py` — the loop | Done, kill-mid-run tested |
 | `scripts/run_e2e.py` / `make e2e` | Green, ends with 0 purchase orders |
 | `orchestrator/auth.py`, `approvals.py`, `scripts/grant_producer.py` | Done, emulator-tested |
 | `orchestrator/logs.py` — JSON for Cloud Logging | Done |
 | Row claiming — overlapping ticks cannot double-email | Done, proven by a concurrent test |
-| `Dockerfile` | Written; **built and smoke-tested by CI**, never by hand |
-| `scripts/deploy.sh` | Written and audited; **never run**. Cloud Build, mail off by default |
-| `scripts/verify_deploy.sh` | Written; the real definition of "deployed" |
+| `Dockerfile` | Built by CI on every push, and by Cloud Build for the live deploy |
+| `scripts/deploy.sh` | **Run.** Two Cloud Run services + Scheduler live on `encoded-phalanx-505503-v8` |
+| `scripts/verify_deploy.sh` | **12 passed, 0 failed, 0 unknown** on the live project |
 | `docs/deploy-runbook.md` | The order to do it in, and what each failure means |
 | **Phase 1** — settings, Gmail transport, HTTP service, OAuth bootstrap, runbook, CI | Done |
 | **Phase 2** — script upload, prop confirmation, research, negotiation creation | Done |
 | **Phase 4** — auth, approval service, rules tests | Done |
-| **Phase 3** — the code half | Done. The deploy is unblocked and waiting to be run |
+| **Phase 3** — deploy | **Done and verified against real infrastructure** |
 
-228 Python tests, plus 22 rules tests in `web/`. CI fails the build if any
+229 Python tests, plus 22 rules tests in `web/`. CI fails the build if any
 Python test skips, since a green run that skipped the guardrail tests is worse
 than a red one — `make check` runs the same `test-all` target for that reason,
 so a green laptop and a green CI mean the same thing.
 
 **Not started**
 
-Running the deploy — no longer blocked; the $100 credit landed, so this is the
-next thing to do and it needs a human with Cloud Shell · `web/` has rules tests
-but no app yet (Phases 5–6) · `supplier-sim/`, scaffolding only (later).
+`web/` has rules tests but no app yet (Phases 5–6) · `supplier-sim/`,
+scaffolding only (later) · the live Gmail round-trip, which needs the OAuth
+bootstrap and two mailboxes.
+
+**The deployed system is empty.** Everything runs; nothing has been uploaded.
+The next milestone is a screenplay in Firestore so the Scheduler has work —
+after that the loop advances on its own, into an in-memory mailbox until the
+Gmail cutover.
 
 **Known debts, carried deliberately**
 
@@ -90,19 +95,13 @@ but no app yet (Phases 5–6) · `supplier-sim/`, scaffolding only (later).
   Settled for real deploys — `firebase deploy --only firestore` against
   `encoded-phalanx-505503-v8` on 18 Aug compiled and released *both* files, so
   the array form is honoured there. The gap is emulator-only.
-- **Nothing is deployed yet**, but the credit has landed and the script has
-  been audited against the code it deploys. Four things that would each have
-  cost an hour are fixed: the service would not have booted (mail configured
-  before a token existed), Gmail would have failed later anyway (no OAuth client
-  in the environment), `docker` was required where Cloud Shell has none, and
-  `.secrets/` was not actually gitignored — so a refresh token could have been
-  committed, or uploaded to Cloud Build. Still never executed; assume the first
-  run finds something. The image half is verified: CI builds it and curls
-  `/healthz` on every push.
-- `/tick` is still unauthenticated *in code*. The protection is deployment-side
-  — private ingress plus a Scheduler OIDC token, both in `deploy.sh` — so it is
-  real only once deployed. A home-grown shared secret in the meantime would
-  look like protection without being any.
+- ~~Nothing is deployed.~~ Both services, the Scheduler job and both databases
+  are live on `encoded-phalanx-505503-v8`, and `make verify-deploy` reports
+  12/0/0 — including the guardrail pair: the tick account reads `(default)`
+  and is refused on `orders`.
+- `/tick` is unauthenticated in code; the protection is deployment-side, and it
+  is now real — an anonymous `POST /tick` against the live service returns 403,
+  and only the Scheduler service account holds `run.invoker`.
 - The live email round-trip is unproven — it needs two mailboxes and the OAuth
   bootstrap. The transport is covered offline; `docs/oauth-runbook.md` is the
   checklist.
@@ -141,7 +140,7 @@ wrong, not the invariant.
 **Goal.** A deployable HTTP service that sends and receives real Gmail.
 
 **Shipped.** `settings.py`, `gmail.py` (transport + file/Secret-Manager token
-stores), `app.py` (`GET /healthz`, `POST /tick`), `scripts/oauth_bootstrap.py`,
+stores), `app.py` (`GET /health`, `POST /tick`), `scripts/oauth_bootstrap.py`,
 `docs/oauth-runbook.md`, and CI running the full gate on push.
 
 Also fixed a latent bug found while building it: threading was keyed on Gmail's
@@ -293,12 +292,20 @@ around. What the system owes under contention is not that every item succeeds,
 but that none is silently dropped: each either completes or is reported, and a
 reported one comes back when its lease expires. Both are now asserted.
 
-**Still to do — now unblocked.** Follow `docs/deploy-runbook.md`: rules first,
-then `make deploy` with mail off, then `make verify-deploy`. The check that
-matters is the guardrail pair — impersonate the tick account, read `(default)`
-successfully, then fail to read `orders`. Only the pair means anything, because
-impersonation itself denies identically when you lack
+**Done when — met.** `make verify-deploy` against
+`encoded-phalanx-505503-v8`: **12 passed, 0 failed, 0 could not be determined**,
+including the guardrail pair — the tick account reads `(default)` and is refused
+on `orders`, so the denial is Firestore's rather than an artefact of missing
 `serviceAccountTokenCreator`.
+
+**What the first real run cost, and why it was worth it.** Four things that no
+green test suite could have found: `/healthz` never reaches a Cloud Run
+container (Google's front end answers it), a conditional IAM policy turns every
+later `add-iam-policy-binding` interactive and a piped script appears to hang,
+the guardrail check was calling a gcloud subcommand that does not exist, and a
+tick with no projects logged nothing at all — making a live Scheduler
+indistinguishable from a dead one. Each is fixed, with the reason recorded where
+the next person will hit it.
 
 **Build**
 

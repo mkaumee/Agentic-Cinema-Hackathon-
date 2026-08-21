@@ -12,18 +12,27 @@
 # creates, and re-running after a failure is safe.
 #
 # ---------------------------------------------------------------------------
-# NOT YET RUN AGAINST A REAL PROJECT
+# Run against encoded-phalanx-505503-v8 on 21 Aug 2026, verified 12/0/0
 # ---------------------------------------------------------------------------
 #
-# Written on a machine with neither gcloud nor a Docker daemon. The image it
-# deploys is built and smoke-tested by CI on every push, so that half is
-# verified; every gcloud call below is not. Expect to fix something the first
-# time.
+# Written on a machine with neither gcloud nor a Docker daemon, so the first
+# real run found things. Kept here because they are the failures a second
+# project would hit too:
 #
-# A clean run is the beginning of the check, not the end of it. What decides
-# whether the deploy is correct is scripts/verify_deploy.sh — in particular
-# whether the tick account can still reach the orders database, which no amount
-# of green output here can tell you.
+#   · Artifact Registry provisioning timed out on first use. Transient; the
+#     re-run picked up where it stopped, which is what idempotency is for.
+#   · Once the project policy held the agent's conditioned binding, every
+#     unconditioned add-iam-policy-binding became interactive. Piped to
+#     /dev/null that prompt is invisible and the script looks hung. Hence
+#     --condition=None on every one of them.
+#   · /healthz never reached the container — Google's front end answers it
+#     with its own 404 on Cloud Run. The health route is /health for that
+#     reason. See the note on the route in app.py.
+#
+# A clean run is still the beginning of the check, not the end of it. What
+# decides whether the deploy is correct is scripts/verify_deploy.sh — in
+# particular whether the tick account can still reach the orders database,
+# which no amount of green output here can tell you.
 #
 # ---------------------------------------------------------------------------
 # Mail is off unless you ask for it
