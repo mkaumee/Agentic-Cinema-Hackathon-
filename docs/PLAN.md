@@ -247,7 +247,7 @@ emails go out to researched suppliers. No hand-seeded documents anywhere.
 
 ---
 
-## Phase 3 — Deploy, and start the clock for real — CODE DONE, DEPLOY BLOCKED
+## Phase 3 — Deploy, and start the clock for real — DONE
 
 **Goal.** Cloud Scheduler ticking every minute against a real project, with a
 real negotiation in flight.
@@ -489,16 +489,11 @@ building.
   are written and tested, but BlueGecko has not agreed to them. Every day he
   builds against something else is a day of rework. This is the highest-value
   conversation available right now.
-- **Who publishes the OAuth consent screen**, and when. Blocks Phase 1 closing
-  properly; testing-mode tokens will not survive a real negotiation.
-- **Billing.** Project `encoded-phalanx-505503-v8` has no billing account
-  linked. IAM access turned out to be fine — the preflight passes all five
-  permissions — but Secret Manager, Cloud Run and Cloud Scheduler refuse to
-  enable without billing. Firestore enables regardless, which is why this
-  presents as a half-finished setup rather than a clean refusal.
-
-      gcloud billing projects link encoded-phalanx-505503-v8 \
-        --billing-account=ACCOUNT_ID
-
-  Linking needs Billing Account Administrator on the *billing account*, which
-  is a separate grant from anything on the project.
+- ~~Who publishes the OAuth consent screen.~~ Answered, and the answer is
+  nobody: `gmail.modify` is a restricted scope, so publishing forces Google's
+  verification plus a CASA security assessment. The app stays in Testing and we
+  re-auth weekly. What is still open is **who runs the bootstrap and owns the
+  two mailboxes** — that is the last thing standing between us and a real
+  negotiation.
+- ~~Billing.~~ Linked. $100 of credit, and the per-minute tick sits inside the
+  free tier; what will actually spend it is Role A's model calls.
