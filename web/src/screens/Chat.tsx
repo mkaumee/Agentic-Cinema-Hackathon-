@@ -29,6 +29,7 @@ import { Link } from "react-router-dom";
 import type { Row } from "@/chat/rows";
 import { useGreenlitThread } from "@/chat/useGreenlitThread";
 import { Decision } from "@/components/chat/DecisionPart";
+import { Question } from "@/components/chat/QuestionPart";
 import { signOutOfEverything, USE_EMULATOR, type User } from "@/firebase";
 import { MailboxCard } from "@/components/chat/MailboxCard";
 import { NewProduction } from "@/components/chat/NewProduction";
@@ -82,7 +83,7 @@ export function Chat({
     negotiationIds,
   );
 
-  const { runtime, waiting, openings, readScript, busy } = useGreenlitThread({
+  const { runtime, waiting, openings, questions, readScript, busy } = useGreenlitThread({
     projectId,
     items,
     negotiations,
@@ -107,6 +108,7 @@ export function Chat({
             mailbox={mailbox}
             waiting={waiting}
             openings={openings}
+            questions={questions}
             readError={readError}
             loading={loading}
           />
@@ -166,6 +168,7 @@ function Rail({
   mailbox,
   waiting,
   openings,
+  questions,
   readError,
   loading,
   negotiations,
@@ -177,6 +180,7 @@ function Rail({
   mailbox: ReturnType<typeof useMailbox>;
   waiting: Row[];
   openings: Row[];
+  questions: Row[];
   readError: string;
   loading: boolean;
   negotiations: Negotiation[];
@@ -268,15 +272,15 @@ function Rail({
               waiting on a person exactly as much as a quote is, and it is the
               one the producer will not go looking for — the agent writes it
               while they are elsewhere. */}
-          {waiting.length + openings.length > 0 && (
+          {waiting.length + openings.length + questions.length > 0 && (
             <span className="ml-2 rounded-full bg-foreground px-1.5 py-0.5 text-xs text-background">
-              {waiting.length + openings.length}
+              {waiting.length + openings.length + questions.length}
             </span>
           )}
         </p>
         {loading ? (
           <SkeletonRows rows={2} className="mt-1" />
-        ) : waiting.length + openings.length === 0 ? (
+        ) : waiting.length + openings.length + questions.length === 0 ? (
           <p className="mt-1 text-xs text-muted-foreground">
             Nothing is waiting on a decision. The agent stops here every time,
             so this filling in is how you find out.
@@ -302,6 +306,22 @@ function Rail({
                     rounds: row.roundsUsed,
                     reason: row.reason,
                     rivals: row.rivals,
+                  }}
+                  negotiationId={row.negotiationId}
+                  projectId={projectId}
+                />
+              ) : null,
+            )}
+            {questions.map((row) =>
+              row.kind === "question" ? (
+                <Question
+                  key={row.id}
+                  compact
+                  args={{
+                    negotiationId: row.negotiationId,
+                    item: row.itemName,
+                    supplier: row.supplier,
+                    asked: row.asked,
                   }}
                   negotiationId={row.negotiationId}
                   projectId={projectId}

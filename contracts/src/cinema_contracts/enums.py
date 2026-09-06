@@ -87,6 +87,18 @@ class EscalationReason(StrEnum):
     PRICE_IN_ATTACHMENT = "PRICE_IN_ATTACHMENT"
     """The number is inside a PDF or image. Out of scope to extract; ask a human."""
 
+    NEEDS_FROM_PRODUCER = "NEEDS_FROM_PRODUCER"
+    """The seller asked for something only the producer has.
+
+    A reference photo, a sample, the dimensions of the set — a reasonable
+    question, and not one the agent can answer by trying harder or by looking
+    it up. Distinct from UNPARSEABLE_REPLY, which means the agent could not
+    read the message: here it read it perfectly well and the answer is not its
+    to give.
+
+    Put the seller's actual question in ``notes``. It is shown to the producer
+    verbatim, because a paraphrase of a question is a worse question."""
+
     AMBIGUOUS_TERMS = "AMBIGUOUS_TERMS"
     """A price exists but what it covers is unclear — delivery, tax, duration."""
 

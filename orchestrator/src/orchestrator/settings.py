@@ -201,6 +201,15 @@ class Settings(BaseSettings):
     def origin_list(self) -> list[str]:
         return [o.strip() for o in self.allowed_origins.split(",") if o.strip()]
 
+    attachments_bucket: str = ""
+    """Cloud Storage bucket holding files a producer sends to a seller.
+
+    Empty means no attachments on this deployment: the answer route refuses a
+    file and says so, and words still go through. Deliberately not defaulted to
+    a guessed name — a bucket that does not exist fails at send time, hours
+    after the producer thought they had attached something.
+    """
+
     open_enrolment: bool = True
     """Whether signing in is enough to become a producer.
 

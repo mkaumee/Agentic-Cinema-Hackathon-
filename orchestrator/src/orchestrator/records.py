@@ -264,6 +264,27 @@ class NegotiationRecord(_Record):
     same send path and must never inherit a stale opening.
     """
 
+    producer_answer: str = ""
+    producer_attachment_key: str = ""
+    """What a person supplied when the seller asked them something.
+
+    A seller asking for a reference photo is not a quote and not a failure —
+    it is a reasonable question the agent cannot answer by trying harder. The
+    negotiation parks, the producer types an answer and optionally uploads a
+    file, and the next tick sends both and carries on unattended from there.
+
+    Cleared once sent, so the following round cannot repeat somebody's photo.
+    """
+
+    bounced_at: datetime | None = None
+    """When the address turned out to be dead, if it did.
+
+    Set instead of escalating. A bounce is not a decision for a person — the
+    mailbox does not work — so nothing appears in the approval queue, and this
+    is what keeps that from being the same as the agent quietly forgetting.
+    The briefing reads it, so "what happened to Skyline Props?" has an answer.
+    """
+
     opening_released_at: datetime | None = None
     """When a person released the opening email. Simulated time, per Rule 2.
 
@@ -290,6 +311,14 @@ class MessageRecord(_Record):
     gmail_message_id: str = ""
     extracted_quote: ExtractedQuote | None = None
     needs_human: bool = False
+
+    bounced: bool = False
+    """This is the mail system, not the seller.
+
+    Filed rather than dropped so the timeline stays true — the message did
+    arrive, it just was not from a person — and marked so the panel can say
+    which it was. An unmarked bounce in the transcript reads as a supplier
+    sending something strange."""
 
 
 class PurchaseOrderRecord(_Record):

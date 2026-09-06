@@ -20,14 +20,17 @@ import pytest
 from cinema_contracts import (
     ClockMode,
     EscalationReason,
+    InboundMessage,
     Money,
     NegotiationContext,
     NegotiationState,
     NextMove,
+    QuoteExtraction,
 )
 from cinema_contracts.testing import ScriptedBrain
 from google.auth.exceptions import RefreshError
 from google.cloud.firestore_v1 import AsyncClient
+from orchestrator.attachments import StoredFile
 from orchestrator.clock import ClockState, FrozenRealTime, SimClock
 from orchestrator.mail import InMemoryMailbox, MailTransport, RawInbound
 from orchestrator.mailboxes import SingleMailbox
@@ -509,16 +512,24 @@ async def test_one_failing_negotiation_does_not_stop_the_others(
 
 
 async def test_a_redelivered_reply_does_not_burn_a_round(harness: _Harness) -> None:
+    """Every poll re-offers the whole thread, so this happens on every tick.
+
+    It used to need the inbox poked by hand to simulate a redelivery after a
+    killed tick. It does not any more: the transport stopped using Gmail's
+    UNREAD label to mean "new" — the producer clears that by opening their own
+    inbox — so the same message comes back every minute for the life of the
+    negotiation, and this skip is the only thing standing between that and an
+    extract_quote call per message per tick.
+    """
     await harness.add_negotiation(floor=Money(amount=900))
     _ = await harness.loop.run_tick(PID)
     thread = harness.mail.sent[0]["thread_id"]
 
     reply = harness.mail.deliver(thread_id=thread, body="RM1,250")
     await harness.at(T0 + timedelta(hours=6))
-    _ = await harness.loop.run_tick(PID)
+    first = await harness.loop.run_tick(PID)
+    assert first.replies_filed == 1
 
-    # Gmail hands us the same message again after a killed tick.
-    harness.mail._inbox.append(reply)  # pyright: ignore[reportPrivateUsage]
     report = await harness.loop.run_tick(PID)
 
     assert report.replies_skipped == 1
@@ -1043,3 +1054,272 @@ async def test_the_draft_does_not_come_back_as_a_counter_offer(
     settled = await harness.repo.get_negotiation(PID, "neg1")
     assert settled is not None
     assert settled.draft_body == "", "cleared once the opening had gone"
+
+
+# --------------------------------------------------------------------------- #
+# Bounces, and reading a reply the producer opened first
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_bounce_stops_the_negotiation_without_bothering_anybody(
+    harness: _Harness,
+) -> None:
+    """The mail system is not a supplier.
+
+    A delivery failure lands in the seller's own thread and matches it, so
+    before this it went to the brain — which read "Address not found", did its
+    job, and produced a counter-offer to a mailbox nobody reads.
+    """
+    await harness.add_negotiation()
+    _ = await harness.loop.run_tick(PID)
+    thread = harness.mail.sent[0]["thread_id"]
+    sent_before = len(harness.mail.sent)
+
+    _ = harness.mail.deliver(
+        thread_id=thread,
+        from_email="Mail Delivery Subsystem <mailer-daemon@googlemail.com>",
+        subject="Delivery Status Notification (Failure)",
+        body="Address not found. Your message wasn't delivered.",
+    )
+    await harness.at(T0 + timedelta(hours=6))
+    report = await harness.loop.run_tick(PID)
+
+    assert report.bounced == 1
+    assert report.replies_filed == 0, "a bounce is not a reply"
+    assert len(harness.mail.sent) == sent_before, "and nothing was written back"
+
+    record = await harness.repo.get_negotiation(PID, "neg1")
+    assert record is not None
+    assert record.state is NegotiationState.DEAD
+    assert record.bounced_at is not None
+    assert record.next_action_due_at is None, "never chased again"
+    assert record.escalation_reason == "", "and nothing put in the approval queue"
+
+
+async def test_a_bounce_is_kept_so_it_can_be_explained(harness: _Harness) -> None:
+    """Quiet is fine; unaccountable is not.
+
+    The producer is never interrupted about a dead address, so the only way
+    they can find out is by asking — which means the record has to be there.
+    """
+    await harness.add_negotiation()
+    _ = await harness.loop.run_tick(PID)
+    thread = harness.mail.sent[0]["thread_id"]
+
+    _ = harness.mail.deliver(
+        thread_id=thread,
+        from_email="mailer-daemon@googlemail.com",
+        subject="Address not found",
+        body="550 5.1.1 The email account that you tried to reach does not exist.",
+    )
+    await harness.at(T0 + timedelta(hours=6))
+    _ = await harness.loop.run_tick(PID)
+
+    filed = await harness.repo.list_messages(PID, "neg1")
+    bounce = [m for m in filed if m.bounced]
+    assert len(bounce) == 1, "in the timeline, marked as the mail system"
+
+    record = await harness.repo.get_negotiation(PID, "neg1")
+    assert record is not None
+    assert "Stopped writing" in record.latest_reasoning
+
+
+async def test_a_supplier_talking_about_delivery_is_still_answered(
+    harness: _Harness,
+) -> None:
+    """The expensive false positive, checked through the whole loop.
+
+    Killing this would be silent — bounces are never escalated — so the
+    producer would simply never hear from a seller who was answering them.
+    """
+    await harness.add_negotiation(floor=Money(amount=900))
+    _ = await harness.loop.run_tick(PID)
+    thread = harness.mail.sent[0]["thread_id"]
+
+    _ = harness.mail.deliver(
+        thread_id=thread,
+        subject="Re: Hire enquiry — sorry we could not deliver last week",
+        body="We can do RM1,250 per day, delivery included.",
+    )
+    await harness.at(T0 + timedelta(hours=6))
+    report = await harness.loop.run_tick(PID)
+
+    assert report.bounced == 0
+    assert report.replies_filed == 1
+    record = await harness.repo.get_negotiation(PID, "neg1")
+    assert record is not None
+    assert record.state is not NegotiationState.DEAD
+
+
+async def test_a_reply_the_producer_already_opened_is_still_answered(
+    harness: _Harness,
+) -> None:
+    """The bug this pass exists for.
+
+    Negotiations run from the producer's own Gmail, so they open the seller's
+    reply — of course they do, it is their inbox — which clears UNREAD. The
+    transport used that label to mean "new", so the reply became invisible and
+    the negotiation ran out its rounds as though nobody had answered.
+
+    The fake transport hands over everything in the thread, which is what the
+    real one does now; the dedupe below is what keeps that affordable.
+    """
+    await harness.add_negotiation(floor=Money(amount=900))
+    _ = await harness.loop.run_tick(PID)
+    thread = harness.mail.sent[0]["thread_id"]
+    _ = harness.mail.deliver(thread_id=thread, body="We can do RM1,250 per day.")
+
+    await harness.at(T0 + timedelta(hours=6))
+    first = await harness.loop.run_tick(PID)
+    assert first.replies_filed == 1
+
+    # It answered, in the same thread.
+    assert len(harness.mail.sent) == 2
+    assert harness.mail.sent[1]["thread_id"] == thread
+
+    # And the reply is not read twice on the next tick, which is what makes
+    # re-offering the whole thread every minute affordable.
+    await harness.at(T0 + timedelta(hours=12))
+    second = await harness.loop.run_tick(PID)
+    assert second.replies_skipped == 1
+    assert second.replies_filed == 0
+
+
+class _CountingBrain(ScriptedBrain):
+    """A scripted brain that says how often it was asked to read a reply.
+
+    The point of filing-time dedupe is not that a message is filed once — the
+    old `append_message` return value already gave us that — it is that the
+    *brain is not called* for a message we have already read. Every poll now
+    re-offers the whole thread, so without the skip a five-day negotiation
+    costs one extract_quote per message per minute for five days. A test that
+    only counted stored messages could not tell those two apart.
+    """
+
+    reads: int = 0
+
+    @override
+    async def extract_quote(self, message: InboundMessage) -> QuoteExtraction:
+        _CountingBrain.reads += 1
+        return await super().extract_quote(message)
+
+
+async def test_a_reply_already_read_does_not_go_to_the_brain_again(
+    firestore: AsyncClient,
+) -> None:
+    _CountingBrain.reads = 0
+    harness = _Harness(firestore, brain=_CountingBrain())
+    await harness.setup_project()
+    await harness.add_negotiation(floor=Money(amount=900))
+    _ = await harness.loop.run_tick(PID)
+    thread = harness.mail.sent[0]["thread_id"]
+
+    _ = harness.mail.deliver(thread_id=thread, body="RM1,250")
+    await harness.at(T0 + timedelta(hours=6))
+    _ = await harness.loop.run_tick(PID)
+    assert _CountingBrain.reads == 1, "read once"
+
+    # Three more ticks. The transport re-offers the same message every time.
+    for hours in (12, 18, 24):
+        await harness.at(T0 + timedelta(hours=hours))
+        _ = await harness.loop.run_tick(PID)
+
+    assert _CountingBrain.reads == 1, "and never read again"
+
+
+class _FakeAttachments:
+    """Stands in for the bucket. Holds bytes and nothing else."""
+
+    def __init__(self, files: dict[str, StoredFile] | None = None) -> None:
+        self.files: dict[str, StoredFile] = files or {}
+
+    async def get(self, key: str) -> StoredFile | None:
+        return self.files.get(key)
+
+
+async def test_the_producers_answer_and_file_are_what_go_to_the_seller(
+    firestore: AsyncClient,
+) -> None:
+    """A seller asked for a reference photo; a person supplied one.
+
+    Their words go out as written, not rewritten by the brain — they answered
+    a question that was put to them, and paraphrasing that is how a seller ends
+    up being told something nobody said.
+    """
+    key = "proj/neg1/reference.jpg"
+    store = _FakeAttachments(
+        {key: StoredFile("reference.jpg", "image/jpeg", b"\xff\xd8not-really-a-jpeg")}
+    )
+    harness = _Harness(firestore)
+    harness.loop = TickLoop(
+        harness.repo,
+        harness.clock,
+        ScriptedBrain(),
+        SingleMailbox(harness.mail),
+        attachments=store,
+    )
+    await harness.setup_project()
+    await harness.add_negotiation(floor=Money(amount=900))
+    _ = await harness.loop.run_tick(PID)
+
+    # The seller came back with a price and a question. The producer answered
+    # the question; the agent still has a counter to make. Whatever the brain
+    # would have written, what goes out is the producer's words.
+    thread = harness.mail.sent[0]["thread_id"]
+    _ = harness.mail.deliver(thread_id=thread, body="RM1,250 per day.")
+
+    record = await harness.repo.get_negotiation(PID, "neg1")
+    assert record is not None
+    record.producer_answer = "Here is the mirror we mean, in the corner."
+    record.producer_attachment_key = key
+    await harness.repo.save_negotiation(PID, "neg1", record)
+
+    await harness.at(T0 + timedelta(hours=6))
+    _ = await harness.loop.run_tick(PID)
+
+    sent = harness.mail.sent[-1]
+    assert sent["body"] == "Here is the mirror we mean, in the corner."
+    assert "reference.jpg" in sent["attachments"]
+
+    settled = await harness.repo.get_negotiation(PID, "neg1")
+    assert settled is not None
+    assert settled.producer_answer == "", "cleared, so the next round is not a repeat"
+    assert settled.producer_attachment_key == ""
+
+
+async def test_a_vanished_attachment_does_not_stop_the_answer(
+    firestore: AsyncClient,
+) -> None:
+    """The producer's words are still worth sending.
+
+    A file can go between the upload and the tick — a deleted production, a
+    tidied bucket. Losing the whole reply over the missing half would be the
+    agent going quiet on a seller who asked a fair question.
+    """
+    harness = _Harness(firestore)
+    harness.loop = TickLoop(
+        harness.repo,
+        harness.clock,
+        ScriptedBrain(),
+        SingleMailbox(harness.mail),
+        attachments=_FakeAttachments(),
+    )
+    await harness.setup_project()
+    await harness.add_negotiation(floor=Money(amount=900))
+    _ = await harness.loop.run_tick(PID)
+
+    thread = harness.mail.sent[0]["thread_id"]
+    _ = harness.mail.deliver(thread_id=thread, body="RM1,250 per day.")
+
+    record = await harness.repo.get_negotiation(PID, "neg1")
+    assert record is not None
+    record.producer_answer = "About 1.2 metres tall."
+    record.producer_attachment_key = "proj/neg1/gone.jpg"
+    await harness.repo.save_negotiation(PID, "neg1", record)
+
+    await harness.at(T0 + timedelta(hours=6))
+    _ = await harness.loop.run_tick(PID)
+
+    sent = harness.mail.sent[-1]
+    assert sent["body"] == "About 1.2 metres tall."
+    assert sent["attachments"] == ""

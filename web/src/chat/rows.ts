@@ -92,6 +92,25 @@ export interface DecisionRow {
 }
 
 /**
+ * A seller who asked the producer something the agent cannot answer.
+ *
+ * Separate from `DecisionRow` on purpose. Both are the agent stopping for a
+ * person, and that is where the resemblance ends: one asks "shall we buy
+ * this", the other "which mirror do you mean". A single card that tried to be
+ * both would put an Approve button under a question, at a price nobody named.
+ */
+export interface QuestionRow {
+  kind: "question";
+  id: string;
+  negotiationId: string;
+  itemName: string;
+  supplier: string;
+  /** What they asked, in their words. */
+  asked: string;
+  at: Date;
+}
+
+/**
  * Which way an email went.
  *
  * Case-insensitive because Firestore holds the contract enum's own spelling,
@@ -177,6 +196,7 @@ export type Row =
   | BriefingRow
   | ActivityRow
   | DecisionRow
+  | QuestionRow
   | PropsRow
   | OpeningsRow
   | ResearchRow;

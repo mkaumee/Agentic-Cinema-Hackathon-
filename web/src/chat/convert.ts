@@ -37,6 +37,7 @@ export const DECISION_TOOL = "approve_purchase";
 export const PROPS_TOOL = "read_script";
 export const OPENINGS_TOOL = "draft_openings";
 export const RESEARCH_TOOL = "research_items";
+export const QUESTION_TOOL = "answer_supplier";
 
 /**
  * A briefing, plus the note saying who wrote it.
@@ -188,6 +189,30 @@ export function toThreadMessage(row: Row): ThreadMessageLike {
               rivals: row.rivals,
             },
             approval: { id: row.negotiationId },
+          },
+        ],
+        createdAt: row.at,
+      };
+
+    case "question":
+      // No `approval`, unlike a decision. An approval is a yes-or-no the
+      // library renders with accept and reject; this needs a person to type
+      // something and possibly attach a file, and there is no version of
+      // "reject" here that means anything to the seller waiting on it.
+      return {
+        id: row.id,
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: row.id,
+            toolName: QUESTION_TOOL,
+            args: {
+              negotiationId: row.negotiationId,
+              item: row.itemName,
+              supplier: row.supplier,
+              asked: row.asked,
+            },
           },
         ],
         createdAt: row.at,

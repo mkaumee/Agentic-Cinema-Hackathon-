@@ -661,17 +661,29 @@ async def test_our_own_sent_mail_in_the_thread_is_not_read_back_as_a_reply() -> 
     assert [message_id for message_id, _ in fake.modified] == ["theirs"]
 
 
-async def test_a_message_already_filed_is_not_returned_a_second_time() -> None:
-    """UNREAD is the only record of what a previous tick consumed."""
+async def test_a_message_the_producer_already_opened_is_still_returned() -> None:
+    """The inversion of what this test used to assert, and the bug it hid.
+
+    It used to say "UNREAD is the only record of what a previous tick
+    consumed", which was true while the agent had a mailbox to itself. Once
+    negotiations moved into the producer's own Gmail it stopped being: they
+    open the seller's reply — of course they do, it is their inbox — the label
+    clears, and the agent never sees the message again. Nothing errors. The
+    negotiation runs out its rounds and dies as though nobody answered.
+
+    So poll hands over everything in a live thread, and "have I already read
+    this" is answered by the message ids we stored, which nobody else can
+    clear. Our own outbound is still filtered, by SENT.
+    """
     transport, fake = _transport()
     fake.inbox = [
-        _inbound(message_id="filed", thread_id="t-1", labels=["INBOX"]),
-        _inbound(message_id="fresh", thread_id="t-1"),
+        _inbound(message_id="opened", thread_id="t-1", labels=["INBOX"]),
+        _inbound(message_id="unread", thread_id="t-1"),
     ]
 
     got = await transport.poll(threads=frozenset({"t-1"}))
 
-    assert [m.message_id for m in got] == ["fresh"]
+    assert [m.message_id for m in got] == ["opened", "unread"]
 
 
 async def test_a_thread_that_no_longer_exists_does_not_stop_the_tick() -> None:

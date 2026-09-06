@@ -51,6 +51,7 @@ class NegotiationEvent(StrEnum):
     AGENT_WALKED_AWAY = "AGENT_WALKED_AWAY"
 
     HUMAN_APPROVED = "HUMAN_APPROVED"
+    HUMAN_ANSWERED = "HUMAN_ANSWERED"
     HUMAN_RETURNED_WITH_FLOOR = "HUMAN_RETURNED_WITH_FLOOR"
     HUMAN_CANCELLED = "HUMAN_CANCELLED"
 
@@ -58,6 +59,7 @@ class NegotiationEvent(StrEnum):
 HUMAN_EVENTS: frozenset[NegotiationEvent] = frozenset(
     {
         NegotiationEvent.HUMAN_APPROVED,
+        NegotiationEvent.HUMAN_ANSWERED,
         NegotiationEvent.HUMAN_RETURNED_WITH_FLOOR,
         NegotiationEvent.HUMAN_CANCELLED,
     }
@@ -67,6 +69,13 @@ HUMAN_EVENTS: frozenset[NegotiationEvent] = frozenset(
 The tick loop refuses to apply any of these. They arrive through endpoints that
 require a producer identity, and ``HUMAN_APPROVED`` additionally requires a
 Firestore rule the agent's service account cannot satisfy.
+
+``HUMAN_ANSWERED`` belongs here for a reason worth writing down, because it was
+missed once and a test caught it. It is the only way out of
+``READY_FOR_HUMAN`` short of approval or cancellation, so leaving it out of this
+set — which is defined by subtraction — handed the agent an event that un-parks
+a negotiation a person parked. The stop condition would still have *existed*;
+the agent would simply have been able to step over it.
 """
 
 AGENT_EVENTS: frozenset[NegotiationEvent] = frozenset(NegotiationEvent) - HUMAN_EVENTS
@@ -174,6 +183,14 @@ _TRANSITIONS: dict[tuple[NegotiationState, NegotiationEvent], NegotiationState] 
         NegotiationState.ORDERED
     ),
     (NegotiationState.READY_FOR_HUMAN, NegotiationEvent.HUMAN_RETURNED_WITH_FLOOR): (
+        NegotiationState.NEGOTIATING
+    ),
+    # A seller asked the producer something — a reference photo, the dimensions
+    # of the set — and they answered. Same destination as returning with a
+    # floor, and deliberately not the same event: one is a price instruction
+    # and the other is an answer to a question, and a log that cannot tell them
+    # apart is a log nobody can reconstruct a negotiation from.
+    (NegotiationState.READY_FOR_HUMAN, NegotiationEvent.HUMAN_ANSWERED): (
         NegotiationState.NEGOTIATING
     ),
     (NegotiationState.READY_FOR_HUMAN, NegotiationEvent.HUMAN_CANCELLED): (

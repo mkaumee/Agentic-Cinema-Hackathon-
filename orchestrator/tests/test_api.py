@@ -42,6 +42,12 @@ from conftest import TokenMinter
 from firebase_admin import auth as firebase_auth
 from google.cloud.firestore_v1 import AsyncClient
 from orchestrator.api import MAX_REASON, ApiServices, app, build_api_services
+from orchestrator.attachments import (
+    MAX_BYTES,
+    AttachmentStore,
+    StoredFile,
+    TooLargeError,
+)
 from orchestrator.auth import init_firebase
 from orchestrator.clock import ClockState, SimClock
 from orchestrator.records import (
@@ -1233,3 +1239,267 @@ async def test_a_stranger_cannot_read_or_release_an_opening(
     assert record is not None
     assert record.opening_released_at is None, "nothing was released"
     assert record.draft_body == "Hi, do you hire mirrors?", "and nothing was rewritten"
+
+
+# --------------------------------------------------------------------------- #
+# Answering a seller who asked the producer something
+# --------------------------------------------------------------------------- #
+
+
+class _FakeBucket:
+    """Stands in for Cloud Storage. Keeps the key rule and the size limit.
+
+    Both of those are the parts a test can be wrong about: the key is what
+    stops one production reading another's uploads, and the limit is the only
+    thing between a phone photograph and a send that fails at the transport.
+    """
+
+    def __init__(self) -> None:
+        self.files: dict[str, StoredFile] = {}
+
+    async def put(self, project_id: str, negotiation_id: str, file: StoredFile) -> str:
+        if len(file.data) > MAX_BYTES:
+            raise TooLargeError(f"{file.filename} is over the limit.")
+        key = AttachmentStore.key_for(project_id, negotiation_id, file.filename)
+        self.files[key] = file
+        return key
+
+
+def _with_bucket(firestore: AsyncClient, bucket: _FakeBucket | None) -> None:
+    repo = FirestoreRepository(firestore)
+    app.state.services = ApiServices(
+        settings=SETTINGS,
+        client=firestore,
+        repo=repo,
+        clock=SimClock(repo),
+        brain=ScriptedBrain(),
+        attachments=bucket,
+    )
+
+
+def _upload(answer: str = "", data: bytes = b"") -> dict[str, object]:
+    return {
+        "answer": answer,
+        "filename": "reference.jpg" if data else "",
+        "mime_type": "image/jpeg",
+        "content_b64": base64.b64encode(data).decode() if data else "",
+    }
+
+
+async def test_an_answer_and_a_file_send_the_negotiation_back_to_work(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    """The whole point of the parked state is that it un-parks.
+
+    Nothing is emailed here — this service holds no mailbox. It stores the
+    bytes, records the words, and makes the row due; the tick posts it.
+    """
+    owner = tokens.create("owner@example.invalid")
+    headers = {
+        "Authorization": f"Bearer {tokens.grant(owner, 'owner@example.invalid')}"
+    }
+    repo = await _owned_project(firestore, "kopitiam", owner)
+    bucket = _FakeBucket()
+    _with_bucket(firestore, bucket)
+
+    reply = await api.post(
+        "/projects/kopitiam/negotiations/neg1/answer",
+        headers=headers,
+        json=_upload("It is the tall one in the corner.", b"\xff\xd8jpeg-ish"),
+    )
+
+    assert reply.status_code == 200, reply.text
+    key = str(reply.json()["attached"])
+    assert key == "kopitiam/neg1/reference.jpg", "scoped so it cannot be guessed"
+    assert bucket.files[key].data == b"\xff\xd8jpeg-ish"
+
+    record = await repo.get_negotiation("kopitiam", "neg1")
+    assert record is not None
+    assert record.producer_answer == "It is the tall one in the corner."
+    assert record.producer_attachment_key == key
+    assert record.state is NegotiationState.NEGOTIATING, "no longer waiting on anyone"
+    assert record.next_action_due_at is not None, "and due now, not on a timer"
+    assert record.escalation_reason == "", "so it leaves the Needs You queue"
+
+
+async def test_words_alone_are_a_complete_answer(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    """Most of what a seller asks for is a sentence, not a photograph."""
+    owner = tokens.create("owner@example.invalid")
+    headers = {
+        "Authorization": f"Bearer {tokens.grant(owner, 'owner@example.invalid')}"
+    }
+    repo = await _owned_project(firestore, "kopitiam", owner)
+    _with_bucket(firestore, _FakeBucket())
+
+    reply = await api.post(
+        "/projects/kopitiam/negotiations/neg1/answer",
+        headers=headers,
+        json=_upload("About 1.2 metres tall."),
+    )
+
+    assert reply.status_code == 200, reply.text
+    assert reply.json()["attached"] == ""
+    record = await repo.get_negotiation("kopitiam", "neg1")
+    assert record is not None
+    assert record.producer_answer == "About 1.2 metres tall."
+    assert record.producer_attachment_key == ""
+
+
+async def test_an_answer_with_nothing_in_it_is_refused(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    """A Send button that posts an empty reply to a seller is worse than none.
+
+    The seller asked a question; a blank round-trip reads as the agent
+    acknowledging it and answering nothing.
+    """
+    owner = tokens.create("owner@example.invalid")
+    headers = {
+        "Authorization": f"Bearer {tokens.grant(owner, 'owner@example.invalid')}"
+    }
+    repo = await _owned_project(firestore, "kopitiam", owner)
+    _with_bucket(firestore, _FakeBucket())
+
+    reply = await api.post(
+        "/projects/kopitiam/negotiations/neg1/answer",
+        headers=headers,
+        json=_upload("   "),
+    )
+
+    assert reply.status_code == 422
+    record = await repo.get_negotiation("kopitiam", "neg1")
+    assert record is not None
+    assert record.state is NegotiationState.READY_FOR_HUMAN, "still parked"
+
+
+async def test_a_file_too_big_to_email_is_refused_here(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    """Refused at the door rather than at the transport.
+
+    Accepting it would store the bytes, un-park the negotiation, and then fail
+    on the tick — where the producer never sees it and the seller waits.
+    """
+    owner = tokens.create("owner@example.invalid")
+    headers = {
+        "Authorization": f"Bearer {tokens.grant(owner, 'owner@example.invalid')}"
+    }
+    repo = await _owned_project(firestore, "kopitiam", owner)
+    _with_bucket(firestore, _FakeBucket())
+
+    reply = await api.post(
+        "/projects/kopitiam/negotiations/neg1/answer",
+        headers=headers,
+        json=_upload("Here you go.", b"x" * (MAX_BYTES + 1)),
+    )
+
+    assert reply.status_code == 413
+    record = await repo.get_negotiation("kopitiam", "neg1")
+    assert record is not None
+    assert record.producer_answer == "", "nothing was recorded"
+    assert record.state is NegotiationState.READY_FOR_HUMAN, "and nothing un-parked"
+
+
+async def test_a_deployment_with_no_bucket_says_so_instead_of_dropping_the_file(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    """Silently sending the words without the photo is the bad failure.
+
+    The producer would see a sent reply and assume the seller has their
+    reference image. They do not.
+    """
+    owner = tokens.create("owner@example.invalid")
+    headers = {
+        "Authorization": f"Bearer {tokens.grant(owner, 'owner@example.invalid')}"
+    }
+    repo = await _owned_project(firestore, "kopitiam", owner)
+    _with_bucket(firestore, None)
+
+    refused = await api.post(
+        "/projects/kopitiam/negotiations/neg1/answer",
+        headers=headers,
+        json=_upload("Attached.", b"\xff\xd8jpeg-ish"),
+    )
+
+    assert refused.status_code == 503
+    record = await repo.get_negotiation("kopitiam", "neg1")
+    assert record is not None
+    assert record.state is NegotiationState.READY_FOR_HUMAN
+
+    # Words still work on the same deployment: no bucket is not no answering.
+    words = await api.post(
+        "/projects/kopitiam/negotiations/neg1/answer",
+        headers=headers,
+        json=_upload("It is 1.2 metres tall."),
+    )
+    assert words.status_code == 200, words.text
+
+
+async def test_a_corrupt_upload_is_refused_rather_than_stored(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    owner = tokens.create("owner@example.invalid")
+    headers = {
+        "Authorization": f"Bearer {tokens.grant(owner, 'owner@example.invalid')}"
+    }
+    _ = await _owned_project(firestore, "kopitiam", owner)
+    bucket = _FakeBucket()
+    _with_bucket(firestore, bucket)
+
+    reply = await api.post(
+        "/projects/kopitiam/negotiations/neg1/answer",
+        headers=headers,
+        json={
+            "answer": "Attached.",
+            "filename": "reference.jpg",
+            "mime_type": "image/jpeg",
+            "content_b64": "not base64 at all!!",
+        },
+    )
+
+    assert reply.status_code == 422
+    assert bucket.files == {}
+
+
+async def test_a_stranger_cannot_answer_your_supplier(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    """Answering is speaking as the producer, to their seller, from their
+    mailbox. It is scoped like everything else."""
+    repo = await _owned_project(firestore, "someone-elses", "a-different-producer")
+    bucket = _FakeBucket()
+    _with_bucket(firestore, bucket)
+    headers = _auth(tokens, "outsider@example.invalid")
+
+    reply = await api.post(
+        "/projects/someone-elses/negotiations/neg1/answer",
+        headers=headers,
+        json=_upload("Send it to me instead.", b"\xff\xd8jpeg-ish"),
+    )
+
+    assert reply.status_code == 404
+    assert bucket.files == {}, "and the bytes never reached the bucket"
+    record = await repo.get_negotiation("someone-elses", "neg1")
+    assert record is not None
+    assert record.producer_answer == ""
+
+
+async def test_answering_a_negotiation_that_is_not_there(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    owner = tokens.create("owner@example.invalid")
+    headers = {
+        "Authorization": f"Bearer {tokens.grant(owner, 'owner@example.invalid')}"
+    }
+    _ = await _owned_project(firestore, "kopitiam", owner)
+    _with_bucket(firestore, _FakeBucket())
+
+    reply = await api.post(
+        "/projects/kopitiam/negotiations/no-such-negotiation/answer",
+        headers=headers,
+        json=_upload("Hello?"),
+    )
+
+    assert reply.status_code == 404

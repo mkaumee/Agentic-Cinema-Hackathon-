@@ -13,6 +13,9 @@ dependencies = [
     "google-api-python-client>=2.150",
     "google-auth-oauthlib>=1.2",
     "google-cloud-secret-manager>=2.20",
+    # A producer's reference photo, between uploading it and the tick that
+    # attaches it. Firestore cannot hold it: a document caps at 1 MiB.
+    "google-cloud-storage>=2.18",
     "firebase-admin>=7.0",
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",

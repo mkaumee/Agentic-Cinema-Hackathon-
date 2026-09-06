@@ -37,13 +37,15 @@ Get that wrong and somebody who can replay a state value attaches their mailbox
 to another producer's account — or worse, has the agent send as them.
 """
 
+import base64
+import binascii
 import logging
 import secrets
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from datetime import timedelta
-from typing import Annotated
+from typing import Annotated, override
 from urllib.parse import urlencode
 
 from cinema_contracts import AgentBrain, Money, NegotiationState, ScriptSource
@@ -56,6 +58,12 @@ from pydantic import BaseModel, Field
 
 from orchestrator import intake
 from orchestrator.app import build_brain, gemini_credentials_route
+from orchestrator.attachments import (
+    AttachmentStore,
+    AttachmentWriter,
+    StoredFile,
+    TooLargeError,
+)
 from orchestrator.auth import (
     Claims,
     Producer,
@@ -87,6 +95,7 @@ from orchestrator.scripts import (
     is_document,
 )
 from orchestrator.settings import GMAIL_SCOPES, BrainBackend, Settings
+from orchestrator.state_machine import NegotiationEvent, apply_event
 
 log = logging.getLogger("orchestrator.api")
 
@@ -120,6 +129,14 @@ class ApiServices:
     it every upload fails at request time rather than at startup, which is why
     `scripts/deploy.sh` grants it to both accounts."""
 
+    attachments: AttachmentWriter | None = None
+    """Where a producer's reference photo waits for the tick that sends it.
+
+    None on a deployment with no bucket, and on a laptop. The answer route
+    refuses a *file* in that case and says so; an answer in words still works,
+    because most of what a seller asks for is words.
+    """
+
 
 def build_api_services(settings: Settings | None = None) -> ApiServices:
     resolved = settings or Settings()
@@ -135,6 +152,11 @@ def build_api_services(settings: Settings | None = None) -> ApiServices:
         # searches the web and it runs on the tick, so a PARALLEL_API_KEY here
         # would be a credential in an environment with no use for it.
         brain=build_brain(resolved, needs_research=False),
+        attachments=(
+            AttachmentStore(resolved.attachments_bucket)
+            if resolved.attachments_bucket
+            else None
+        ),
     )
 
 
@@ -517,6 +539,31 @@ class OpeningsReleased(BaseModel):
     approved: list[str]
 
 
+class AnswerSupplier(BaseModel):
+    """What a producer supplies when a seller asks them something.
+
+    Both optional individually and not together: an answer with neither words
+    nor a file is a button that appears to do something and does not.
+    """
+
+    answer: str = ""
+    filename: str = ""
+    mime_type: str = "application/octet-stream"
+    content_b64: str = ""
+
+    @override
+    def model_post_init(self, _context: object, /) -> None:
+        if not self.answer.strip() and not self.content_b64.strip():
+            raise ValueError(
+                "Send an answer, a file, or both — this reply has neither."
+            )
+
+
+class Answered(BaseModel):
+    negotiation_id: str
+    attached: str = ""
+
+
 class RenameProject(BaseModel):
     title: str = Field(min_length=1, max_length=120)
 
@@ -838,6 +885,87 @@ async def enrol_me(request: Request, claims: Claims) -> Enrolled:
 
     producer = enrol_producer(claims)
     return Enrolled(uid=producer.uid, email=producer.email)
+
+
+@app.post("/projects/{project_id}/negotiations/{negotiation_id}/answer")
+async def answer_supplier(
+    request: Request,
+    project_id: str,
+    negotiation_id: str,
+    body: AnswerSupplier,
+    producer: Signed,
+) -> Answered:
+    """Give the seller what they asked for, and let the agent carry on.
+
+    A seller asking for a reference photo is not a quote and not a failure —
+    it is a reasonable question the agent cannot answer by trying harder. The
+    negotiation parked; this un-parks it.
+
+    The words are sent as written rather than rewritten by the brain: the
+    producer answered a question that was put to them, and paraphrasing that is
+    how a seller ends up being told something nobody said.
+
+    Nothing is emailed here. This service holds no mailbox; it records what to
+    send and makes the row due, and the tick posts it within the minute.
+    """
+    services = services_of(request)
+    _ = await _owned(services, project_id, producer)
+
+    record = await services.repo.get_negotiation(project_id, negotiation_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"no negotiation {negotiation_id}")
+
+    key = ""
+    if body.content_b64:
+        if services.attachments is None:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "This deployment has no attachment bucket configured, so a "
+                    "file cannot be sent. An answer on its own still can."
+                ),
+            )
+        try:
+            raw = base64.b64decode(body.content_b64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise HTTPException(
+                status_code=422, detail="That upload was not valid base64."
+            ) from exc
+        try:
+            key = await services.attachments.put(
+                project_id,
+                negotiation_id,
+                StoredFile(
+                    filename=body.filename or "attachment",
+                    content_type=body.mime_type,
+                    data=raw,
+                ),
+            )
+        except TooLargeError as exc:
+            raise HTTPException(status_code=413, detail=str(exc)) from exc
+
+    now = await services.clock.now(project_id)
+    record.producer_answer = body.answer.strip()
+    record.producer_attachment_key = key
+    record.escalation_reason = ""
+    # Due immediately: the producer has just answered, and a delay here reads
+    # as the agent ignoring them.
+    record.next_action_due_at = now
+    record.updated_at = now
+    if record.state is NegotiationState.READY_FOR_HUMAN:
+        record.state = apply_event(record.state, NegotiationEvent.HUMAN_ANSWERED)
+    await services.repo.save_negotiation(project_id, negotiation_id, record)
+
+    log.info(
+        "producer answered a supplier",
+        extra={
+            "project_id": project_id,
+            "negotiation_id": negotiation_id,
+            "uid": producer.uid,
+            "attached": bool(key),
+        },
+    )
+    return Answered(negotiation_id=negotiation_id, attached=key)
 
 
 @app.patch("/projects/{project_id}")

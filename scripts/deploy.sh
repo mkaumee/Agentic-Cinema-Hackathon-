@@ -85,6 +85,7 @@ IMAGE_TAG="${IMAGE_TAG:-$(git rev-parse --short HEAD 2>/dev/null || echo latest)
 AGENT_SA="${AGENT_SA:-cinema-agent}"
 APPROVALS_SA="${APPROVALS_SA:-cinema-approvals}"
 API_SA="${API_SA:-cinema-api}"
+ATTACHMENTS_BUCKET="${ATTACHMENTS_BUCKET:-${PROJECT_ID}-attachments}"
 SCHEDULER_SA="${SCHEDULER_SA:-cinema-scheduler}"
 ORDERS_DB="${ORDERS_DB:-orders}"
 TOKEN_SECRET="${TOKEN_SECRET:-gmail-agent-refresh-token}"
@@ -724,6 +725,40 @@ for reasoner in "$AGENT_SA:$AGENT_EMAIL" "$API_SA:$API_EMAIL"; do
   fi
 done
 
+# The attachments bucket, granted one way each.
+#
+# `cinema-api` takes the upload from the producer's browser and puts it in the
+# bucket; the tick reads it back when it sends. Neither holds both halves, and
+# that is the point rather than an accident of ordering: the service a browser
+# can reach cannot read back what any other producer uploaded, and the service
+# that emails strangers cannot put a new object anywhere.
+#
+# objectViewer for the agent is granted in scripts/gcp_setup.sh, alongside the
+# bucket itself. Only the writer is here, because the api service account is
+# created by this script.
+#
+# Skipped silently when there is no bucket. A deployment without one still
+# works — the answer route refuses a file and says why, and answering a seller
+# in words is most of what this is for.
+if gcloud storage buckets describe "gs://${ATTACHMENTS_BUCKET}" >/dev/null 2>&1; then
+  if gcloud storage buckets get-iam-policy "gs://${ATTACHMENTS_BUCKET}" \
+       --flatten='bindings[].members' \
+       --filter="bindings.role:roles/storage.objectCreator AND bindings.members:serviceAccount:${API_EMAIL}" \
+       --format='value(bindings.role)' | grep -q objectCreator; then
+    skip "objectCreator on gs://${ATTACHMENTS_BUCKET} for $API_SA"
+  else
+    gcloud storage buckets add-iam-policy-binding "gs://${ATTACHMENTS_BUCKET}" \
+      --member="serviceAccount:${API_EMAIL}" \
+      --role="roles/storage.objectCreator" >/dev/null
+    ok "objectCreator for $API_SA — writes uploads, cannot read them back"
+  fi
+else
+  printf '  \033[90m·\033[0m no gs://%s — files are off, answers in words still work.\n' \
+    "$ATTACHMENTS_BUCKET"
+  printf '    Run make gcp-setup to create it.\n'
+  ATTACHMENTS_BUCKET=""
+fi
+
 # Reading the token secret is the tick service's business only. The approvals
 # service never sends mail.
 if gcloud secrets describe "$TOKEN_SECRET" >/dev/null 2>&1; then
@@ -836,6 +871,15 @@ if [[ -n "${CINEMA_AGENT_EMAIL:-}" ]]; then
   TICK_ENV="${TICK_ENV}@CINEMA_AGENT_EMAIL=${CINEMA_AGENT_EMAIL}"
 fi
 
+# Emptied above when the bucket does not exist, so an absent bucket reaches
+# the services as an absent variable rather than as a name that 404s at the
+# moment a producer presses Send.
+API_ATTACHMENTS_ENV=""
+if [[ -n "$ATTACHMENTS_BUCKET" ]]; then
+  TICK_ENV="${TICK_ENV}@CINEMA_ATTACHMENTS_BUCKET=${ATTACHMENTS_BUCKET}"
+  API_ATTACHMENTS_ENV="@CINEMA_ATTACHMENTS_BUCKET=${ATTACHMENTS_BUCKET}"
+fi
+
 # --timeout is under the one-minute schedule on purpose, so a wedged tick
 # cannot still be running when the next one fires. That is only safe because
 # the tick claims each row before working on it — a truncated tick leaves
@@ -890,7 +934,7 @@ gcloud run deploy "$API_SERVICE" \
   --timeout=60s \
   --max-instances=2 \
   --memory=512Mi \
-  --set-env-vars="^@^CINEMA_GCP_PROJECT=${PROJECT_ID}@CINEMA_LOG_FORMAT=json@CINEMA_ALLOWED_ORIGINS=${ALLOWED_ORIGINS}@CINEMA_TOKEN_BACKEND=secret-manager@CINEMA_REFRESH_TOKEN_SECRET=${TOKEN_SECRET}${API_BRAIN_ENV}${API_OAUTH_ENV}" \
+  --set-env-vars="^@^CINEMA_GCP_PROJECT=${PROJECT_ID}@CINEMA_LOG_FORMAT=json@CINEMA_ALLOWED_ORIGINS=${ALLOWED_ORIGINS}@CINEMA_TOKEN_BACKEND=secret-manager@CINEMA_REFRESH_TOKEN_SECRET=${TOKEN_SECRET}${API_BRAIN_ENV}${API_OAUTH_ENV}${API_ATTACHMENTS_ENV}" \
   --quiet >/dev/null
 ok "$API_SERVICE  (orchestrator.api:app, as $API_SA)"
 

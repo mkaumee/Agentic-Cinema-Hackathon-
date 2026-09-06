@@ -151,3 +151,45 @@ def test_every_reference_is_one_the_digest_knows() -> None:
     for question in ("what needs me?", "who is quiet?", "what are we spending?"):
         _, refs = summarise(digest, question)
         assert all(ref[1] in digest.known_ids() for ref in refs), question
+
+
+def test_a_bounced_address_is_not_reported_as_no_reply() -> None:
+    """Both are DEAD; they are not the same news.
+
+    The producer is never interrupted over a bounce — a dead mailbox is not a
+    decision anyone can make — so asking is the only way they find out. That is
+    only defensible if the answer is true. "We gave up after no reply" sends
+    them off to chase somebody who never received a word.
+    """
+    silent = _negotiation("cup", "s1", None, state=NegotiationState.DEAD)
+    bounced = _negotiation("cup", "s2", None, state=NegotiationState.DEAD)
+    bounced.bounced_at = T0
+    bounced.latest_reasoning = "Address not found, from mailer-daemon@googlemail.com."
+
+    digest = _digest(
+        {"cup": _item("Cup")},
+        {"n1": silent, "n2": bounced},
+        {"s1": "Ah Seng", "s2": "Skyline"},
+    )
+
+    text, refs = summarise(digest, "what happened, anyone bounce?")
+
+    assert "1 gave up on after no reply" in text
+    assert "Ah Seng" in text
+    assert "1 stopped because the address bounced" in text
+    assert "Skyline" in text
+    assert "Address not found" in text, "the note, so the answer says why"
+    assert {ref[1] for ref in refs} == {"n1", "n2"}
+
+
+def test_a_bounce_is_not_counted_as_a_supplier_who_went_quiet() -> None:
+    """The wording is the whole point, so assert it is not the other one."""
+    bounced = _negotiation("cup", "s2", None, state=NegotiationState.DEAD)
+    bounced.bounced_at = T0
+
+    digest = _digest({"cup": _item("Cup")}, {"n2": bounced}, {"s2": "Skyline"})
+
+    text, _ = summarise(digest, "who is quiet?")
+
+    assert "no reply" not in text
+    assert "the address bounced" in text

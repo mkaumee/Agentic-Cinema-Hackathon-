@@ -22,6 +22,26 @@ import type { Item, Negotiation } from "@/hooks/useProject";
 
 export const WAITING = "READY_FOR_HUMAN";
 
+/**
+ * The escalation that is a question, not a purchase.
+ *
+ * A seller who asks for a reference photo parks the negotiation in the same
+ * `READY_FOR_HUMAN` state a good quote does, and that is right — both need a
+ * person. What they need from that person is not remotely the same, and the
+ * two must never share a card: an Approve button under "which mirror do you
+ * mean?" offers to buy at a price nobody named.
+ */
+export const QUESTION = "NEEDS_FROM_PRODUCER";
+
+/** A seller's question, waiting on the one person who can answer it. */
+export interface Question {
+  item: Item;
+  negotiation: Negotiation;
+  /** What they asked, in their words — the brain puts it in `notes`, which
+   * lands on the record as `latest_reasoning`. */
+  asked: string;
+}
+
 export interface Decision {
   item: Item;
   /** The one an Approve button may act on. */
@@ -40,6 +60,11 @@ export function decisionsFor(
   const byItem = new Map<string, Negotiation[]>();
   for (const n of negotiations) {
     if (n.state !== WAITING || n.item_id === undefined) continue;
+    // A question is not a quote. Left in, it could be the only negotiation for
+    // its prop and would therefore be `chosen` — putting an Approve button
+    // under a seller asking which mirror we mean, at no price. It gets its own
+    // card from `questionsFor`.
+    if (n.escalation_reason === QUESTION) continue;
     byItem.set(n.item_id, [...(byItem.get(n.item_id) ?? []), n]);
   }
 
@@ -54,6 +79,28 @@ export function decisionsFor(
     const [chosen, ...rivals] = sorted;
     if (chosen === undefined) continue;
     out.push({ item, chosen, rivals });
+  }
+  return out.sort((a, b) => (a.item.name ?? "").localeCompare(b.item.name ?? ""));
+}
+
+/**
+ * Sellers who asked the producer something, one card each.
+ *
+ * Not grouped by item the way decisions are, and the difference is not an
+ * oversight: two suppliers asking about the same prop have asked two different
+ * questions and need two different answers. Grouping would silently drop one
+ * of them.
+ */
+export function questionsFor(
+  items: Item[],
+  negotiations: Negotiation[],
+): Question[] {
+  const out: Question[] = [];
+  for (const n of negotiations) {
+    if (n.state !== WAITING || n.escalation_reason !== QUESTION) continue;
+    const item = items.find((i) => i.id === n.item_id);
+    if (item === undefined || item.status === "ORDERED") continue;
+    out.push({ item, negotiation: n, asked: n.latest_reasoning ?? "" });
   }
   return out.sort((a, b) => (a.item.name ?? "").localeCompare(b.item.name ?? ""));
 }

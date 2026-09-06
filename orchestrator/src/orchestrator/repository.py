@@ -642,6 +642,26 @@ class FirestoreRepository:
             return False
         return True
 
+    async def has_message(
+        self, project_id: str, negotiation_id: str, message_id: str
+    ) -> bool:
+        """Have we already filed this Gmail message?
+
+        The durable answer to a question the transport used to answer with
+        Gmail's UNREAD label — which the producer clears simply by opening
+        their own inbox. This is a document we wrote and nobody else can touch.
+
+        Cheap on purpose, and checked *before* the brain is called: without it,
+        polling every message in every live thread on every tick would mean an
+        LLM call per message per minute for the life of a negotiation.
+        """
+        ref = (
+            self._negotiation_ref(project_id, negotiation_id)
+            .collection(MESSAGES)
+            .document(message_id)
+        )
+        return (await ref.get()).exists
+
     async def list_messages(
         self, project_id: str, negotiation_id: str
     ) -> list[MessageRecord]:

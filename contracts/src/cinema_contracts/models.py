@@ -397,6 +397,14 @@ class BriefingNegotiation(_Frozen):
     )
     waiting_on_human: bool = False
     escalation_reason: str = ""
+    bounced: bool = False
+    """The address did not work, so the agent stopped writing to it.
+
+    Distinct from every other way a negotiation reaches DEAD, and the briefing
+    has to say so. "We gave up after no reply" and "their email bounced" send a
+    producer to different places — one to chase, one to find a working address —
+    and DEAD alone cannot tell them apart. ``reasoning`` carries the note.
+    """
 
 
 class ProducerQuestion(_Frozen):

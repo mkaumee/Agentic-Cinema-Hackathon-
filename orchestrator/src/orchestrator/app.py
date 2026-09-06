@@ -44,6 +44,7 @@ from google.cloud.firestore_v1 import AsyncClient
 from pydantic import BaseModel, Field
 
 from orchestrator import intake
+from orchestrator.attachments import AttachmentStore
 from orchestrator.clock import SimClock
 from orchestrator.gmail import GmailTransport, build_credentials, token_store_for
 from orchestrator.logs import configure_logging
@@ -246,7 +247,22 @@ def build_services(settings: Settings | None = None) -> Services:
         clock=clock,
         brain=brain,
         mail=mail,
-        loop=TickLoop(repo, clock, brain, build_mailboxes(resolved, repo, mail)),
+        loop=TickLoop(
+            repo,
+            clock,
+            brain,
+            build_mailboxes(resolved, repo, mail),
+            # Read-only, from a bucket this account has objectViewer on and
+            # nothing more. It fetches what a producer already uploaded and
+            # attaches it; it cannot put anything there. None when the
+            # deployment has no bucket, which the send path treats as "the
+            # words go without the file" rather than as a failure.
+            attachments=(
+                AttachmentStore(resolved.attachments_bucket)
+                if resolved.attachments_bucket
+                else None
+            ),
+        ),
     )
 
 

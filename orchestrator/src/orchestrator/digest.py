@@ -76,6 +76,14 @@ class NegotiationLine:
     why rather than only what."""
     waiting_on_human: bool
     escalation_reason: str
+    bounced: bool = False
+    """Dead because the address bounced, not because nobody answered.
+
+    Carried so a producer who asks "what happened to Skyline Props?" gets the
+    truth rather than the generic DEAD wording. The agent does not interrupt
+    anyone over a bounce — there is no decision in a dead mailbox — but not
+    interrupting is only defensible if asking still works.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +178,7 @@ def build_digest(
                 reasoning=record.latest_reasoning,
                 waiting_on_human=record.state in WAITING_STATES,
                 escalation_reason=record.escalation_reason,
+                bounced=record.bounced_at is not None,
             )
         )
 
@@ -216,6 +225,7 @@ def as_question(digest: ProjectDigest, question: str) -> ProducerQuestion:
                 reasoning=talk.reasoning,
                 waiting_on_human=talk.waiting_on_human,
                 escalation_reason=talk.escalation_reason,
+                bounced=talk.bounced,
             )
             for talk in digest.negotiations
         ],

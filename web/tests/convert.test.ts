@@ -9,7 +9,12 @@
 
 import { describe, expect, it } from "vitest";
 
-import { DECISION_TOOL, EMAIL_TOOL, toThreadMessage } from "../src/chat/convert";
+import {
+  DECISION_TOOL,
+  EMAIL_TOOL,
+  QUESTION_TOOL,
+  toThreadMessage,
+} from "../src/chat/convert";
 import { directionOf, inOrder, type Row } from "../src/chat/rows";
 
 const AT = new Date("2026-03-01T09:00:00Z");
@@ -218,5 +223,51 @@ describe("a briefing that did not come from the brain", () => {
     expect(textOf(briefing(false, "NotFound: something"))).toBe(
       "Nothing needs you right now.",
     );
+  });
+});
+
+describe("what a seller asked the producer", () => {
+  const question = (over: Partial<Row> = {}): Row =>
+    ({
+      kind: "question",
+      id: "q-1",
+      negotiationId: "neg1",
+      itemName: "Mirror",
+      supplier: "Ah Seng Rentals",
+      asked: "Which mirror do you mean — the tall one?",
+      at: AT,
+      ...over,
+    }) as Row;
+
+  it("renders under its own tool, not the decision one", () => {
+    // Registered separately in Transcript.tsx. Emitting this under
+    // DECISION_TOOL would render an Approve button against a question, and
+    // nothing would throw — it would simply offer to buy at no price.
+    const [part] = partsOf(question());
+
+    expect(part).toMatchObject({ type: "tool-call", toolName: QUESTION_TOOL });
+    expect(part).not.toMatchObject({ toolName: DECISION_TOOL });
+  });
+
+  it("carries no approval, because there is no yes or no here", () => {
+    // An approval renders as accept and reject. "Reject" means nothing to a
+    // seller who asked how tall the mirror is.
+    const [part] = partsOf(question());
+
+    expect(part).not.toHaveProperty("approval");
+    expect(part).not.toHaveProperty("result");
+  });
+
+  it("carries the question in the seller's own words", () => {
+    const [part] = partsOf(question());
+
+    expect(part).toMatchObject({
+      args: {
+        negotiationId: "neg1",
+        item: "Mirror",
+        supplier: "Ah Seng Rentals",
+        asked: "Which mirror do you mean — the tall one?",
+      },
+    });
   });
 });

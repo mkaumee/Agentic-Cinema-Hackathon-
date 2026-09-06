@@ -327,6 +327,38 @@ export async function releaseOpenings(
   );
 }
 
+/**
+ * Give a seller what they asked for, and let the agent carry on.
+ *
+ * Nothing is emailed by this call. The api service holds no mailbox — it
+ * stores the file, records the words and makes the row due, and the tick
+ * service posts it within the minute. Same split that keeps this side of the
+ * deployment unable to write a purchase order.
+ *
+ * The words go out as the producer typed them. They answered a question that
+ * was put to them, and having the brain paraphrase it is how a seller ends up
+ * being told something nobody said.
+ */
+export async function answerSupplier(
+  projectId: string,
+  negotiationId: string,
+  answer: string,
+  file?: Upload,
+): Promise<Done> {
+  return completed(
+    await send(
+      "POST",
+      `/projects/${projectId}/negotiations/${negotiationId}/answer`,
+      {
+        answer,
+        filename: file?.filename ?? "",
+        mime_type: file?.mimeType ?? "application/octet-stream",
+        content_b64: file?.contentB64 ?? "",
+      },
+    ),
+  );
+}
+
 export async function enrolAsProducer(): Promise<Done> {
   const reply = await send("POST", "/producers/me");
   const result = await completed(reply);

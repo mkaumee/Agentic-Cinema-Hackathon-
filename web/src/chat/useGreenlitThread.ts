@@ -20,7 +20,7 @@ import { useCallback, useMemo, useState } from "react";
 import type { Item, Message, Negotiation, Supplier } from "@/hooks/useProject";
 import { ask, toUpload, uploadScript, type Upload } from "./api";
 import { IDLE, isBusy, type Busy } from "./busy";
-import { decisionsFor } from "./decisions";
+import { decisionsFor, questionsFor } from "./decisions";
 import { researchOf, stillWorking } from "./research";
 import { toThreadMessage } from "./convert";
 import { directionOf, inOrder, type Row } from "./rows";
@@ -51,6 +51,9 @@ export interface GreenlitThread {
   waiting: Row[];
   /** Opening emails written and not yet released. Also waiting on a person. */
   openings: Row[];
+  /** Sellers who asked the producer something. Waiting on a person too, and
+   * on a different person's answer than a decision is. */
+  questions: Row[];
   /** Hand a screenplay to the agent. Resolves once the props are on screen. */
   readScript: (file: File) => Promise<void>;
   /**
@@ -134,6 +137,33 @@ export function useGreenlitThread(sources: ThreadSources): GreenlitThread {
   );
 
   /**
+   * Sellers who asked the producer something.
+   *
+   * The same `READY_FOR_HUMAN` state as a decision, and deliberately not the
+   * same row: one is a purchase to approve, the other a question to answer,
+   * and a card that tried to be both would offer to buy at a price nobody
+   * named. `decisionsFor` drops these for that reason and this picks them up.
+   *
+   * One per negotiation, not per prop. Two sellers asking about the same
+   * mirror have asked two different questions.
+   */
+  const questions = useMemo<Row[]>(
+    () =>
+      questionsFor(sources.items, sources.negotiations).map(
+        ({ item, negotiation, asked }) => ({
+          kind: "question" as const,
+          id: `question:${negotiation.id}`,
+          negotiationId: negotiation.id,
+          itemName: item.name ?? item.id,
+          supplier: named(negotiation.supplier_id),
+          asked,
+          at: negotiation.last_inbound_at?.toDate() ?? new Date(),
+        }),
+      ),
+    [sources.items, sources.negotiations, named],
+  );
+
+  /**
    * Opening emails written and not yet released.
    *
    * Derived from Firestore rather than pushed in like the props are, because
@@ -204,8 +234,16 @@ export function useGreenlitThread(sources: ThreadSources): GreenlitThread {
   }, [sources.items, sources.suppliers, sources.negotiations]);
 
   const rows = useMemo(
-    () => inOrder([...conversation, ...activity, ...waiting, ...openings, ...research]),
-    [conversation, activity, waiting, openings, research],
+    () =>
+      inOrder([
+        ...conversation,
+        ...activity,
+        ...waiting,
+        ...questions,
+        ...openings,
+        ...research,
+      ]),
+    [conversation, activity, waiting, questions, openings, research],
   );
 
 
@@ -332,5 +370,5 @@ export function useGreenlitThread(sources: ThreadSources): GreenlitThread {
     convertMessage: toThreadMessage,
   });
 
-  return { runtime, waiting, openings, readScript, busy };
+  return { runtime, waiting, openings, questions, readScript, busy };
 }

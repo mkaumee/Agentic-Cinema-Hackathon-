@@ -55,7 +55,13 @@ def summarise(digest: ProjectDigest, question: str) -> tuple[str, list[Reference
 
     if any(word in asked for word in ("need", "waiting", "approve", "decide")):
         return _waiting(digest)
-    if any(word in asked for word in ("quiet", "silent", "chas", "stuck", "slow")):
+    # "bounce" and "dead" route here rather than to the overview because a
+    # producer only asks them after noticing a supplier went missing, and the
+    # overview would answer with a count that does not mention them at all.
+    if any(
+        word in asked
+        for word in ("quiet", "silent", "chas", "stuck", "slow", "bounc", "dead")
+    ):
         return _quiet(digest)
     if any(word in asked for word in ("cost", "price", "spend", "budget", "saving")):
         return _money_answer(digest)
@@ -110,6 +116,8 @@ def _quiet(digest: ProjectDigest) -> tuple[str, list[Referenced]]:
     """
     chasing = [n for n in digest.negotiations if n.state == "CHASING"]
     dead = [n for n in digest.negotiations if n.state == "DEAD"]
+    bounced = [n for n in dead if n.bounced]
+    silent = [n for n in dead if not n.bounced]
     if not chasing and not dead:
         return ("Every supplier who was written to has answered.", [])
 
@@ -120,11 +128,26 @@ def _quiet(digest: ProjectDigest) -> tuple[str, list[Referenced]]:
         for n in chasing:
             lines.append(f"  · {n.supplier} about {n.item_name}")
             refs.append(("negotiation", n.negotiation_id, n.item_name))
-    if dead:
-        lines.append(f"{len(dead)} gave up on after no reply:")
-        for n in dead:
+    if silent:
+        lines.append(f"{len(silent)} gave up on after no reply:")
+        for n in silent:
             lines.append(f"  · {n.supplier} about {n.item_name}")
             refs.append(("negotiation", n.negotiation_id, n.item_name))
+    if bounced:
+        # Separated from the silent ones because they are a different problem
+        # with a different fix. Nobody was interrupted when these bounced —
+        # a dead mailbox is not a decision — so this answer is the only place
+        # the producer finds out, and calling it "no reply" would send them
+        # off to chase an address that does not exist.
+        lines.append(f"{len(bounced)} stopped because the address bounced:")
+        for n in bounced:
+            note = f" — {n.reasoning}" if n.reasoning else ""
+            lines.append(f"  · {n.supplier} about {n.item_name}{note}")
+            refs.append(("negotiation", n.negotiation_id, n.item_name))
+        lines.append(
+            "No more email goes to those. Their props carry on with "
+            "whoever else was written to."
+        )
     return ("\n".join(lines), refs)
 
 

@@ -51,6 +51,7 @@ REGION="${REGION:-us-central1}"
 AGENT_SA="${AGENT_SA:-cinema-agent}"
 ORDERS_DB="${ORDERS_DB:-orders}"
 TOKEN_SECRET="${TOKEN_SECRET:-gmail-agent-refresh-token}"
+ATTACHMENTS_BUCKET="${ATTACHMENTS_BUCKET:-${PROJECT_ID}-attachments}"
 
 if [[ -z "$PROJECT_ID" ]]; then
   echo "PROJECT_ID is not set." >&2
@@ -259,6 +260,7 @@ FREE_APIS=(
 )
 BILLED_APIS=(
   secretmanager.googleapis.com
+  storage.googleapis.com
   run.googleapis.com
   cloudscheduler.googleapis.com
   artifactregistry.googleapis.com
@@ -418,6 +420,50 @@ fi
 
 # ---------------------------------------------------------------------------
 
+# Where a producer's reference photo waits between the upload and the tick that
+# sends it. Not Firestore: a document caps at 1 MiB and a photograph off a phone
+# is routinely several times that, so it would pass a test with a small file and
+# fail in front of a judge with a real one.
+#
+# The two services reach it from opposite ends and neither holds both halves.
+# `cinema-api` writes (objectCreator, granted in deploy.sh) and `cinema-agent`
+# reads (objectViewer, below). Same shape as the token secret: the service that
+# stores a thing has no business using it.
+say "Attachments bucket"
+if [[ "${WITHOUT_BILLING:-}" == "1" ]]; then
+  printf '  \033[90m·\033[0m bucket %s skipped — Cloud Storage needs billing.\n' \
+    "$ATTACHMENTS_BUCKET"
+  printf '    Leave CINEMA_ATTACHMENTS_BUCKET unset; answering in words still works.\n'
+else
+  if gcloud storage buckets describe "gs://${ATTACHMENTS_BUCKET}" >/dev/null 2>&1; then
+    skip "gs://${ATTACHMENTS_BUCKET}"
+  else
+    # Uniform access, because per-object ACLs would let one upload be made
+    # public without anything in this repo saying so. Public access prevented
+    # on top of it: these are a producer's reference photos, and the only
+    # readers that should ever exist are the two service accounts.
+    gcloud storage buckets create "gs://${ATTACHMENTS_BUCKET}" \
+      --location="$REGION" \
+      --uniform-bucket-level-access \
+      --public-access-prevention >/dev/null
+    ok "gs://${ATTACHMENTS_BUCKET}"
+  fi
+
+  if gcloud storage buckets get-iam-policy "gs://${ATTACHMENTS_BUCKET}" \
+       --flatten='bindings[].members' \
+       --filter="bindings.role:roles/storage.objectViewer AND bindings.members:serviceAccount:${AGENT_EMAIL}" \
+       --format='value(bindings.role)' | grep -q objectViewer; then
+    skip "objectViewer for the agent"
+  else
+    gcloud storage buckets add-iam-policy-binding "gs://${ATTACHMENTS_BUCKET}" \
+      --member="serviceAccount:${AGENT_EMAIL}" \
+      --role="roles/storage.objectViewer" >/dev/null
+    ok "objectViewer for the agent (read only — it never uploads)"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+
 say "What the agent account can actually do"
 echo "  Read this rather than trusting the ticks above — it is the guardrail."
 gcloud projects get-iam-policy "$PROJECT_ID" \
@@ -440,6 +486,7 @@ $(printf '\033[1mNext\033[0m')
        CINEMA_GCP_PROJECT=$PROJECT_ID
        $TOKEN_LINE
        CINEMA_REFRESH_TOKEN_SECRET=$TOKEN_SECRET
+       CINEMA_ATTACHMENTS_BUCKET=$ATTACHMENTS_BUCKET
 
   2. Deploy the rules and indexes:
 

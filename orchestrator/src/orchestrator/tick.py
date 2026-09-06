@@ -46,8 +46,10 @@ from cinema_contracts import (
     SupplierCandidate,
 )
 
+from orchestrator.attachments import AttachmentReader, StoredFile
+from orchestrator.bounces import bounce_note, looks_like_a_bounce
 from orchestrator.clock import SimClock
-from orchestrator.mail import MailTransport, RawInbound
+from orchestrator.mail import Attachment, MailTransport, RawInbound
 from orchestrator.mailboxes import MailboxProvider, is_expired_credential
 from orchestrator.records import MessageRecord, NegotiationRecord
 from orchestrator.repository import DueNegotiation, FirestoreRepository
@@ -120,6 +122,9 @@ class TickReport:
     """Rows another tick was already working on. Zero unless ticks overlap, and
     a number that climbs is the signal that ticks are running long."""
     messages_sent: int = 0
+    bounced: int = 0
+    """Addresses that turned out to be dead. Counted apart from replies filed,
+    because a bounce is not a supplier answering."""
     openings_drafted: int = 0
     """Opening emails written and left for a person to read.
 
@@ -161,6 +166,7 @@ class TickLoop:
     _brain: AgentBrain
     _mailboxes: MailboxProvider
     _sourcing: SourcingLoop
+    _attachments: AttachmentReader | None
 
     def __init__(
         self,
@@ -168,12 +174,17 @@ class TickLoop:
         clock: SimClock,
         brain: AgentBrain,
         mailboxes: MailboxProvider,
+        attachments: AttachmentReader | None = None,
     ) -> None:
         self._repo = repo
         self._clock = clock
         self._brain = brain
         self._mailboxes = mailboxes
         self._sourcing = SourcingLoop(repo, brain)
+        # Optional: the loop runs without a bucket on a laptop and in every
+        # test that is not about attachments. A negotiation whose producer
+        # supplied only words needs no store at all.
+        self._attachments = attachments
 
     async def run_tick(self, project_id: str, *, limit: int = 50) -> TickReport:
         now = await self._clock.advance(project_id)
@@ -283,6 +294,28 @@ class TickLoop:
             return
 
         record = target.record
+
+        # Two checks before the brain, for two different reasons.
+        #
+        # Already filed: the transport no longer uses Gmail's UNREAD label to
+        # mean "new" — the producer clears that by opening their own inbox — so
+        # poll returns every message in a live thread and this is what makes
+        # that affordable. Without it a five-day negotiation would cost an
+        # extract_quote call per message per minute.
+        if await self._repo.has_message(
+            target.project_id, target.negotiation_id, raw.message_id
+        ):
+            report.replies_skipped += 1
+            return
+
+        # A bounce: the mail system saying the address is dead, arriving in the
+        # supplier's own thread and matching it. Handed to the brain it reads as
+        # a seller writing "Address not found", and the brain does its job and
+        # produces a counter-offer to a mailbox nobody is reading.
+        if looks_like_a_bounce(from_email=raw.from_email, subject=raw.subject):
+            await self._file_bounce(target, raw, now, report)
+            return
+
         extraction = await self._brain.extract_quote(
             InboundMessage(
                 message_id=raw.message_id,
@@ -340,6 +373,70 @@ class TickLoop:
         await self._repo.save_negotiation(
             target.project_id, target.negotiation_id, record
         )
+
+    async def _attachments_for(self, record: NegotiationRecord) -> StoredFile | None:
+        """The producer's file, if there is one and it is still there.
+
+        None covers three cases that all mean the same thing to a send: no
+        store configured (the tick runs without one in tests and on a laptop),
+        nothing uploaded, and an object that has since gone. A missing
+        attachment must not take the negotiation down — the answer is still
+        worth sending.
+        """
+        if self._attachments is None or not record.producer_attachment_key:
+            return None
+        return await self._attachments.get(record.producer_attachment_key)
+
+    async def _file_bounce(
+        self,
+        target: DueNegotiation,
+        raw: RawInbound,
+        now: datetime,
+        report: TickReport,
+    ) -> None:
+        """Stop writing to a dead address, quietly, and write down why.
+
+        Quietly is deliberate. There is no decision here for a person to make —
+        the address does not work — and a "needs you" queue filling with dead
+        mailboxes is a queue people stop reading, which costs them the
+        approvals that actually matter.
+
+        Quiet is not unaccountable, though, which is why the note goes in the
+        timeline and onto the record. The producer is never interrupted and can
+        always ask; the briefing draws on both.
+
+        The item is untouched. Its other suppliers carry on.
+        """
+        record = target.record
+        note = bounce_note(raw.from_email, raw.subject)
+
+        _ = await self._repo.append_message(
+            target.project_id,
+            target.negotiation_id,
+            raw.message_id,
+            MessageRecord(
+                direction=MessageDirection.INBOUND,
+                body=raw.body,
+                subject=raw.subject,
+                sim_sent_at=now,
+                gmail_message_id=raw.message_id,
+                bounced=True,
+            ),
+        )
+
+        if not is_terminal(record.state):
+            record.state = apply_event(record.state, NegotiationEvent.AGENT_WALKED_AWAY)
+        record.latest_reasoning = note
+        record.bounced_at = now
+        record.next_action_due_at = None
+        record.updated_at = now
+        await self._repo.save_negotiation(
+            target.project_id, target.negotiation_id, record
+        )
+        # Counted rather than logged: this module reports through TickReport
+        # and has no logger of its own, and the note above is the durable
+        # record a producer can actually read.
+        report.bounced += 1
 
     def _apply_extraction(
         self, record: NegotiationRecord, extraction: QuoteExtraction, now: datetime
@@ -493,6 +590,24 @@ class TickLoop:
             )
             body = (record.draft_body if opening else "") or move.draft_body
 
+            # What the producer supplied when the seller asked them something.
+            # Their words go out as written and the brain's are dropped: they
+            # answered a question that was put to them, and paraphrasing that
+            # is how you end up telling a seller something nobody said.
+            attachments: list[Attachment] = []
+            if record.producer_answer or record.producer_attachment_key:
+                if record.producer_answer:
+                    body = record.producer_answer
+                stored = await self._attachments_for(record)
+                if stored is not None:
+                    attachments.append(
+                        Attachment(
+                            filename=stored.filename,
+                            content_type=stored.content_type,
+                            data=stored.data,
+                        )
+                    )
+
             # Threading is built from RFC-822 header ids, never from the
             # transport's own message id. See SentMessage in mail.py for why
             # confusing the two silently shreds the supplier's thread.
@@ -509,6 +624,7 @@ class TickLoop:
                 thread_id=record.gmail_thread_id,
                 in_reply_to=record.last_rfc822_id,
                 references=_references(record),
+                attachments=attachments,
             )
             record.gmail_thread_id = sent.thread_id
             record.last_msg_id = sent.message_id
@@ -532,9 +648,12 @@ class TickLoop:
             )
 
             # COUNTER and CHASE share this path, so a draft left lying here
-            # would eventually be sent as somebody's counter-offer.
+            # would eventually be sent as somebody's counter-offer. The same
+            # goes for the producer's answer and their photograph.
             record.draft_subject = ""
             record.draft_body = ""
+            record.producer_answer = ""
+            record.producer_attachment_key = ""
 
             if move.action is MoveAction.COUNTER:
                 record.rounds_used += 1
