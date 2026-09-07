@@ -48,6 +48,17 @@ export interface Decision {
   chosen: Negotiation;
   /** Everyone else who quoted. Shown, never actionable. */
   rivals: Negotiation[];
+  /**
+   * A shop page rather than a conversation.
+   *
+   * Both are decisions and both stop at the same gate, and there the
+   * resemblance ends. Nothing was negotiated, so rounds, "opened at" and
+   * "talked down by" describe a conversation that never happened — and
+   * "Push for 10% less" is not merely useless on one, it is destructive:
+   * it makes the row due, and a row with no email address in the tick's send
+   * path is an agent trying to haggle with a URL.
+   */
+  isListing: boolean;
 }
 
 const priceOf = (n: Negotiation): number =>
@@ -78,7 +89,12 @@ export function decisionsFor(
     const sorted = [...group].sort((a, b) => priceOf(a) - priceOf(b));
     const [chosen, ...rivals] = sorted;
     if (chosen === undefined) continue;
-    out.push({ item, chosen, rivals });
+    out.push({
+      item,
+      chosen,
+      rivals,
+      isListing: (chosen.listing_url ?? "") !== "",
+    });
   }
   return out.sort((a, b) => (a.item.name ?? "").localeCompare(b.item.name ?? ""));
 }

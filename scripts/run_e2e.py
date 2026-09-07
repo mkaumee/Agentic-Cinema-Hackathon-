@@ -326,10 +326,17 @@ async def verify(
     if unstarted:
         failures.append(f"items never left DRAFT: {unstarted}")
 
+    # A *negotiated* escalation, deliberately. A shop listing is created
+    # already at READY_FOR_HUMAN, so once the buy route existed this assertion
+    # could be satisfied by a row that sent zero emails and waited zero days —
+    # and `make e2e`, which CLAUDE.md calls the only thing keeping the two
+    # halves from diverging, would have gone green on a build where the
+    # negotiation loop was completely broken.
     if not any(
-        r.state is NegotiationState.READY_FOR_HUMAN for r in negotiations.values()
+        r.state is NegotiationState.READY_FOR_HUMAN and not r.listing_url
+        for r in negotiations.values()
     ):
-        failures.append("no negotiation reached READY_FOR_HUMAN")
+        failures.append("no negotiation reached READY_FOR_HUMAN by talking to anyone")
 
     hung = [
         nid

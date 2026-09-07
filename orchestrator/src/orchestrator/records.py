@@ -25,10 +25,12 @@ from typing import ClassVar
 
 from cinema_contracts import (
     ExtractedQuote,
+    Listing,
     Money,
     NegotiationState,
     ReferenceBand,
     SceneMention,
+    SourcingRoute,
 )
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -169,6 +171,23 @@ class ItemRecord(_Record):
     status: ItemStatus = ItemStatus.DRAFT
     chosen_quote: ExtractedQuote | None = None
 
+    route: SourcingRoute = SourcingRoute.NEGOTIATE
+    """Bought off a shelf, or talked about with a person.
+
+    Proposed by the brain from what the object is, editable by the producer on
+    the confirmation list, and corrected by research when the evidence
+    disagrees. Defaulted to NEGOTIATE so every item written before this field
+    existed reads back as what it actually was.
+    """
+
+    listings: list[Listing] = Field(default_factory=list)
+    """Shop pages research found, cheapest first.
+
+    Kept on the item as well as being turned into negotiations because the
+    negotiations are the *decision* and this is the *evidence* — the same
+    reason ``reference_band`` lives here beside quotes that came in later.
+    """
+
     supplier_ids: list[str] = Field(default_factory=list)
     """Sellers research found *for this item*.
 
@@ -193,15 +212,55 @@ class ItemRecord(_Record):
     the index rather than leaving a row to filter on every pass.
     """
 
+    purchase_confirmed_at: datetime | None = None
+    """When the producer said the checkout actually went through.
+
+    Approving a listing records that they were *sent to a shop*. Nothing here
+    can know they finished paying, and an item that reads ORDERED on the
+    strength of a click is the screen guessing.
+
+    This cannot live on the purchase order. That document is create-only by
+    Hard Rule 4 and ``firestore.orders.rules`` denies update outright, so the
+    answer goes here, in the default database, written by the api service —
+    saying "yes I bought it" moves no money and has no business on the money
+    path.
+    """
+
+    purchase_note: str = ""
+    """What the producer said when the checkout did *not* go through.
+
+    Set with ``purchase_confirmed_at`` left None. The item stays ORDERED and
+    the purchase order stands, because that document is never rewritten and
+    pretending otherwise would make the one receipt in this system a lie. What
+    this does is stop the screen claiming the prop is sorted when it is not.
+    """
+
     updated_at: datetime | None = None
 
 
 class SupplierRecord(_Record):
-    """``projects/{pid}/suppliers/{sid}``"""
+    """``projects/{pid}/suppliers/{sid}``
+
+    A company to write to, or — with ``listing_url`` set — a shop to buy from.
+    One record type for both because everything downstream wants the same
+    thing from it: a name to put on a card.
+    """
 
     name: str
     email: str
+    """Empty for a shop. That is the whole difference, and it is why
+    ``looks_like_an_address`` is checked before a negotiation is opened rather
+    than trusted at send time."""
+
     source_url: str = ""
+    listing_url: str = ""
+    """The product page, when this is a shop rather than a person.
+
+    Its presence is what marks the record as a listing seller. Kept separate
+    from ``source_url``, which means "where I found this company" and is
+    provenance rather than a thing to click and buy.
+    """
+
     confidence: float = Field(ge=0.0, le=1.0, default=0.5)
     verified: bool = False
 
@@ -218,6 +277,19 @@ class NegotiationRecord(_Record):
 
     item_id: str
     supplier_id: str
+
+    listing_url: str = ""
+    """Set when this is a shop page rather than a conversation.
+
+    The marker, and it is a field rather than an ``escalation_reason`` value on
+    purpose. A dozen call sites need to tell a listing from a negotiated quote
+    — the send path, the floor endpoint, the savings screen, the briefing — and
+    a reason string that only one of them happens to check is not a boundary,
+    it is a convention waiting to be forgotten. ``is_listing`` reads this.
+
+    Its presence also means the row must never be emailed: there is nobody on
+    the other end, only a product page.
+    """
     state: NegotiationState = NegotiationState.DRAFTED
 
     floor_price: Money | None = None
@@ -321,6 +393,16 @@ class MessageRecord(_Record):
     sending something strange."""
 
 
+def is_listing(record: NegotiationRecord) -> bool:
+    """A shop page, not a person.
+
+    One function so the answer is the same everywhere. Every place that assumes
+    a negotiation had a counterpart who reads email — rounds, silence, "talked
+    down by", the floor endpoint — asks this first.
+    """
+    return bool(record.listing_url)
+
+
 class PurchaseOrderRecord(_Record):
     """``purchase_orders/{item_id}``
 
@@ -337,3 +419,11 @@ class PurchaseOrderRecord(_Record):
     price: Money
     approved_by: str
     approved_at: datetime
+
+    listing_url: str = ""
+    """Where the producer was sent, when the order came from a shop page.
+
+    On the receipt rather than only on the negotiation, because an order that
+    records a price with no provenance is half a receipt. Empty for anything
+    negotiated over email, where the supplier id is the provenance.
+    """

@@ -242,6 +242,49 @@ async def test_a_finished_negotiation_drops_out_of_the_query(
     assert [d.negotiation_id for d in due] == ["live"]
 
 
+async def test_a_row_with_no_due_date_is_absent_from_the_queue_entirely(
+    firestore: AsyncClient,
+) -> None:
+    """No due date means never picked up, for as long as that lasts.
+
+    The invariant a shop listing rests on. A listing is created
+    ``READY_FOR_HUMAN`` with ``next_action_due_at=None`` and must never be
+    picked up — there is no seller to write to, only a product page. If it were
+    picked up, the brain would be asked what to say to a URL and the tick would
+    try to mail an empty address.
+
+    ``READY_FOR_HUMAN`` is not terminal, so the field-removal in
+    ``save_negotiation`` does not cover this — that is the test above, and it
+    is a different mechanism. What covers this one is Firestore: a range filter
+    against a timestamp does not match a null, so the row stays out whether the
+    field is absent or explicitly null. Checked both ways rather than assumed;
+    flipping ``exclude_none`` in ``_Record.to_firestore`` does not change the
+    result.
+
+    Which makes this a test of behaviour rather than of mechanism, and that is
+    the right thing to pin: the guarantee has to survive a change to how
+    records are serialised.
+    """
+    repo = FirestoreRepository(firestore)
+    await repo.create_project(PID, _project())
+
+    await repo.save_negotiation(
+        PID,
+        "listing",
+        _negotiation(state=NegotiationState.READY_FOR_HUMAN, due=None),
+    )
+    await repo.save_negotiation(PID, "live", _negotiation(due=T0 - timedelta(days=1)))
+
+    due = await repo.due_negotiations(T0)
+
+    assert [d.negotiation_id for d in due] == ["live"]
+
+    # And still absent however far the clock runs, which is what "never picked
+    # up" has to mean for a row that waits on a person indefinitely.
+    later = await repo.due_negotiations(T0 + timedelta(days=365))
+    assert [d.negotiation_id for d in later] == ["live"]
+
+
 async def test_a_tick_only_takes_a_bounded_bite(firestore: AsyncClient) -> None:
     repo = FirestoreRepository(firestore)
     await repo.create_project(PID, _project())

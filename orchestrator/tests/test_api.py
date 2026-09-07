@@ -1503,3 +1503,170 @@ async def test_answering_a_negotiation_that_is_not_there(
     )
 
     assert reply.status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# Shop listings: a decision with nobody on the other end
+# --------------------------------------------------------------------------- #
+
+
+async def _listing(firestore: AsyncClient, project_id: str) -> FirestoreRepository:
+    """A prop sourced from a shop page rather than from a person."""
+    repo = FirestoreRepository(firestore)
+    await repo.save_supplier(
+        project_id,
+        "shop1",
+        SupplierRecord(
+            name="A Marketplace",
+            email="",
+            listing_url="https://shop.example.invalid/mirror",
+        ),
+    )
+    await repo.save_negotiation(
+        project_id,
+        "listing1",
+        NegotiationRecord(
+            item_id="mirror",
+            supplier_id="shop1",
+            state=NegotiationState.READY_FOR_HUMAN,
+            listing_url="https://shop.example.invalid/mirror",
+            latest_quote=ExtractedQuote(
+                unit_price=Money(amount=89, currency="MYR"),
+                total=Money(amount=89, currency="MYR"),
+            ),
+            escalation_reason="LISTING_FOUND",
+            created_at=T0,
+            updated_at=T0,
+        ),
+    )
+    return repo
+
+
+async def test_a_shop_listing_cannot_be_answered_as_though_it_asked_something(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    """A product page did not ask a question, and cannot be replied to.
+
+    Not cosmetic. This route sets `next_action_due_at = now`, which is how a
+    row with no email address gets into the tick's send path — the same failure
+    the floor endpoint has, reached through a different door.
+    """
+    owner = tokens.create("owner@example.invalid")
+    headers = {
+        "Authorization": f"Bearer {tokens.grant(owner, 'owner@example.invalid')}"
+    }
+    repo = await _owned_project(firestore, "kopitiam", owner)
+    _ = await _listing(firestore, "kopitiam")
+    _with_bucket(firestore, _FakeBucket())
+
+    reply = await api.post(
+        "/projects/kopitiam/negotiations/listing1/answer",
+        headers=headers,
+        json=_upload("Here is the photo you asked for."),
+    )
+
+    assert reply.status_code == 409
+    record = await repo.get_negotiation("kopitiam", "listing1")
+    assert record is not None
+    assert record.next_action_due_at is None, "still out of the tick's queue"
+    assert record.producer_answer == ""
+
+
+async def test_saying_the_checkout_went_through(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    """Approving a listing sends someone to a shop. Only they know what happened."""
+    owner = tokens.create("owner@example.invalid")
+    headers = {
+        "Authorization": f"Bearer {tokens.grant(owner, 'owner@example.invalid')}"
+    }
+    repo = await _owned_project(firestore, "kopitiam", owner)
+    item = await repo.get_item("kopitiam", "mirror")
+    assert item is not None
+    item.status = ItemStatus.ORDERED
+    await repo.save_item("kopitiam", "mirror", item)
+
+    reply = await api.post(
+        "/projects/kopitiam/items/mirror/receipt",
+        headers=headers,
+        json={"received": True},
+    )
+
+    assert reply.status_code == 200, reply.text
+    settled = await repo.get_item("kopitiam", "mirror")
+    assert settled is not None
+    assert settled.purchase_confirmed_at is not None
+    assert settled.purchase_note == ""
+
+
+async def test_a_failed_checkout_does_not_unwind_the_order(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    """The purchase order stands. It is never rewritten, by anyone, ever.
+
+    Which is the honest outcome rather than a shortcoming: `purchase_orders` is
+    create-only by Hard Rule 4, and making the one receipt in this system
+    mutable to tidy up a UI state would cost far more than it buys. What
+    changes is that the item stops claiming to be sorted.
+    """
+    owner = tokens.create("owner@example.invalid")
+    headers = {
+        "Authorization": f"Bearer {tokens.grant(owner, 'owner@example.invalid')}"
+    }
+    repo = await _owned_project(firestore, "kopitiam", owner)
+    item = await repo.get_item("kopitiam", "mirror")
+    assert item is not None
+    item.status = ItemStatus.ORDERED
+    await repo.save_item("kopitiam", "mirror", item)
+
+    reply = await api.post(
+        "/projects/kopitiam/items/mirror/receipt",
+        headers=headers,
+        json={"received": False, "note": "Sold out by the time I got there."},
+    )
+
+    assert reply.status_code == 200, reply.text
+    settled = await repo.get_item("kopitiam", "mirror")
+    assert settled is not None
+    assert settled.status is ItemStatus.ORDERED, "the order is not undone"
+    assert settled.purchase_confirmed_at is None
+    assert settled.purchase_note == "Sold out by the time I got there."
+
+
+async def test_there_is_nothing_to_confirm_before_anything_is_approved(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    owner = tokens.create("owner@example.invalid")
+    headers = {
+        "Authorization": f"Bearer {tokens.grant(owner, 'owner@example.invalid')}"
+    }
+    _ = await _owned_project(firestore, "kopitiam", owner)
+
+    reply = await api.post(
+        "/projects/kopitiam/items/mirror/receipt",
+        headers=headers,
+        json={"received": True},
+    )
+
+    assert reply.status_code == 409
+
+
+async def test_a_stranger_cannot_report_on_your_shopping(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    repo = await _owned_project(firestore, "someone-elses", "a-different-producer")
+    item = await repo.get_item("someone-elses", "mirror")
+    assert item is not None
+    item.status = ItemStatus.ORDERED
+    await repo.save_item("someone-elses", "mirror", item)
+
+    reply = await api.post(
+        "/projects/someone-elses/items/mirror/receipt",
+        headers=_auth(tokens, "outsider@example.invalid"),
+        json={"received": False, "note": "Mine now."},
+    )
+
+    assert reply.status_code == 404
+    settled = await repo.get_item("someone-elses", "mirror")
+    assert settled is not None
+    assert settled.purchase_note == ""

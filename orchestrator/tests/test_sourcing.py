@@ -16,7 +16,15 @@ from typing import Any, override
 
 import httpx
 import pytest
-from cinema_contracts import ItemBrief, ItemResearch, Money, NegotiationState
+from cinema_contracts import (
+    AgentBrain,
+    ItemBrief,
+    ItemResearch,
+    Listing,
+    Money,
+    NegotiationState,
+    SourcingRoute,
+)
 from cinema_contracts.testing import ScriptedBrain
 from google.cloud.firestore_v1 import AsyncClient
 from orchestrator.app import Services, app
@@ -511,3 +519,247 @@ async def test_an_item_lost_to_contention_comes_back(
     assert all(i.status is ItemStatus.NEGOTIATING for i in items.values()), {
         k: v.status for k, v in items.items()
     }
+
+
+# --------------------------------------------------------------------------- #
+# Two roads out of the breakdown
+# --------------------------------------------------------------------------- #
+
+
+def _wire(firestore: AsyncClient, brain: AgentBrain) -> InMemoryMailbox:
+    """Point the tick app at a brain of the test's choosing. Returns the mailbox.
+
+    Handed back so a test can assert on what was sent, which for the buy route
+    is the whole point: the answer has to be nothing.
+    """
+    repo = FirestoreRepository(firestore)
+    clock = SimClock(repo, FrozenRealTime(REAL0))
+    mail = InMemoryMailbox()
+    app.state.services = Services(
+        settings=SETTINGS,
+        client=firestore,
+        repo=repo,
+        clock=clock,
+        brain=brain,
+        mail=mail,
+        loop=TickLoop(repo, clock, brain, SingleMailbox(mail)),
+    )
+    return mail
+
+
+async def _confirm(api: httpx.AsyncClient, item_id: str, route: str) -> None:
+    response = await api.post(
+        f"/projects/{PID}/items/confirm",
+        json={"items": [{"item_id": item_id, "qty": 1, "route": route}]},
+    )
+    assert response.status_code == 200, response.text
+
+
+async def test_a_prop_routed_to_a_shop_is_never_emailed_to_anyone(
+    api: httpx.AsyncClient, firestore: AsyncClient
+) -> None:
+    """The claim the buy route lives or dies on.
+
+    A listing has no correspondent — only a product page — so the agent must
+    not write to it, chase it, or ask the brain what to say to it. That is not
+    a rule enforced somewhere later: the row is created with no due date, so
+    the tick never sees it at all.
+
+    Several ticks, because "not on the first pass" is not the claim.
+    """
+    mail = _wire(firestore, ScriptedBrain())
+    await _new_project(api)
+    _ = await _upload(api)
+    await _confirm(api, item_id_for("cup"), "BUY")
+
+    for _ in range(4):
+        _ = await api.post("/tick")
+
+    repo = FirestoreRepository(firestore)
+    negotiations = await repo.list_negotiations(PID)
+    assert negotiations, "the listing should still produce a decision"
+    assert all(
+        n.state is NegotiationState.READY_FOR_HUMAN for n in negotiations.values()
+    )
+    assert all(n.listing_url for n in negotiations.values()), "marked as a listing"
+    assert all(n.next_action_due_at is None for n in negotiations.values())
+    assert all(n.latest_quote is not None for n in negotiations.values()), "has a price"
+
+    assert mail.sent == [], "nothing was emailed about a shop page"
+    assert all(not n.draft_body for n in negotiations.values()), "and nothing drafted"
+
+    item = await repo.get_item(PID, item_id_for("cup"))
+    assert item is not None
+    assert item.route is SourcingRoute.BUY
+    assert item.listings, "the evidence is kept on the item too"
+
+
+async def test_a_shop_prop_with_no_listings_falls_back_to_writing_to_people(
+    api: httpx.AsyncClient, firestore: AsyncClient
+) -> None:
+    """The producer asked to buy it; nobody sells it online. Ask people instead.
+
+    Overriding their choice is only defensible because the alternative is doing
+    nothing at all — there is no version of respecting it that helps them.
+    """
+
+    class NoListings(ScriptedBrain):
+        @override
+        async def research_item(self, brief: ItemBrief) -> ItemResearch:
+            found = await super().research_item(brief)
+            return found.model_copy(update={"listings": []})
+
+    _ = _wire(firestore, NoListings())
+    await _new_project(api)
+    _ = await _upload(api)
+    await _confirm(api, item_id_for("cup"), "BUY")
+
+    for _ in range(2):
+        _ = await api.post("/tick")
+
+    repo = FirestoreRepository(firestore)
+    item = await repo.get_item(PID, item_id_for("cup"))
+    assert item is not None
+    assert item.route is SourcingRoute.NEGOTIATE, "corrected by the evidence"
+    assert item.status is ItemStatus.NEGOTIATING
+
+    negotiations = await repo.list_negotiations(PID)
+    assert negotiations
+    assert all(not n.listing_url for n in negotiations.values())
+    assert all(n.state is NegotiationState.DRAFTED for n in negotiations.values())
+
+
+async def test_sellers_who_cannot_be_emailed_become_listings_not_a_retry_loop(
+    api: httpx.AsyncClient, firestore: AsyncClient
+) -> None:
+    """The bug the buy route fixes, as much as the feature it adds.
+
+    Research that finds three real sellers on marketplace pages with no
+    scrapeable address stored as nothing at all, and the item retried every six
+    hours forever — indistinguishable, on screen, from a prop nobody sells.
+    """
+
+    class ShopsOnly(ScriptedBrain):
+        @override
+        async def research_item(self, brief: ItemBrief) -> ItemResearch:
+            found = await super().research_item(brief)
+            return found.model_copy(
+                update={
+                    "supplier_candidates": [],
+                    "listings": [
+                        Listing(
+                            title=f"{brief.name} on a marketplace",
+                            url=f"https://shop.example.invalid/{brief.item_id}",
+                            price=Money(amount=89, currency="MYR"),
+                            seller="A Marketplace",
+                        )
+                    ],
+                }
+            )
+
+    _ = _wire(firestore, ShopsOnly())
+    await _new_project(api)
+    _ = await _upload(api)
+    # Routed to people, which is the default and what the old code always did.
+    await _confirm(api, item_id_for("cup"), "NEGOTIATE")
+
+    for _ in range(2):
+        _ = await api.post("/tick")
+
+    repo = FirestoreRepository(firestore)
+    item = await repo.get_item(PID, item_id_for("cup"))
+    assert item is not None
+    assert item.route is SourcingRoute.BUY
+    assert item.status is ItemStatus.NEGOTIATING, "not stuck retrying"
+    assert item.next_action_due_at is None
+
+    negotiations = await repo.list_negotiations(PID)
+    assert negotiations, "a decision, rather than a six-hour retry forever"
+    assert all(n.listing_url for n in negotiations.values())
+
+
+async def test_two_listings_on_one_marketplace_are_two_decisions(
+    api: httpx.AsyncClient, firestore: AsyncClient
+) -> None:
+    """Keyed by the product page, not by the shop.
+
+    Key a listing by its seller and two products from one marketplace collide,
+    `create_negotiation` refuses the second, and it vanishes with no error at
+    all — the producer is shown one option and told it was the best of two.
+    """
+
+    class TwoFromOneShop(ScriptedBrain):
+        @override
+        async def research_item(self, brief: ItemBrief) -> ItemResearch:
+            found = await super().research_item(brief)
+            return found.model_copy(
+                update={
+                    "listings": [
+                        Listing(
+                            title="The dearer one",
+                            url="https://shop.example.invalid/a",
+                            price=Money(amount=120, currency="MYR"),
+                            seller="One Marketplace",
+                        ),
+                        Listing(
+                            title="The cheaper one",
+                            url="https://shop.example.invalid/b",
+                            price=Money(amount=89, currency="MYR"),
+                            seller="One Marketplace",
+                        ),
+                    ]
+                }
+            )
+
+    _ = _wire(firestore, TwoFromOneShop())
+    await _new_project(api)
+    _ = await _upload(api)
+    await _confirm(api, item_id_for("cup"), "BUY")
+
+    for _ in range(2):
+        _ = await api.post("/tick")
+
+    repo = FirestoreRepository(firestore)
+    negotiations = await repo.list_negotiations(PID)
+    urls = {n.listing_url for n in negotiations.values()}
+    assert urls == {
+        "https://shop.example.invalid/a",
+        "https://shop.example.invalid/b",
+    }
+
+    item = await repo.get_item(PID, item_id_for("cup"))
+    assert item is not None
+    assert [listing.price.amount for listing in item.listings] == [89, 120], (
+        "cheapest first, because the screen leads with the best one"
+    )
+
+
+async def test_the_producer_can_overrule_the_route_before_anything_happens(
+    api: httpx.AsyncClient, firestore: AsyncClient
+) -> None:
+    """They know the birdcage is being built. The agent only guessed.
+
+    The toggle is on the confirmation list because that is the last moment
+    before anything is researched or written to anyone.
+    """
+    _ = _wire(firestore, ScriptedBrain())
+    await _new_project(api)
+    _ = await _upload(api)
+
+    repo = FirestoreRepository(firestore)
+    proposed = await repo.get_item(PID, item_id_for("cup"))
+    assert proposed is not None
+    proposed.route = SourcingRoute.BUY
+    await repo.save_item(PID, item_id_for("cup"), proposed)
+
+    await _confirm(api, item_id_for("cup"), "NEGOTIATE")
+
+    for _ in range(2):
+        _ = await api.post("/tick")
+
+    item = await repo.get_item(PID, item_id_for("cup"))
+    assert item is not None
+    assert item.route is SourcingRoute.NEGOTIATE, "the person's choice stood"
+    negotiations = await repo.list_negotiations(PID)
+    assert negotiations
+    assert all(not n.listing_url for n in negotiations.values())

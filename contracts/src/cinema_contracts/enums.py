@@ -36,6 +36,33 @@ TERMINAL_STATES: frozenset[NegotiationState] = frozenset(
 """States the tick loop will never schedule again."""
 
 
+class SourcingRoute(StrEnum):
+    """How a prop is going to be got hold of.
+
+    Two roads out of the breakdown, and the difference is whether a person has
+    to be involved on the other end.
+
+    ``NEGOTIATE`` is the original one and still the interesting one: rentals,
+    handmade pieces, period and oriental furniture, animals, anything built to
+    order. There is no listing to click, the price depends on the days and the
+    condition, and getting it means a conversation over several days.
+
+    ``BUY`` is the boring half, and doing it by email was faintly absurd — six
+    identical coffee mugs do not need a negotiation, they need a shop page, a
+    price and a link. The agent finds the listings and hands the producer the
+    best one.
+
+    The brain proposes a route at breakdown time, from the nature of the object
+    rather than from a search. A producer can flip it on the confirmation list
+    before anything happens, and research can correct it when the evidence
+    disagrees — an item routed BUY that turns out to have no listings falls
+    back rather than dying.
+    """
+
+    NEGOTIATE = "NEGOTIATE"
+    BUY = "BUY"
+
+
 class MoveAction(StrEnum):
     """What the brain decided to do next.
 
@@ -107,6 +134,16 @@ class EscalationReason(StrEnum):
 
     BUDGET_EXCEEDED = "BUDGET_EXCEEDED"
     """Even the best offer is above the reference band or the item budget."""
+
+    LISTING_FOUND = "LISTING_FOUND"
+    """Not a negotiation at all — a shop page the producer can buy from.
+
+    Sits in the same ``READY_FOR_HUMAN`` queue as a negotiated quote because it
+    is the same decision: a price, in front of a person, that the agent will
+    not act on. What differs is what the person does next. There is nobody to
+    push back at, no rounds were spent, and nothing was talked down, so a card
+    that printed those fields would be inventing a conversation that never
+    happened."""
 
 
 class MessageDirection(StrEnum):

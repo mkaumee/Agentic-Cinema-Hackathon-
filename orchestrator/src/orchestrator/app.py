@@ -36,7 +36,7 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 
-from cinema_contracts import AgentBrain, Money, ScriptSource
+from cinema_contracts import AgentBrain, Money, ScriptSource, SourcingRoute
 from cinema_contracts.testing import ScriptedBrain
 from fastapi import FastAPI, HTTPException, Request
 from google.api_core.exceptions import AlreadyExists
@@ -442,6 +442,7 @@ class FoundProp(BaseModel):
     qty: int
     consumable: bool
     confidence: float
+    route: SourcingRoute = SourcingRoute.NEGOTIATE
     scenes: list[str]
     lines: list[str]
     """The script lines it was found in. The receipt."""
@@ -456,6 +457,7 @@ class ConfirmedItem(BaseModel):
     qty: int = Field(ge=1, default=1)
     include: bool = True
     floor_price: Money | None = None
+    route: SourcingRoute | None = None
 
 
 class ConfirmItems(BaseModel):
@@ -533,6 +535,7 @@ async def confirm_items(
                     qty=c.qty,
                     include=c.include,
                     floor_price=c.floor_price,
+                    route=c.route,
                 )
                 for c in body.items
             ],

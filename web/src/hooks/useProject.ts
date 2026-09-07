@@ -52,6 +52,15 @@ export interface ReferenceBand {
   source_urls?: string[];
 }
 
+/** One shop page selling this item, ready to click. */
+export interface Listing {
+  title?: string;
+  url?: string;
+  price?: Money;
+  seller?: string;
+  in_stock?: boolean;
+}
+
 /** A line of the screenplay this prop was found in — the evidence a producer
  * checks the agent against, so it belongs on screen and not behind a link. */
 export interface SceneMention {
@@ -76,6 +85,14 @@ export interface Item {
   floor_price?: Money;
   chosen_quote?: Quote;
   next_action_due_at?: Timestamp;
+  /** BUY or NEGOTIATE — a shop page, or a person to write to. */
+  route?: string;
+  listings?: Listing[];
+  /** Set once the producer says the shop checkout actually completed.
+   * Approving a listing only records that they were sent to a shop. */
+  purchase_confirmed_at?: Timestamp;
+  /** What they said when it did not go through. */
+  purchase_note?: string;
 }
 
 export interface Negotiation {
@@ -93,11 +110,19 @@ export interface Negotiation {
   last_outbound_at?: Timestamp;
   escalation_reason?: string;
   latest_reasoning?: string;
+  /** A shop page, not a conversation.
+   *
+   * The marker every listing-aware branch reads. A field rather than a
+   * particular `escalation_reason`, because a dozen places need to tell a
+   * listing from a negotiated quote and a reason string only one of them
+   * happens to check is a convention waiting to be forgotten. */
+  listing_url?: string;
 
   draft_subject?: string;
   draft_body?: string;
   /** Unset while the opening email is still waiting to be read and released. */
   opening_released_at?: Timestamp;
+  created_at?: Timestamp;
   updated_at?: Timestamp;
 }
 
@@ -107,6 +132,9 @@ export interface Supplier {
   email?: string;
   source_url?: string;
   verified?: boolean;
+  /** Set when this is a shop rather than a person. Its presence is the marker;
+   * `email` is empty for these, which is what keeps them out of the mail path. */
+  listing_url?: string;
 }
 
 export interface Message {

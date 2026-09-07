@@ -33,7 +33,12 @@ from cinema_contracts import (
     ProducerQuestion,
 )
 
-from orchestrator.records import ItemRecord, ItemStatus, NegotiationRecord
+from orchestrator.records import (
+    ItemRecord,
+    ItemStatus,
+    NegotiationRecord,
+    is_listing,
+)
 
 WAITING_STATES = frozenset({NegotiationState.READY_FOR_HUMAN})
 """Where the agent has stopped and cannot continue without a person.
@@ -76,6 +81,18 @@ class NegotiationLine:
     why rather than only what."""
     waiting_on_human: bool
     escalation_reason: str
+    is_listing: bool = False
+    """A shop page, not a conversation.
+
+    Every sentence a briefing might build about a negotiation assumes a
+    counterpart: rounds spent, an opening price they came down from, whether
+    they have gone quiet. None of that is true of a listing, and it is not
+    almost-true either — "Mirror from Shopee at MYR 89 after 0 rounds" is a
+    description of a negotiation that never happened.
+    """
+
+    listing_url: str = ""
+
     bounced: bool = False
     """Dead because the address bounced, not because nobody answered.
 
@@ -178,6 +195,8 @@ def build_digest(
                 reasoning=record.latest_reasoning,
                 waiting_on_human=record.state in WAITING_STATES,
                 escalation_reason=record.escalation_reason,
+                is_listing=is_listing(record),
+                listing_url=record.listing_url,
                 bounced=record.bounced_at is not None,
             )
         )
@@ -225,6 +244,7 @@ def as_question(digest: ProjectDigest, question: str) -> ProducerQuestion:
                 reasoning=talk.reasoning,
                 waiting_on_human=talk.waiting_on_human,
                 escalation_reason=talk.escalation_reason,
+                is_listing=talk.is_listing,
                 bounced=talk.bounced,
             )
             for talk in digest.negotiations

@@ -38,6 +38,7 @@ export const PROPS_TOOL = "read_script";
 export const OPENINGS_TOOL = "draft_openings";
 export const RESEARCH_TOOL = "research_items";
 export const QUESTION_TOOL = "answer_supplier";
+export const LISTING_TOOL = "buy_listing";
 
 /**
  * A briefing, plus the note saying who wrote it.
@@ -189,6 +190,33 @@ export function toThreadMessage(row: Row): ThreadMessageLike {
               rivals: row.rivals,
             },
             approval: { id: row.negotiationId },
+          },
+        ],
+        createdAt: row.at,
+      };
+
+    case "listing":
+      // No `approval`, and not for the reason a question has none. The library
+      // renders an approval as accept-or-reject, and the reject here would have
+      // to mean "do not buy this", which is just leaving it alone. The card
+      // carries its own button because pressing it also opens the shop.
+      return {
+        id: row.id,
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: row.id,
+            toolName: LISTING_TOOL,
+            args: {
+              negotiationId: row.negotiationId,
+              itemId: row.itemId,
+              item: row.itemName,
+              shop: row.shop,
+              price: row.price,
+              url: row.url,
+              rivals: row.rivals,
+            },
           },
         ],
         createdAt: row.at,

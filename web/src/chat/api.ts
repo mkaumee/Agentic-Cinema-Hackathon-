@@ -174,6 +174,9 @@ export type Prop = {
   qty: number;
   consumable: boolean;
   confidence: number;
+  /** The agent's proposed route: BUY or NEGOTIATE. A proposal, not a decision
+   * — the confirmation list lets a producer flip it before anything happens. */
+  route?: string;
   scenes: string[];
   /** The script lines it was found in. The receipt. */
   lines: string[];
@@ -359,6 +362,32 @@ export async function answerSupplier(
   );
 }
 
+/**
+ * Say whether the shop checkout actually went through.
+ *
+ * Approving a listing records that the producer was *sent to a shop*. Nothing
+ * here can know they finished paying — that happens on somebody else's site —
+ * so an item reading ORDERED on the strength of a click is the screen
+ * guessing, and this is where it stops guessing.
+ *
+ * Saying it did not go through does **not** un-order anything. The purchase
+ * order is create-only and is never rewritten; what changes is that the item
+ * stops claiming to be sorted and carries the note about why.
+ */
+export async function confirmReceipt(
+  projectId: string,
+  itemId: string,
+  received: boolean,
+  note = "",
+): Promise<Done> {
+  return completed(
+    await send("POST", `/projects/${projectId}/items/${itemId}/receipt`, {
+      received,
+      note,
+    }),
+  );
+}
+
 export async function enrolAsProducer(): Promise<Done> {
   const reply = await send("POST", "/producers/me");
   const result = await completed(reply);
@@ -402,6 +431,8 @@ export interface Choice {
   item_id: string;
   qty: number;
   include: boolean;
+  /** BUY or NEGOTIATE. Omitted means "leave the agent's proposal alone". */
+  route?: string;
 }
 
 export async function confirmProps(

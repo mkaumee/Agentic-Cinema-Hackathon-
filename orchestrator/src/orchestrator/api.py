@@ -48,7 +48,13 @@ from datetime import timedelta
 from typing import Annotated, override
 from urllib.parse import urlencode
 
-from cinema_contracts import AgentBrain, Money, NegotiationState, ScriptSource
+from cinema_contracts import (
+    AgentBrain,
+    Money,
+    NegotiationState,
+    ScriptSource,
+    SourcingRoute,
+)
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
@@ -81,10 +87,12 @@ from orchestrator.gmail import (
 )
 from orchestrator.logs import configure_logging
 from orchestrator.records import (
+    ItemStatus,
     MailboxRecord,
     MailboxStatus,
     NegotiationRecord,
     ProjectRecord,
+    is_listing,
 )
 from orchestrator.repository import FirestoreRepository
 from orchestrator.scripts import (
@@ -598,6 +606,7 @@ class FoundProp(BaseModel):
     qty: int
     consumable: bool
     confidence: float
+    route: SourcingRoute = SourcingRoute.NEGOTIATE
     scenes: list[str]
     lines: list[str]
     """The script lines it was found in. The receipt."""
@@ -612,6 +621,12 @@ class ConfirmedItem(BaseModel):
     qty: int = Field(ge=1, default=1)
     include: bool = True
     floor_price: Money | None = None
+    route: SourcingRoute | None = None
+    """The producer overriding how this prop gets sourced.
+
+    None means "leave the agent's proposal alone", which is what an older
+    client sends and what the checkbox sends when nobody touched it.
+    """
 
 
 class ConfirmItems(BaseModel):
@@ -745,6 +760,7 @@ async def confirm_items(
                     qty=c.qty,
                     include=c.include,
                     floor_price=c.floor_price,
+                    route=c.route,
                 )
                 for c in body.items
             ],
@@ -914,6 +930,15 @@ async def answer_supplier(
     record = await services.repo.get_negotiation(project_id, negotiation_id)
     if record is None:
         raise HTTPException(status_code=404, detail=f"no negotiation {negotiation_id}")
+    if is_listing(record):
+        # A shop page cannot have asked anything, so nothing should ever reach
+        # here for one. If it did, the damage is the same as the floor
+        # endpoint's: this route sets `next_action_due_at = now`, which puts a
+        # row with no email address into the tick's send path.
+        raise HTTPException(
+            status_code=409,
+            detail=("This is a shop listing. There is no seller here to answer."),
+        )
 
     key = ""
     if body.content_b64:
@@ -966,6 +991,86 @@ async def answer_supplier(
         },
     )
     return Answered(negotiation_id=negotiation_id, attached=key)
+
+
+class ConfirmReceipt(BaseModel):
+    """Did the shop checkout actually go through?"""
+
+    received: bool
+    note: str = Field(default="", max_length=500)
+
+
+class ReceiptConfirmed(BaseModel):
+    item_id: str
+    received: bool
+
+
+@app.post("/projects/{project_id}/items/{item_id}/receipt")
+async def confirm_receipt(
+    request: Request,
+    project_id: str,
+    item_id: str,
+    body: ConfirmReceipt,
+    producer: Signed,
+) -> ReceiptConfirmed:
+    """Say whether the shop checkout completed.
+
+    Not called ``/purchase``: `test_this_service_cannot_spend_money` refuses any
+    route on this service whose path contains "approve" or "purchase", and it
+    was right to refuse this one. Those words are reserved for the service that
+    can actually spend, and a route here wearing one would read like a second
+    way to buy something. It is the same rule that made releasing the opening
+    emails ``/openings/release``.
+
+    Approving a listing records that the producer was *sent to a shop*. Nothing
+    in this system can know they finished paying — the payment happens on
+    somebody else's site — so an item reading ORDERED on the strength of a
+    click is the screen guessing, and this is where it stops guessing.
+
+    Note where this does not write. `purchase_orders` is create-only by Hard
+    Rule 4 and `firestore.orders.rules` denies update outright, so this cannot
+    and must not amend the order. It writes to the item, in the default
+    database, from the service that has no orders binding at all — which is
+    right on its own terms as well: saying "yes I bought it" moves no money and
+    has no business on the money path.
+
+    **A failed checkout does not un-order anything.** The purchase order stands,
+    because that document is never rewritten and making the one receipt in this
+    system mutable to fix a UI state would cost more than it buys. What changes
+    is that the item stops claiming to be sorted, and carries the producer's
+    note about why.
+    """
+    services = services_of(request)
+    _ = await _owned(services, project_id, producer)
+
+    item = await services.repo.get_item(project_id, item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail=f"no item {item_id}")
+    if item.status is not ItemStatus.ORDERED:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{item_id} is {item.status.value}, not ORDERED. There is no "
+                "purchase to confirm until one has been approved."
+            ),
+        )
+
+    now = await services.clock.now(project_id)
+    item.purchase_confirmed_at = now if body.received else None
+    item.purchase_note = "" if body.received else body.note.strip()
+    item.updated_at = now
+    await services.repo.save_item(project_id, item_id, item)
+
+    log.info(
+        "shop checkout reported",
+        extra={
+            "project_id": project_id,
+            "item_id": item_id,
+            "received": body.received,
+            "uid": producer.uid,
+        },
+    )
+    return ReceiptConfirmed(item_id=item_id, received=body.received)
 
 
 @app.patch("/projects/{project_id}")

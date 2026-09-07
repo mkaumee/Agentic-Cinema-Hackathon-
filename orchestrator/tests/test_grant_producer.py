@@ -89,6 +89,12 @@ async def test_a_granted_producer_can_actually_approve(
     is baked into the token at issue time, so the old one keeps being refused.
     """
     repo = FirestoreRepository(firestore)
+    # Signed up before the production exists, because they have to own it.
+    # Approving is scoped to the owner — the `producer` claim says someone may
+    # approve purchases, not whose — so a production with no owner is one
+    # nobody can approve against, and this test would be asserting a 404 it
+    # never meant to ask for.
+    uid = granting.create("newcomer@example.invalid")
     await repo.create_project(
         PROJECT,
         ProjectRecord(
@@ -97,6 +103,7 @@ async def test_a_granted_producer_can_actually_approve(
                 sim_now=T0, real_anchor=REAL0, speed=0.0, mode=ClockMode.FROZEN
             ),
             created_at=T0,
+            owner_uid=uid,
         ),
     )
     await repo.save_item(
@@ -134,7 +141,6 @@ async def test_a_granted_producer_can_actually_approve(
     )
     payload = {"project_id": PROJECT, "negotiation_id": "neg1"}
 
-    _ = granting.create("newcomer@example.invalid")
     before = granting.sign_in("newcomer@example.invalid")
     refused = await api.post(
         "/items/mirror/approve",

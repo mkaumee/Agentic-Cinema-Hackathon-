@@ -35,6 +35,7 @@ from datetime import datetime, timedelta
 
 from cinema_contracts import (
     AgentBrain,
+    EscalationReason,
     InboundMessage,
     ItemBrief,
     MessageDirection,
@@ -51,9 +52,14 @@ from orchestrator.bounces import bounce_note, looks_like_a_bounce
 from orchestrator.clock import SimClock
 from orchestrator.mail import Attachment, MailTransport, RawInbound
 from orchestrator.mailboxes import MailboxProvider, is_expired_credential
-from orchestrator.records import MessageRecord, NegotiationRecord
+from orchestrator.records import (
+    ITEM_TERMINAL_STATUSES,
+    MessageRecord,
+    NegotiationRecord,
+    is_listing,
+)
 from orchestrator.repository import DueNegotiation, FirestoreRepository
-from orchestrator.sourcing import SourcingLoop
+from orchestrator.sourcing import SourcingLoop, looks_like_an_address
 from orchestrator.state_machine import (
     NegotiationEvent,
     allowed_events,
@@ -125,6 +131,16 @@ class TickReport:
     bounced: int = 0
     """Addresses that turned out to be dead. Counted apart from replies filed,
     because a bounce is not a supplier answering."""
+    listings_parked: int = 0
+    """Shop rows that became due and were put back.
+
+    Should be zero. A number that is not zero means something made a listing
+    due — the floor or answer endpoint getting past its guard — and is worth
+    seeing rather than absorbing silently."""
+
+    stood_down: int = 0
+    """Negotiations stopped because the prop was already bought."""
+
     openings_drafted: int = 0
     """Opening emails written and left for a person to read.
 
@@ -485,6 +501,27 @@ class TickLoop:
         if is_terminal(record.state):
             return
 
+        # A shop page has nobody on the other end. It should never be due at
+        # all — listings are created with no due date precisely so they stay
+        # out of this queue — but "should never" is not a guard, and the ways
+        # back in are ordinary producer actions: the floor endpoint and the
+        # answer endpoint both set `next_action_due_at = now`. Without this,
+        # one press of "Push for 10% less" hands a shop URL to the brain and
+        # then mails an empty To: header every fifteen minutes, forever.
+        if is_listing(record):
+            await self._park_listing(due, now, report)
+            return
+
+        # The item is already bought. Its other sellers are still mid-
+        # conversation and would carry on for days about a prop that is
+        # settled — which costs a real person's time and reads, from their
+        # inbox, as being strung along. Rare when approval came after a week
+        # of mail; routine now that a listing can be approved on tick one
+        # while three email negotiations are still in flight.
+        if await self._item_is_settled(due):
+            await self._stand_down(due, now, report)
+            return
+
         if not await self._repo.claim_negotiation(
             due, now + timedelta(hours=CLAIM_LEASE_HOURS)
         ):
@@ -617,6 +654,19 @@ class TickLoop:
             # ticking. Expiry surfaces on the poll above, which every tick does
             # first and unconditionally — so a dead mailbox is noticed on the
             # same pass either way, and recording it twice would be noise.
+            if not looks_like_an_address(supplier.email):
+                # Last line before the transport. A supplier with no address is
+                # a shop, and every earlier guard for that is a condition some
+                # future edit can slip past; this one is on the instruction
+                # that actually sends. Gmail would take `To: ""` and fail with
+                # a 400 that unwinds into the per-negotiation catch, so the
+                # visible symptom of losing this would be a silent retry every
+                # fifteen minutes rather than anything anyone notices.
+                raise RuntimeError(
+                    f"refusing to send to {record.supplier_id}: no address. "
+                    "This is a shop listing, not a correspondent."
+                )
+
             sent = await mail.send(
                 to=supplier.email,
                 subject=subject,
@@ -685,6 +735,49 @@ class TickLoop:
         )
         record.updated_at = now
         await self._repo.save_negotiation(due.project_id, due.negotiation_id, record)
+
+    async def _park_listing(
+        self, due: DueNegotiation, now: datetime, report: TickReport
+    ) -> None:
+        """Put a shop row back where it belongs: waiting on a person, not due.
+
+        Not an error and not a walk-away. The listing is still a perfectly good
+        decision for the producer to make; something just made it due that had
+        no business doing so, and the fix is to clear the date and leave the
+        card where it was.
+        """
+        record = due.record
+        record.state = NegotiationState.READY_FOR_HUMAN
+        record.escalation_reason = EscalationReason.LISTING_FOUND.value
+        record.next_action_due_at = None
+        record.updated_at = now
+        await self._repo.save_negotiation(due.project_id, due.negotiation_id, record)
+        report.listings_parked += 1
+
+    async def _item_is_settled(self, due: DueNegotiation) -> bool:
+        """Has this prop already been bought, by any route?"""
+        item = await self._repo.get_item(due.project_id, due.record.item_id)
+        return item is not None and item.status in ITEM_TERMINAL_STATUSES
+
+    async def _stand_down(
+        self, due: DueNegotiation, now: datetime, report: TickReport
+    ) -> None:
+        """Stop writing to a seller about something already sourced.
+
+        DEAD rather than a quiet unschedule, because the transcript should say
+        what happened. The producer bought it elsewhere; this seller was not
+        rejected on their price and the record should not imply they were.
+        """
+        record = due.record
+        if not is_terminal(record.state):
+            record.state = apply_event(record.state, NegotiationEvent.AGENT_WALKED_AWAY)
+        record.latest_reasoning = (
+            "Stopped: this prop was sourced elsewhere and is already ordered."
+        )
+        record.next_action_due_at = None
+        record.updated_at = now
+        await self._repo.save_negotiation(due.project_id, due.negotiation_id, record)
+        report.stood_down += 1
 
     async def _raise_silence(
         self, due: DueNegotiation, now: datetime, report: TickReport

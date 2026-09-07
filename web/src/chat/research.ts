@@ -101,6 +101,12 @@ export function researchOf(
       const mine = negotiations.filter((n) => n.item_id === item.id);
       const priced = item.reference_band !== undefined;
       const sellers = item.supplier_ids ?? [];
+      // A prop being bought off a shelf has no correspondents, so every step
+      // below about writing to people is not merely irrelevant to it — it
+      // would be false. A listing is READY_FOR_HUMAN, therefore not DRAFTED,
+      // so the untouched ladder announced "Sent to Shopee" for an item where
+      // the entire point is that nothing was sent.
+      const buying = (item.route ?? "") === "BUY";
 
       const steps: Step[] = [
         {
@@ -120,7 +126,27 @@ export function researchOf(
         },
       ];
 
-      if (priced) {
+      if (priced && buying) {
+        const count = item.listings?.length ?? 0;
+        const best = item.listings?.[0]?.price;
+        steps.push({
+          key: "listings",
+          label:
+            count === 1
+              ? "Found 1 listing to buy from"
+              : `Found ${String(count)} listings to buy from`,
+          state: count > 0 ? "done" : "waiting",
+          detail:
+            best !== undefined
+              ? `best ${best.currency} ${best.amount.toLocaleString()}`
+              : undefined,
+        });
+        steps.push({
+          key: "ready",
+          label: "Ready for you to buy",
+          state: mine.length > 0 ? "done" : "waiting",
+        });
+      } else if (priced) {
         steps.push({
           key: "sellers",
           label:
@@ -134,7 +160,7 @@ export function researchOf(
 
       // One line per negotiation, appearing as each is opened. This is the
       // "got the first, then the second" the loop actually performs.
-      for (const negotiation of mine) {
+      for (const negotiation of buying ? [] : mine) {
         const written = (negotiation.draft_body ?? "") !== "";
         const sent = negotiation.state !== "DRAFTED";
         steps.push({
@@ -148,7 +174,7 @@ export function researchOf(
         });
       }
 
-      if (priced && sellers.length > 0 && mine.length === 0) {
+      if (!buying && priced && sellers.length > 0 && mine.length === 0) {
         steps.push({
           key: "opening",
           label: "Writing the first emails",

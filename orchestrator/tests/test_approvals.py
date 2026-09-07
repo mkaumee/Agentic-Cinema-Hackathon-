@@ -33,6 +33,7 @@ from orchestrator.settings import Settings
 T0 = datetime(2026, 3, 1, 9, 0, tzinfo=UTC)
 REAL0 = datetime(2026, 8, 12, 14, 0, tzinfo=UTC)
 PROJECT = "projA"
+PRODUCER_EMAIL = "producer@example.invalid"
 
 SETTINGS = Settings(
     _env_file=None,  # pyright: ignore[reportCallIssue]
@@ -50,12 +51,21 @@ QUOTE = ExtractedQuote(
 async def _seed(
     repo: FirestoreRepository,
     *,
+    owner: str = "",
     state: NegotiationState = NegotiationState.READY_FOR_HUMAN,
     quote: ExtractedQuote | None = QUOTE,
     negotiation_id: str = "neg1",
     supplier_id: str = "sup1",
+    listing_url: str = "",
 ) -> None:
-    """One project, one item, one negotiation parked in front of a person."""
+    """One project, one item, one negotiation parked in front of a person.
+
+    ``owner`` is not optional in spirit. Approving is scoped to the producer who
+    owns the production — the `producer` claim says someone may approve
+    purchases, not whose — so a seeded project with no owner is one nobody can
+    approve against, which is the correct behaviour and makes for a confusing
+    test failure. ``_owning`` below pairs the two up.
+    """
     existing = await repo.get_project(PROJECT)
     if existing is None:
         await repo.create_project(
@@ -66,6 +76,7 @@ async def _seed(
                     sim_now=T0, real_anchor=REAL0, speed=0.0, mode=ClockMode.FROZEN
                 ),
                 created_at=T0,
+                owner_uid=owner,
             ),
         )
         await repo.save_item(
@@ -87,6 +98,7 @@ async def _seed(
             item_id="mirror",
             supplier_id=supplier_id,
             state=state,
+            listing_url=listing_url,
             latest_quote=quote,
             escalation_reason="price is good, your call",
             next_action_due_at=None,
@@ -94,6 +106,45 @@ async def _seed(
             updated_at=T0,
         ),
     )
+
+
+async def _adopt(firestore: AsyncClient, tokens: TokenMinter) -> str:
+    """Hand the already-seeded production to a producer, and return their token.
+
+    Approval is scoped to the owner, so a test that mints a producer without
+    also making them the owner is testing a 404 it did not mean to ask for.
+    """
+    uid = tokens.create(PRODUCER_EMAIL)
+    _ = (
+        await firestore.collection("projects")
+        .document(PROJECT)
+        .update({"owner_uid": uid})
+    )
+    return tokens.grant(uid, PRODUCER_EMAIL, role="producer")
+
+
+async def _owning(
+    firestore: AsyncClient,
+    tokens: TokenMinter,
+    *,
+    state: NegotiationState = NegotiationState.READY_FOR_HUMAN,
+    quote: ExtractedQuote | None = QUOTE,
+    negotiation_id: str = "neg1",
+    supplier_id: str = "sup1",
+    listing_url: str = "",
+) -> str:
+    """Seed the production and return a token for the producer who owns it."""
+    uid = tokens.create(PRODUCER_EMAIL)
+    await _seed(
+        FirestoreRepository(firestore),
+        owner=uid,
+        state=state,
+        quote=quote,
+        negotiation_id=negotiation_id,
+        supplier_id=supplier_id,
+        listing_url=listing_url,
+    )
+    return tokens.grant(uid, PRODUCER_EMAIL, role="producer")
 
 
 @pytest.fixture
@@ -202,8 +253,7 @@ async def test_the_agents_own_identity_cannot_approve(
 async def test_a_producer_can_approve(
     api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
 ) -> None:
-    await _seed(FirestoreRepository(firestore))
-    producer = tokens.mint("producer@example.invalid", role="producer")
+    producer = await _owning(firestore, tokens)
 
     response = await api.post(
         "/items/mirror/approve",
@@ -226,8 +276,7 @@ async def test_approving_writes_the_purchase_order(
     orders_firestore: AsyncClient,
     tokens: TokenMinter,
 ) -> None:
-    await _seed(FirestoreRepository(firestore))
-    producer = tokens.mint("producer@example.invalid", role="producer")
+    producer = await _owning(firestore, tokens)
 
     _ = await api.post(
         "/items/mirror/approve",
@@ -254,8 +303,7 @@ async def test_the_order_records_who_approved_it(
     An order nobody is named on is not an approval, it is a fact that money was
     spent.
     """
-    await _seed(FirestoreRepository(firestore))
-    producer = tokens.mint("producer@example.invalid", role="producer")
+    producer = await _owning(firestore, tokens)
 
     body = (
         await api.post(
@@ -276,7 +324,7 @@ async def test_approving_moves_the_negotiation_and_the_item(
 ) -> None:
     repo = FirestoreRepository(firestore)
     await _seed(repo)
-    producer = tokens.mint("producer@example.invalid", role="producer")
+    producer = await _adopt(firestore, tokens)
 
     _ = await api.post(
         "/items/mirror/approve",
@@ -299,7 +347,7 @@ async def test_an_ordered_negotiation_is_never_ticked_again(
     """Terminal means out of the queue, not merely filtered out of it."""
     repo = FirestoreRepository(firestore)
     await _seed(repo)
-    producer = tokens.mint("producer@example.invalid", role="producer")
+    producer = await _adopt(firestore, tokens)
 
     _ = await api.post(
         "/items/mirror/approve",
@@ -325,8 +373,7 @@ async def test_approving_a_negotiation_still_in_progress_is_refused(
 ) -> None:
     """Only what the agent has handed back. Anything else buys at a number
     nobody has agreed to yet."""
-    await _seed(FirestoreRepository(firestore), state=NegotiationState.NEGOTIATING)
-    producer = tokens.mint("producer@example.invalid", role="producer")
+    producer = await _owning(firestore, tokens, state=NegotiationState.NEGOTIATING)
 
     response = await api.post(
         "/items/mirror/approve",
@@ -345,8 +392,7 @@ async def test_approving_with_no_quote_on_the_table_is_refused(
 ) -> None:
     """READY_FOR_HUMAN is also where unparseable replies land, and those have
     no price to order at."""
-    await _seed(FirestoreRepository(firestore), quote=None)
-    producer = tokens.mint("producer@example.invalid", role="producer")
+    producer = await _owning(firestore, tokens, quote=None)
 
     response = await api.post(
         "/items/mirror/approve",
@@ -363,8 +409,7 @@ async def test_a_negotiation_for_a_different_item_is_refused(
 ) -> None:
     """The URL says what is being bought and the body says which conversation
     justified it. If they disagree, one of them is a mistake."""
-    await _seed(FirestoreRepository(firestore))
-    producer = tokens.mint("producer@example.invalid", role="producer")
+    producer = await _owning(firestore, tokens)
 
     response = await api.post(
         "/items/smoke-machine/approve",
@@ -378,8 +423,7 @@ async def test_a_negotiation_for_a_different_item_is_refused(
 async def test_approving_something_that_does_not_exist_is_a_404(
     api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
 ) -> None:
-    await _seed(FirestoreRepository(firestore))
-    producer = tokens.mint("producer@example.invalid", role="producer")
+    producer = await _owning(firestore, tokens)
 
     response = await api.post(
         "/items/mirror/approve",
@@ -408,7 +452,7 @@ async def test_the_same_item_cannot_be_bought_from_a_second_supplier(
     repo = FirestoreRepository(firestore)
     await _seed(repo)
     await _seed(repo, negotiation_id="neg2", supplier_id="sup2")
-    producer = tokens.mint("producer@example.invalid", role="producer")
+    producer = await _adopt(firestore, tokens)
 
     first = await api.post(
         "/items/mirror/approve",
@@ -437,7 +481,7 @@ async def test_the_losing_negotiation_is_left_alone(
     repo = FirestoreRepository(firestore)
     await _seed(repo)
     await _seed(repo, negotiation_id="neg2", supplier_id="sup2")
-    producer = tokens.mint("producer@example.invalid", role="producer")
+    producer = await _adopt(firestore, tokens)
 
     _ = await api.post(
         "/items/mirror/approve",
@@ -481,7 +525,7 @@ async def test_a_half_finished_approval_is_completed_not_refused(
             approved_at=T0,
         )
     )
-    producer = tokens.mint("producer@example.invalid", role="producer")
+    producer = await _adopt(firestore, tokens)
 
     response = await api.post(
         "/items/mirror/approve",
@@ -519,7 +563,7 @@ async def test_a_retry_does_not_rewrite_the_order(
             approved_at=T0,
         )
     )
-    producer = tokens.mint("producer@example.invalid", role="producer")
+    producer = await _adopt(firestore, tokens)
 
     body = (
         await api.post(
@@ -542,8 +586,7 @@ async def test_approving_twice_is_safe(
     api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
 ) -> None:
     """A double-clicked button must not be a second-guessing moment."""
-    await _seed(FirestoreRepository(firestore))
-    producer = tokens.mint("producer@example.invalid", role="producer")
+    producer = await _owning(firestore, tokens)
     payload = {"project_id": PROJECT, "negotiation_id": "neg1"}
 
     first = await api.post("/items/mirror/approve", json=payload, headers=_as(producer))
@@ -568,8 +611,7 @@ async def test_an_ordered_negotiation_with_no_order_behind_it_is_refused(
     up it means something wrote it by hand. Reporting 200 for it would confirm a
     purchase that does not exist, so it gets the ordinary refusal instead.
     """
-    await _seed(FirestoreRepository(firestore), state=NegotiationState.ORDERED)
-    producer = tokens.mint("producer@example.invalid", role="producer")
+    producer = await _owning(firestore, tokens, state=NegotiationState.ORDERED)
 
     response = await api.post(
         "/items/mirror/approve",
@@ -593,7 +635,7 @@ async def test_a_floor_sends_the_negotiation_back_to_the_agent(
     producer changing the agent's instructions mid-conversation."""
     repo = FirestoreRepository(firestore)
     await _seed(repo)
-    producer = tokens.mint("producer@example.invalid", role="producer")
+    producer = await _adopt(firestore, tokens)
 
     response = await api.post(
         "/negotiations/neg1/floor",
@@ -619,7 +661,7 @@ async def test_a_returned_negotiation_is_picked_up_by_the_next_tick(
     is a producer waiting on nothing."""
     repo = FirestoreRepository(firestore)
     await _seed(repo)
-    producer = tokens.mint("producer@example.invalid", role="producer")
+    producer = await _adopt(firestore, tokens)
 
     _ = await api.post(
         "/negotiations/neg1/floor",
@@ -638,8 +680,7 @@ async def test_a_floor_on_an_already_dead_negotiation_is_a_409(
     api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
 ) -> None:
     """Two screens open on one negotiation is ordinary; a 500 is not."""
-    await _seed(FirestoreRepository(firestore), state=NegotiationState.DEAD)
-    producer = tokens.mint("producer@example.invalid", role="producer")
+    producer = await _owning(firestore, tokens, state=NegotiationState.DEAD)
 
     response = await api.post(
         "/negotiations/neg1/floor",
@@ -682,7 +723,7 @@ async def test_a_producer_can_cancel(
 ) -> None:
     repo = FirestoreRepository(firestore)
     await _seed(repo)
-    producer = tokens.mint("producer@example.invalid", role="producer")
+    producer = await _adopt(firestore, tokens)
 
     response = await api.post(
         "/negotiations/neg1/cancel",
@@ -703,7 +744,7 @@ async def test_cancelling_works_mid_conversation(
     """A producer does not have to wait to be asked before pulling out."""
     repo = FirestoreRepository(firestore)
     await _seed(repo, state=NegotiationState.AWAITING_REPLY)
-    producer = tokens.mint("producer@example.invalid", role="producer")
+    producer = await _adopt(firestore, tokens)
 
     response = await api.post(
         "/negotiations/neg1/cancel",
@@ -721,8 +762,7 @@ async def test_cancelling_an_ordered_negotiation_is_refused(
     api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
 ) -> None:
     """ORDERED is terminal. Money has moved; unwinding it is not an API call."""
-    await _seed(FirestoreRepository(firestore), state=NegotiationState.ORDERED)
-    producer = tokens.mint("producer@example.invalid", role="producer")
+    producer = await _owning(firestore, tokens, state=NegotiationState.ORDERED)
 
     response = await api.post(
         "/negotiations/neg1/cancel",
@@ -818,3 +858,130 @@ async def test_no_origin_is_allowed_by_default(
     )
 
     assert "access-control-allow-origin" not in reply.headers
+
+
+# --------------------------------------------------------------------------- #
+# Shop listings, and the buttons that must not work on one
+# --------------------------------------------------------------------------- #
+
+LISTING = "https://shop.example.invalid/mirror"
+
+
+async def test_a_listing_cannot_be_pushed_for_ten_percent_less(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    """The most dangerous button in the product, on the one row it must not touch.
+
+    `set_floor` sets `next_action_due_at = now` and moves the state to
+    NEGOTIATING. On a shop row that means: it enters the tick's queue, the
+    brain is asked what to say to a product page, and the send path gets an
+    empty address — every fifteen simulated minutes, forever, because the retry
+    is a claim lease rather than a backoff. Meanwhile the card disappears from
+    the producer's queue, since it is no longer READY_FOR_HUMAN, and there is
+    no transition that brings it back without a reply that can never come.
+
+    The button is hidden on a listing card too. A hidden button is not a guard;
+    it is a thing that stops being hidden the next time somebody edits the card.
+    """
+    producer = await _owning(firestore, tokens, listing_url=LISTING)
+
+    response = await api.post(
+        "/negotiations/neg1/floor",
+        json={"project_id": PROJECT, "floor_price": {"amount": 80}},
+        headers=_as(producer),
+    )
+
+    assert response.status_code == 409
+    record = await FirestoreRepository(firestore).get_negotiation(PROJECT, "neg1")
+    assert record is not None
+    assert record.state is NegotiationState.READY_FOR_HUMAN, "still a live decision"
+    assert record.next_action_due_at is None, "and still out of the tick's queue"
+    assert record.floor_price is None
+
+
+async def test_the_order_records_where_the_producer_was_sent(
+    api: httpx.AsyncClient,
+    firestore: AsyncClient,
+    orders_firestore: AsyncClient,
+    tokens: TokenMinter,
+) -> None:
+    """An order recording a price with no provenance is half a receipt.
+
+    For a negotiated quote the supplier id is the provenance. For a listing it
+    is the URL, and this document can never be amended afterwards — so if it is
+    not written here it is not written at all.
+    """
+    producer = await _owning(firestore, tokens, listing_url=LISTING)
+
+    response = await api.post(
+        "/items/mirror/approve",
+        json={"project_id": PROJECT, "negotiation_id": "neg1"},
+        headers=_as(producer),
+    )
+
+    assert response.status_code == 200, response.text
+    order = await OrdersRepository(orders_firestore).get_purchase_order("mirror")
+    assert order is not None
+    assert order.listing_url == LISTING
+
+
+async def test_a_listing_and_a_seller_are_the_same_single_order(
+    api: httpx.AsyncClient,
+    firestore: AsyncClient,
+    orders_firestore: AsyncClient,
+    tokens: TokenMinter,
+) -> None:
+    """Buying the mirror from a shop settles it against every seller too.
+
+    The guardrail is keyed by the item, so the two routes cannot both produce
+    an order for one prop — which is the whole reason a listing was made to
+    funnel through this endpoint instead of getting a path of its own.
+    """
+    producer = await _owning(firestore, tokens, listing_url=LISTING)
+    repo = FirestoreRepository(firestore)
+    await _seed(repo, negotiation_id="neg2", supplier_id="sup2")
+
+    bought = await api.post(
+        "/items/mirror/approve",
+        json={"project_id": PROJECT, "negotiation_id": "neg1"},
+        headers=_as(producer),
+    )
+    also = await api.post(
+        "/items/mirror/approve",
+        json={"project_id": PROJECT, "negotiation_id": "neg2"},
+        headers=_as(producer),
+    )
+
+    assert bought.status_code == 200, bought.text
+    assert also.status_code == 409, "refused by the database, not by our code"
+    order = await OrdersRepository(orders_firestore).get_purchase_order("mirror")
+    assert order is not None
+    assert order.negotiation_id == "neg1", "the first one stands, unrewritten"
+
+
+async def test_a_producer_cannot_approve_on_somebody_elses_production(
+    api: httpx.AsyncClient,
+    firestore: AsyncClient,
+    orders_firestore: AsyncClient,
+    tokens: TokenMinter,
+) -> None:
+    """The claim says they may approve purchases. It does not say whose.
+
+    Enrolment is self-service, so anyone who can reach the panel holds the
+    `producer` claim — and without this check they could post an item id and a
+    project id they do not own and file a purchase order against a stranger's
+    production. `firestore.orders.rules` does check `approved_by`, but that
+    governs a browser writing directly; this service goes through the admin
+    SDK and bypasses every rule in the file.
+    """
+    _ = await _owning(firestore, tokens, listing_url=LISTING)
+    outsider = tokens.mint("outsider@example.invalid", role="producer")
+
+    response = await api.post(
+        "/items/mirror/approve",
+        json={"project_id": PROJECT, "negotiation_id": "neg1"},
+        headers=_as(outsider),
+    )
+
+    assert response.status_code == 404, "and not a 403, which would confirm it exists"
+    assert await OrdersRepository(orders_firestore).get_purchase_order("mirror") is None

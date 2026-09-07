@@ -28,7 +28,19 @@ export function Savings({
   const rows = items
     .map((item) => {
       const best = negotiations
-        .filter((n) => n.item_id === item.id && n.latest_quote !== undefined)
+        // Listings are excluded, and not as a tidiness measure. A shop price
+        // beats a negotiated one by construction, so leaving them in means the
+        // cheapest row for an item is the listing — its first and latest quote
+        // are the same number, `saving` returns null, and the real reduction
+        // somebody spent five days winning vanishes from the savings screen.
+        // Their prices would also be summed into "sellers opened at", of
+        // prices no seller ever offered.
+        .filter(
+          (n) =>
+            n.item_id === item.id &&
+            n.latest_quote !== undefined &&
+            (n.listing_url ?? "") === "",
+        )
         .sort(
           (a, b) =>
             (a.latest_quote?.unit_price?.amount ?? Infinity) -

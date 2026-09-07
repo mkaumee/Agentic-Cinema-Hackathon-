@@ -25,6 +25,7 @@ from cinema_contracts.enums import (
     MessageDirection,
     MoveAction,
     NegotiationState,
+    SourcingRoute,
 )
 from cinema_contracts.money import Currency, Money
 
@@ -74,6 +75,32 @@ class SupplierCandidate(_Frozen):
     source_url: str = ""
     confidence: float = Field(ge=0.0, le=1.0, default=0.5)
     verified: bool = False
+    notes: str = ""
+
+
+class Listing(_Frozen):
+    """One shop page selling this item, ready to click.
+
+    The other half of ``SupplierCandidate``. That one is a company to write to;
+    this is a product to buy, and the difference is not cosmetic — a listing
+    has a price on it already, so there is nothing to negotiate and nobody to
+    negotiate with.
+
+    ``url`` is the whole point and is required. A listing without one is a
+    claim that something is purchasable somewhere, which helps nobody: the
+    producer cannot check it and cannot buy it.
+
+    ``price`` is what the page says today. It is not a band and not an
+    estimate; if the page does not show a price, this is not a listing yet.
+    """
+
+    title: str
+    url: str = Field(min_length=1, description="The product page. Required.")
+    price: Money
+    seller: str = ""
+    """The shop, as a person would name it — "Shopee · AhSeng Home"."""
+
+    in_stock: bool = True
     notes: str = ""
 
 
@@ -154,6 +181,18 @@ class PropDraft(_Frozen):
     because only they know the shooting schedule.
     """
 
+    route: SourcingRoute = SourcingRoute.NEGOTIATE
+    """Whether this is bought off a shelf or talked about with a person.
+
+    Judged from what the object is, not from a search — a rattan birdcage is
+    built to order and a coffee mug is not, and knowing that needs no web
+    access. Defaulted to NEGOTIATE so a brain that does not set it yet behaves
+    exactly as before.
+
+    A proposal, not a decision. The producer sees it on the confirmation list
+    and can flip it, and research overrides it when the evidence disagrees.
+    """
+
     confidence: float = Field(ge=0.0, le=1.0, default=0.5)
     notes: str = ""
 
@@ -177,12 +216,38 @@ class ItemBrief(_Frozen):
     reference_band: ReferenceBand | None = None
     currency: Currency = "MYR"
 
+    route: SourcingRoute = SourcingRoute.NEGOTIATE
+    """What to go looking for: shop pages, or people to write to.
+
+    The two searches are genuinely different — one wants product listings with
+    a price on them, the other wants a company with an address. Researching
+    both for every item would double the cost of the step that already costs
+    the most.
+
+    Fill the other one in anyway when it falls out of the same search, though.
+    Role B uses it to correct a route that was guessed wrong, and finding no
+    listings for something is far more useful when there are three sellers to
+    fall back on.
+    """
+
 
 class ItemResearch(_Frozen):
     """What the brain found out about an item: what it costs and who sells it."""
 
     reference_band: ReferenceBand
     supplier_candidates: list[SupplierCandidate] = Field(default_factory=list)
+    listings: list[Listing] = Field(default_factory=list)
+    """Shop pages the producer could buy this from directly.
+
+    Additive with a default, so a brain that only fills in
+    ``supplier_candidates`` still validates and still works.
+
+    Worth filling in even for an item routed NEGOTIATE. Role B falls back to
+    listings when research turns up sellers it cannot email — which today is
+    indistinguishable from finding nothing at all, and leaves the item retrying
+    every six hours forever.
+    """
+
     notes: str = ""
 
 
@@ -397,6 +462,14 @@ class BriefingNegotiation(_Frozen):
     )
     waiting_on_human: bool = False
     escalation_reason: str = ""
+    is_listing: bool = False
+    """A shop page the producer can buy from, not a conversation.
+
+    Nothing about it was negotiated. Say so rather than describing rounds that
+    were never spent or a price nobody came down from — the producer can tell
+    the difference and will stop trusting the rest of the answer.
+    """
+
     bounced: bool = False
     """The address did not work, so the agent stopped writing to it.
 

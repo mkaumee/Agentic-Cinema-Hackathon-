@@ -25,6 +25,15 @@ import { researchOf, stillWorking } from "./research";
 import { toThreadMessage } from "./convert";
 import { directionOf, inOrder, type Row } from "./rows";
 
+/** Where a row with no timestamp at all sorts: the very top.
+
+ * Never expected — every record is written with a clock reading — but the
+ * alternative fallback is `new Date()`, which puts an undated row at the
+ * bottom and moves it on every snapshot. A row that jumps position each time
+ * anything changes is worse than one pinned to the beginning.
+ */
+const EPOCH = new Date(0);
+
 const money = (q: Negotiation["latest_quote"]): string => {
   const price = q?.unit_price ?? q?.total;
   return price ? `${price.currency} ${price.amount.toLocaleString()}` : "no price yet";
@@ -54,6 +63,8 @@ export interface GreenlitThread {
   /** Sellers who asked the producer something. Waiting on a person too, and
    * on a different person's answer than a decision is. */
   questions: Row[];
+  /** Props with a shop page to buy from rather than a seller to write to. */
+  listings: Row[];
   /** Hand a screenplay to the agent. Resolves once the props are on screen. */
   readScript: (file: File) => Promise<void>;
   /**
@@ -117,8 +128,9 @@ export function useGreenlitThread(sources: ThreadSources): GreenlitThread {
   // rest, which is the rule the Inbox already used.
   const waiting = useMemo<Row[]>(
     () =>
-      decisionsFor(sources.items, sources.negotiations).map(
-        ({ item, chosen, rivals }) => ({
+      decisionsFor(sources.items, sources.negotiations)
+        .filter((decision) => !decision.isListing)
+        .map(({ item, chosen, rivals }) => ({
           kind: "decision" as const,
           id: `decision:${chosen.id}`,
           negotiationId: chosen.id,
@@ -131,8 +143,35 @@ export function useGreenlitThread(sources: ThreadSources): GreenlitThread {
           reasoning: chosen.latest_reasoning ?? "",
           rivals: rivals.length,
           at: chosen.last_inbound_at?.toDate() ?? new Date(),
-        }),
-      ),
+        })),
+    [sources.items, sources.negotiations, named],
+  );
+
+  /**
+   * Props with a shop page instead of a conversation.
+   *
+   * Dated by `created_at`, not by `last_inbound_at ?? new Date()`. A listing
+   * has no inbound message, so the fallback would fire on every snapshot — the
+   * row would re-date and jump position each time anything in the production
+   * changed, which is the exact problem the openings row below is written to
+   * avoid, and it would be wall-clock time on a screen that runs on simulated.
+   */
+  const listings = useMemo<Row[]>(
+    () =>
+      decisionsFor(sources.items, sources.negotiations)
+        .filter((decision) => decision.isListing)
+        .map(({ item, chosen, rivals }) => ({
+          kind: "listing" as const,
+          id: `listing:${chosen.id}`,
+          negotiationId: chosen.id,
+          itemId: item.id,
+          itemName: item.name ?? item.id,
+          shop: named(chosen.supplier_id),
+          price: money(chosen.latest_quote),
+          url: chosen.listing_url ?? "",
+          rivals: rivals.length,
+          at: chosen.created_at?.toDate() ?? chosen.updated_at?.toDate() ?? EPOCH,
+        })),
     [sources.items, sources.negotiations, named],
   );
 
@@ -239,11 +278,12 @@ export function useGreenlitThread(sources: ThreadSources): GreenlitThread {
         ...conversation,
         ...activity,
         ...waiting,
+        ...listings,
         ...questions,
         ...openings,
         ...research,
       ]),
-    [conversation, activity, waiting, questions, openings, research],
+    [conversation, activity, waiting, listings, questions, openings, research],
   );
 
 
@@ -370,5 +410,5 @@ export function useGreenlitThread(sources: ThreadSources): GreenlitThread {
     convertMessage: toThreadMessage,
   });
 
-  return { runtime, waiting, openings, questions, readScript, busy };
+  return { runtime, waiting, openings, questions, listings, readScript, busy };
 }

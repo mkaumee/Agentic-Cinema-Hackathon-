@@ -111,6 +111,29 @@ export interface QuestionRow {
 }
 
 /**
+ * A prop the agent found a shop page for.
+ *
+ * Separate from `DecisionRow` because almost nothing a decision card prints is
+ * true of one. No rounds were spent, nobody opened higher, nobody was talked
+ * down, and there is no seller to push back at — so a single card trying to be
+ * both would either invent a conversation or offer a button that breaks the row.
+ */
+export interface ListingRow {
+  kind: "listing";
+  id: string;
+  negotiationId: string;
+  itemId: string;
+  itemName: string;
+  shop: string;
+  price: string;
+  url: string;
+  /** Other listings for the same prop, all dearer. Approving settles them too,
+   * because a purchase order is keyed by the item. */
+  rivals: number;
+  at: Date;
+}
+
+/**
  * Which way an email went.
  *
  * Case-insensitive because Firestore holds the contract enum's own spelling,
@@ -196,6 +219,7 @@ export type Row =
   | BriefingRow
   | ActivityRow
   | DecisionRow
+  | ListingRow
   | QuestionRow
   | PropsRow
   | OpeningsRow

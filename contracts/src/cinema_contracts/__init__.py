@@ -13,6 +13,7 @@ from cinema_contracts.enums import (
     MessageDirection,
     MoveAction,
     NegotiationState,
+    SourcingRoute,
 )
 from cinema_contracts.models import (
     BriefingItem,
@@ -21,6 +22,7 @@ from cinema_contracts.models import (
     InboundMessage,
     ItemBrief,
     ItemResearch,
+    Listing,
     MessageSummary,
     NegotiationContext,
     NextMove,
@@ -49,6 +51,7 @@ __all__ = [
     "InboundMessage",
     "ItemBrief",
     "ItemResearch",
+    "Listing",
     "MessageDirection",
     "MessageSummary",
     "Money",
@@ -63,5 +66,6 @@ __all__ = [
     "ReferenceBand",
     "SceneMention",
     "ScriptSource",
+    "SourcingRoute",
     "SupplierCandidate",
 ]

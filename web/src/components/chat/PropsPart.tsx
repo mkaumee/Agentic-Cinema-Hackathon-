@@ -45,8 +45,15 @@ export function PropList({
 }) {
   // Everything included by default with the quantity the agent proposed. The
   // producer's job is to catch what is wrong, not to re-enter what is right.
-  const [choices, setChoices] = useState<Record<string, { qty: number; include: boolean }>>(
-    Object.fromEntries(found.map((p) => [p.item_id, { qty: p.qty, include: true }])),
+  const [choices, setChoices] = useState<
+    Record<string, { qty: number; include: boolean; route: string }>
+  >(
+    Object.fromEntries(
+      found.map((p) => [
+        p.item_id,
+        { qty: p.qty, include: true, route: p.route ?? "NEGOTIATE" },
+      ]),
+    ),
   );
   const [done, setDone] = useState<string>("");
   const [busy, setBusy] = useState(false);
@@ -74,6 +81,7 @@ export function PropList({
         item_id: p.item_id,
         qty: choices[p.item_id]?.qty ?? p.qty,
         include: choices[p.item_id]?.include ?? true,
+        route: choices[p.item_id]?.route ?? p.route ?? "NEGOTIATE",
       })),
     )
       .then((result) => {
@@ -97,7 +105,11 @@ export function PropList({
 
       <div className="mt-3 space-y-2">
         {found.map((prop) => {
-          const choice = choices[prop.item_id] ?? { qty: prop.qty, include: true };
+          const choice = choices[prop.item_id] ?? {
+            qty: prop.qty,
+            include: true,
+            route: prop.route ?? "NEGOTIATE",
+          };
           return (
             <div
               key={prop.item_id}
@@ -121,7 +133,34 @@ export function PropList({
                     destroyed on camera
                   </span>
                 )}
-                <label className="ml-auto flex items-center gap-1 text-xs text-muted-foreground">
+                {/* The route toggle. Here rather than on a card that appears
+                    later, because this is the last moment before anything is
+                    researched or written to a stranger — and the producer is
+                    the one who knows the birdcage is being built and the mugs
+                    are not. The agent only guessed. */}
+                <span className="ml-auto flex overflow-hidden rounded border text-xs">
+                  {(["NEGOTIATE", "BUY"] as const).map((option) => (
+                    <button
+                      key={option}
+                      type="button"
+                      disabled={done !== "" || !choice.include}
+                      onClick={() =>
+                        setChoices((prior) => ({
+                          ...prior,
+                          [prop.item_id]: { ...choice, route: option },
+                        }))
+                      }
+                      className={`px-2 py-0.5 ${
+                        choice.route === option
+                          ? "bg-foreground text-background"
+                          : "text-muted-foreground"
+                      }`}
+                    >
+                      {option === "BUY" ? "buy online" : "negotiate"}
+                    </button>
+                  ))}
+                </span>
+                <label className="flex items-center gap-1 text-xs text-muted-foreground">
                   qty
                   <input
                     type="number"

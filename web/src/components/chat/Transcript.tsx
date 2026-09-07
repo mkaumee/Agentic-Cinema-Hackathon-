@@ -27,6 +27,7 @@ import type { Busy } from "@/chat/busy";
 import {
   DECISION_TOOL,
   EMAIL_TOOL,
+  LISTING_TOOL,
   OPENINGS_TOOL,
   PROPS_TOOL,
   QUESTION_TOOL,
@@ -34,6 +35,7 @@ import {
 } from "@/chat/convert";
 import { DecisionPart } from "@/components/chat/DecisionPart";
 import { EmailPart } from "@/components/chat/EmailPart";
+import { ListingPart } from "@/components/chat/ListingPart";
 import { OpeningsPart } from "@/components/chat/OpeningsPart";
 import { PropsPart } from "@/components/chat/PropsPart";
 import { QuestionPart } from "@/components/chat/QuestionPart";
@@ -50,6 +52,7 @@ const TOOLS = {
       [OPENINGS_TOOL]: OpeningsPart,
       [RESEARCH_TOOL]: ResearchPart,
       [QUESTION_TOOL]: QuestionPart,
+      [LISTING_TOOL]: ListingPart,
     },
   },
 } as const;

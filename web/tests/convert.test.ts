@@ -12,6 +12,7 @@ import { describe, expect, it } from "vitest";
 import {
   DECISION_TOOL,
   EMAIL_TOOL,
+  LISTING_TOOL,
   QUESTION_TOOL,
   toThreadMessage,
 } from "../src/chat/convert";
@@ -269,5 +270,51 @@ describe("what a seller asked the producer", () => {
         asked: "Which mirror do you mean — the tall one?",
       },
     });
+  });
+});
+
+describe("a prop to buy from a shop", () => {
+  const listing = (over: Partial<Row> = {}): Row =>
+    ({
+      kind: "listing",
+      id: "l-1",
+      negotiationId: "neg1",
+      itemId: "mug",
+      itemName: "Mug",
+      shop: "A Marketplace",
+      price: "MYR 89",
+      url: "https://shop.example.invalid/mug",
+      rivals: 2,
+      at: AT,
+    }) as Row;
+
+  it("renders under its own tool, carrying the link", () => {
+    // The link is the entire feature. Emitting this under DECISION_TOOL would
+    // render a card with nowhere to put a URL — the one interaction it exists
+    // for — and nothing would throw.
+    const [part] = partsOf(listing());
+
+    expect(part).toMatchObject({
+      type: "tool-call",
+      toolName: LISTING_TOOL,
+      args: {
+        negotiationId: "neg1",
+        itemId: "mug",
+        shop: "A Marketplace",
+        price: "MYR 89",
+        url: "https://shop.example.invalid/mug",
+        rivals: 2,
+      },
+    });
+  });
+
+  it("carries no approval and no result", () => {
+    // An approval renders as accept-or-reject, and "reject" on a shop page
+    // means leaving it alone. The card owns its button, because pressing it
+    // also has to open the shop.
+    const [part] = partsOf(listing());
+
+    expect(part).not.toHaveProperty("approval");
+    expect(part).not.toHaveProperty("result");
   });
 });

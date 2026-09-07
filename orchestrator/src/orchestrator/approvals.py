@@ -51,7 +51,7 @@ from pydantic import BaseModel
 from orchestrator.auth import Producer, init_firebase, require_producer
 from orchestrator.clock import SimClock
 from orchestrator.logs import configure_logging
-from orchestrator.records import ItemStatus, PurchaseOrderRecord
+from orchestrator.records import ItemStatus, PurchaseOrderRecord, is_listing
 from orchestrator.repository import (
     DuplicateOrderError,
     FirestoreRepository,
@@ -228,6 +228,29 @@ async def health(request: Request) -> Health:
     )
 
 
+async def _owned(
+    services: ApprovalServices, project_id: str, producer: Producer
+) -> None:
+    """This production has to be theirs.
+
+    The `producer` claim says "this person may approve purchases". It does not
+    say *whose*. Without this, any enrolled producer — and enrolment is now
+    self-service — could post an item id and a project id they do not own and
+    file a purchase order against somebody else's production.
+
+    `firestore.orders.rules` does check `approved_by == request.auth.uid`, but
+    that governs a browser writing directly. This service goes through the
+    admin SDK and bypasses every rule in the file, so the boundary has to be
+    here. `api.py:_owned` is the same check for the same reason.
+
+    A missing project and somebody else's return the same 404, so a caller
+    cannot learn which project ids exist.
+    """
+    project = await services.repo.get_project(project_id)
+    if project is None or project.owner_uid != producer.uid:
+        raise HTTPException(status_code=404, detail=f"no project {project_id}")
+
+
 @app.post("/items/{item_id}/approve")
 async def approve(
     request: Request,
@@ -242,6 +265,7 @@ async def approve(
     at a number nobody agreed.
     """
     services = services_of(request)
+    await _owned(services, body.project_id, producer)
     record = await services.repo.get_negotiation(body.project_id, body.negotiation_id)
     if record is None:
         raise HTTPException(status_code=404, detail="no such negotiation")
@@ -298,6 +322,10 @@ async def approve(
                 price=price,
                 approved_by=producer.uid,
                 approved_at=now,
+                # Where the producer was sent, when the price came off a shop
+                # page. An order that records a number with no provenance is
+                # half a receipt, and this document can never be amended.
+                listing_url=record.listing_url,
             )
         )
     except DuplicateOrderError:
@@ -365,9 +393,26 @@ async def set_floor(
     accepting or abandoning. Due immediately, so the next tick picks it up.
     """
     services = services_of(request)
+    await _owned(services, body.project_id, producer)
     record = await services.repo.get_negotiation(body.project_id, negotiation_id)
     if record is None:
         raise HTTPException(status_code=404, detail="no such negotiation")
+    if is_listing(record):
+        # There is nobody to push back at. Accepting this would set a due date
+        # on a shop row, hand a product page to the brain, and try to haggle
+        # with a URL — and the card would vanish from the producer's queue on
+        # the way, because it is no longer READY_FOR_HUMAN.
+        #
+        # The button is hidden for listings too. A hidden button is not a
+        # guard: it is a thing that stops being hidden the next time somebody
+        # edits the card.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This is a shop listing, not a negotiation. There is no one "
+                "to make an offer to — the price is the price on the page."
+            ),
+        )
 
     now = await services.clock.now(body.project_id)
     record.state = apply_event(record.state, NegotiationEvent.HUMAN_RETURNED_WITH_FLOOR)
@@ -393,6 +438,7 @@ async def cancel(
 ) -> NegotiationUpdated:
     """Stop. A producer can always end a negotiation they started."""
     services = services_of(request)
+    await _owned(services, body.project_id, producer)
     record = await services.repo.get_negotiation(body.project_id, negotiation_id)
     if record is None:
         raise HTTPException(status_code=404, detail="no such negotiation")
