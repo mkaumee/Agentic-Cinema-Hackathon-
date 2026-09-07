@@ -1,11 +1,9 @@
 /**
- * One thread, three sources.
+ * Chat turns are temporary; confirmation cards and correspondence are saved.
  *
- * The producer's turns and the agent's answers live in React state — a chat
- * transcript is not evidence and has no business sitting in Firestore beside
- * the correspondence that is. The other two sources are the correspondence:
- * every email the agent sent and every reply it got, already stored, already
- * subscribed to by `useProject.ts`.
+ * The producer's turns and the agent's answers live in React state. Draft
+ * props, negotiations and emails come from Firestore through `useProject.ts`,
+ * so pending confirmations survive leaving the page.
  *
  * That is what makes this worth building on an external store rather than a
  * chat runtime. Most of what appears here was not said to anyone — it is a
@@ -21,7 +19,7 @@ import type { Item, Message, Negotiation, Supplier } from "@/hooks/useProject";
 import { ask, toUpload, uploadScript, type Upload } from "./api";
 import { decisionsFor } from "./decisions";
 import { toThreadMessage } from "./convert";
-import { directionOf, inOrder, type Row } from "./rows";
+import { directionOf, draftRows, inOrder, type Row } from "./rows";
 
 const money = (q: Negotiation["latest_quote"]): string => {
   const price = q?.unit_price ?? q?.total;
@@ -47,7 +45,7 @@ export interface GreenlitThread {
   runtime: AssistantRuntime;
   /** Decisions waiting on a person. The rail reads this; it never scrolls. */
   waiting: Row[];
-  /** Hand a screenplay to the agent. Resolves once the props are on screen. */
+  /** Hand a screenplay to the agent. Saved drafts arrive through Firestore. */
   readScript: (file: File) => Promise<void>;
 }
 
@@ -121,8 +119,11 @@ export function useGreenlitThread(sources: ThreadSources): GreenlitThread {
   );
 
   const rows = useMemo(
-    () => inOrder([...conversation, ...activity, ...waiting]),
-    [conversation, activity, waiting],
+    () => inOrder([
+      ...conversation, ...activity, ...waiting,
+      ...draftRows(sources.projectId, sources.items),
+    ]),
+    [conversation, activity, waiting, sources.projectId, sources.items],
   );
 
   const onNew = useCallback(
@@ -185,27 +186,20 @@ export function useGreenlitThread(sources: ThreadSources): GreenlitThread {
       try {
         const upload: Upload = await toUpload(file);
         const result = await uploadScript(sources.projectId, upload);
+        // Firestore supplies the confirmation card even if this page closes.
+        if (result.kind === "read" && result.props.length > 0) return;
         const readAt = new Date();
         setConversation((prior) => [
           ...prior,
-          result.kind === "read"
-            ? {
-                kind: "props",
-                id: `s:${readAt.getTime()}`,
-                filename: file.name,
-                props: result.props,
-                at: readAt,
-              }
-            : {
-                // An unreadable file is not an error to swallow: the message
-                // says a scan is a scan and what to do instead, and it is
-                // written for the person reading it.
-                kind: "briefing",
-                id: `s:${readAt.getTime()}`,
-                text: result.detail,
-                refs: [],
-                at: readAt,
-              },
+          {
+            kind: "briefing",
+            id: `s:${readAt.getTime()}`,
+            text: result.kind === "read"
+              ? `No physical props were found in ${file.name}.`
+              : result.detail,
+            refs: [],
+            at: readAt,
+          },
         ]);
       } finally {
         setRunning(false);

@@ -15,6 +15,7 @@
  */
 
 import type { Prop } from "./api";
+import type { Item } from "@/hooks/useProject";
 
 /** Something an answer pointed at, that the panel renders as a link. */
 export interface Reference {
@@ -122,8 +123,32 @@ export interface PropsRow {
   kind: "props";
   id: string;
   filename: string;
-  props: Prop[];
+  props: Omit<Prop, "confidence">[];
   at: Date;
+}
+
+/** Rebuild the confirmation card from saved items, including after a reload. */
+export function draftRows(projectId: string, items: Item[]): PropsRow[] {
+  const drafts = items.filter((item) => item.status === "DRAFT");
+  if (drafts.length === 0) return [];
+
+  return [{
+    kind: "props",
+    id: `drafts:${projectId}`,
+    filename: "",
+    at: new Date(Math.max(...drafts.map((item) => item.updated_at?.toMillis() ?? 0))),
+    props: drafts.map((item) => ({
+      item_id: item.id,
+      name: item.name ?? item.id,
+      category: item.category ?? "",
+      qty: item.qty ?? 1,
+      consumable: item.consumable ?? false,
+      scenes: item.scenes ?? [],
+      lines: (item.mentions ?? []).flatMap((mention) =>
+        mention.line ? [mention.line] : [],
+      ),
+    })),
+  }];
 }
 
 export type Row =

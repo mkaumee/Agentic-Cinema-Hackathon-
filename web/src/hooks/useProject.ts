@@ -72,6 +72,7 @@ export interface Item {
   status?: string;
   floor_price?: Money;
   chosen_quote?: Quote;
+  updated_at?: Timestamp;
   next_action_due_at?: Timestamp;
 }
 

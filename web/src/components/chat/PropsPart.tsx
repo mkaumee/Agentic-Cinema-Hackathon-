@@ -20,12 +20,13 @@
 import type { ToolCallMessagePartProps } from "@assistant-ui/react";
 import { useState } from "react";
 
-import { confirmProps, type Prop } from "@/chat/api";
+import { confirmProps } from "@/chat/api";
+import type { PropsRow } from "@/chat/rows";
 import { useProjectId } from "@/components/chat/context";
 import { Button } from "@/components/ui/button";
 
 export interface PropsArgs {
-  props?: Prop[];
+  props?: PropsRow["props"];
   filename?: string;
 }
 
@@ -40,15 +41,15 @@ export function PropList({
   name,
 }: {
   projectId: string;
-  found: Prop[];
+  found: PropsRow["props"];
   name: string;
 }) {
-  // Everything included by default with the quantity the agent proposed. The
-  // producer's job is to catch what is wrong, not to re-enter what is right.
+  // Store only edits. Newly arriving drafts use their saved quantity and are
+  // included by default, without resetting edits to the other items.
   const [choices, setChoices] = useState<Record<string, { qty: number; include: boolean }>>(
-    Object.fromEntries(found.map((p) => [p.item_id, { qty: p.qty, include: true }])),
+    {},
   );
-  const [done, setDone] = useState<string>("");
+  const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
   if (found.length === 0) {
@@ -64,10 +65,11 @@ export function PropList({
     );
   }
 
-  const kept = found.filter((p) => choices[p.item_id]?.include).length;
+  const kept = found.filter((p) => choices[p.item_id]?.include ?? true).length;
 
   const confirm = () => {
     setBusy(true);
+    setError("");
     void confirmProps(
       projectId,
       found.map((p) => ({
@@ -77,11 +79,8 @@ export function PropList({
       })),
     )
       .then((result) => {
-        setDone(
-          result.kind === "confirmed"
-            ? `${result.confirmed.length} prop(s) confirmed. The agent starts researching them on the next tick.`
-            : result.detail,
-        );
+        // Confirmed items disappear when the Firestore snapshot arrives.
+        if (result.kind === "error") setError(result.detail);
       })
       .finally(() => setBusy(false));
   };
@@ -89,7 +88,7 @@ export function PropList({
   return (
     <div className="my-2 rounded-lg border px-4 py-3 text-sm">
       <p className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
-        Read from {name || "the script"}
+        {name ? `Read from ${name}` : "Unconfirmed props"}
       </p>
       <p className="mt-1 font-medium">
         {found.length} prop{found.length === 1 ? "" : "s"} found
@@ -107,7 +106,8 @@ export function PropList({
                 <input
                   type="checkbox"
                   checked={choice.include}
-                  disabled={done !== ""}
+                  disabled={busy}
+                  aria-label={`Include ${prop.name}`}
                   onChange={(e) =>
                     setChoices((prior) => ({
                       ...prior,
@@ -127,7 +127,7 @@ export function PropList({
                     type="number"
                     min={1}
                     value={choice.qty}
-                    disabled={done !== "" || !choice.include}
+                    disabled={busy || !choice.include}
                     onChange={(e) =>
                       setChoices((prior) => ({
                         ...prior,
@@ -154,18 +154,15 @@ export function PropList({
         })}
       </div>
 
-      {done === "" ? (
-        <div className="mt-3 flex items-center gap-3">
-          <Button size="sm" disabled={busy || kept === 0} onClick={confirm}>
-            {busy ? "Confirming…" : `Confirm ${kept}`}
-          </Button>
-          <span className="text-xs text-muted-foreground">
-            Nothing is researched or emailed until you do.
-          </span>
-        </div>
-      ) : (
-        <p className="mt-3 font-medium">{done}</p>
-      )}
+      {error && <p role="alert" className="mt-3 text-sm">{error}</p>}
+      <div className="mt-3 flex items-center gap-3">
+        <Button size="sm" disabled={busy || kept === 0} onClick={confirm}>
+          {busy ? "Confirming…" : `Confirm ${kept}`}
+        </Button>
+        <span className="text-xs text-muted-foreground">
+          Nothing is researched or emailed until you do.
+        </span>
+      </div>
     </div>
   );
 }
