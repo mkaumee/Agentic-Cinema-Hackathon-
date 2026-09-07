@@ -93,6 +93,15 @@ class NegotiationLine:
 
     listing_url: str = ""
 
+    ever_written_to: bool = True
+    """Whether a word was ever actually sent to this seller.
+
+    False for an opening the producer dropped before releasing it. "We gave up
+    after no reply" is untrue of somebody who was never written to, and it
+    sends a producer off to chase a conversation that never started — the same
+    shape of mistake the bounce split fixed.
+    """
+
     bounced: bool = False
     """Dead because the address bounced, not because nobody answered.
 
@@ -197,6 +206,7 @@ def build_digest(
                 escalation_reason=record.escalation_reason,
                 is_listing=is_listing(record),
                 listing_url=record.listing_url,
+                ever_written_to=record.last_outbound_at is not None,
                 bounced=record.bounced_at is not None,
             )
         )

@@ -654,7 +654,16 @@ class TickLoop:
             # ticking. Expiry surfaces on the poll above, which every tick does
             # first and unconditionally — so a dead mailbox is noticed on the
             # same pass either way, and recording it twice would be noise.
-            if not looks_like_an_address(supplier.email):
+            # The producer may have pointed this negotiation somewhere else
+            # before releasing it — at an address they own, so they can answer
+            # as the seller and drive the whole loop in a minute instead of
+            # over five days. Read on every round, not only the opening: a
+            # redirect that lapsed after the first message would send the
+            # counter to the real seller while the reply came from the test
+            # inbox.
+            to_address = record.recipient_override or supplier.email
+
+            if not looks_like_an_address(to_address):
                 # Last line before the transport. A supplier with no address is
                 # a shop, and every earlier guard for that is a condition some
                 # future edit can slip past; this one is on the instruction
@@ -668,7 +677,7 @@ class TickLoop:
                 )
 
             sent = await mail.send(
-                to=supplier.email,
+                to=to_address,
                 subject=subject,
                 body=body,
                 thread_id=record.gmail_thread_id,
@@ -700,6 +709,12 @@ class TickLoop:
             # COUNTER and CHASE share this path, so a draft left lying here
             # would eventually be sent as somebody's counter-offer. The same
             # goes for the producer's answer and their photograph.
+            #
+            # `recipient_override` is deliberately NOT cleared here, and that
+            # is the opposite case rather than an oversight: it is where this
+            # conversation lives, not something said once. Clear it and the
+            # seller replies to the address the opening went to while every
+            # counter after it goes to the real one.
             record.draft_subject = ""
             record.draft_body = ""
             record.producer_answer = ""

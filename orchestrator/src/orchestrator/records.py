@@ -278,6 +278,23 @@ class NegotiationRecord(_Record):
     item_id: str
     supplier_id: str
 
+    recipient_override: str = ""
+    """Send to this address instead of the supplier's.
+
+    Set from the openings card before release, and per negotiation rather than
+    on the supplier — ``supplier_id_for`` derives a seller's document id from
+    their address, so editing ``SupplierRecord.email`` would leave the record
+    disagreeing with its own key and would redirect every other item that
+    shares that seller.
+
+    Built for driving a demo: point the opening at an address you own, answer
+    as the seller, and the whole five-day loop runs in a minute. It is never
+    cleared once set — see the draft-clearing block in ``tick.py``, which wipes
+    the subject and body so a counter cannot inherit them. This is the opposite
+    case. Clear it and the seller replies to your address while the agent's
+    counter goes to the real one.
+    """
+
     listing_url: str = ""
     """Set when this is a shop page rather than a conversation.
 

@@ -274,7 +274,7 @@ describe("what a seller asked the producer", () => {
 });
 
 describe("a prop to buy from a shop", () => {
-  const listing = (over: Partial<Row> = {}): Row =>
+  const listing = (): Row =>
     ({
       kind: "listing",
       id: "l-1",

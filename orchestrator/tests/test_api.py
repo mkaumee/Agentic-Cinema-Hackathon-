@@ -1670,3 +1670,221 @@ async def test_a_stranger_cannot_report_on_your_shopping(
     settled = await repo.get_item("someone-elses", "mirror")
     assert settled is not None
     assert settled.purchase_note == ""
+
+
+# --------------------------------------------------------------------------- #
+# Choosing which openings go, and where
+# --------------------------------------------------------------------------- #
+
+
+async def _two_openings(firestore: AsyncClient, project_id: str) -> FirestoreRepository:
+    repo = FirestoreRepository(firestore)
+    for negotiation_id, supplier_id in (("neg1", "sup1"), ("neg2", "sup2")):
+        await repo.save_negotiation(
+            project_id,
+            negotiation_id,
+            NegotiationRecord(
+                item_id="mirror",
+                supplier_id=supplier_id,
+                state=NegotiationState.DRAFTED,
+                draft_subject="Hire enquiry",
+                draft_body="Hi, do you hire mirrors?",
+                created_at=T0,
+                updated_at=T0,
+            ),
+        )
+    return repo
+
+
+async def test_only_the_ticked_openings_are_released(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    """The gap that existed the whole time this was releasable in principle.
+
+    The server has always filtered on the ids it is given; the card just never
+    gave it a subset. Nothing covered the populated path until now.
+    """
+    headers = _auth(tokens)
+    project_id = await _start(api, headers)
+    repo = await _two_openings(firestore, project_id)
+
+    reply = await api.post(
+        f"/projects/{project_id}/openings/release",
+        headers=headers,
+        json={
+            "openings": [
+                {"negotiation_id": "neg1", "include": True},
+                {"negotiation_id": "neg2", "include": False},
+            ]
+        },
+    )
+
+    assert reply.status_code == 200, reply.text
+    assert reply.json() == {"approved": ["neg1"], "dropped": ["neg2"]}
+
+    sent = await repo.get_negotiation(project_id, "neg1")
+    assert sent is not None
+    assert sent.opening_released_at is not None
+    assert sent.next_action_due_at is not None
+    assert sent.state is NegotiationState.DRAFTED, "still unsent until a tick runs"
+
+
+async def test_unticking_an_opening_drops_it_rather_than_leaving_it_waiting(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    """Unticking is a decision, the same as unticking a prop.
+
+    Left merely unreleased it would come back in the card on every snapshot,
+    forever — and a queue that fills with things somebody already decided
+    against is a queue people stop reading.
+    """
+    headers = _auth(tokens)
+    project_id = await _start(api, headers)
+    repo = await _two_openings(firestore, project_id)
+
+    _ = await api.post(
+        f"/projects/{project_id}/openings/release",
+        headers=headers,
+        json={"openings": [{"negotiation_id": "neg2", "include": False}]},
+    )
+
+    dropped = await repo.get_negotiation(project_id, "neg2")
+    assert dropped is not None
+    assert dropped.state is NegotiationState.DEAD
+    assert dropped.opening_released_at is None, "it was never approved for sending"
+    assert dropped.next_action_due_at is None, "and never becomes due"
+
+    # The one it said nothing about is untouched, so a second pass can still
+    # decide it.
+    untouched = await repo.get_negotiation(project_id, "neg1")
+    assert untouched is not None
+    assert untouched.state is NegotiationState.DRAFTED
+    assert untouched.opening_released_at is None
+
+
+async def test_an_empty_body_still_releases_everything(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    """What the card did before it had checkboxes, and what the older tests post."""
+    headers = _auth(tokens)
+    project_id = await _start(api, headers)
+    repo = await _two_openings(firestore, project_id)
+
+    reply = await api.post(
+        f"/projects/{project_id}/openings/release", headers=headers, json={}
+    )
+
+    assert sorted(reply.json()["approved"]) == ["neg1", "neg2"]
+    assert reply.json()["dropped"] == []
+    for negotiation_id in ("neg1", "neg2"):
+        record = await repo.get_negotiation(project_id, negotiation_id)
+        assert record is not None
+        assert record.opening_released_at is not None
+
+
+async def test_an_opening_can_be_pointed_at_a_different_address(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    """Which is what makes the loop demonstrable in a minute rather than a week.
+
+    Stored on the negotiation, never on the supplier: a seller's document id is
+    a slug of their address, so editing the supplier would leave the record
+    disagreeing with its own key and redirect every other item that shares them.
+    """
+    headers = _auth(tokens)
+    project_id = await _start(api, headers)
+    repo = await _pending_opening(firestore, project_id)
+    await repo.save_supplier(
+        project_id,
+        "sup1",
+        SupplierRecord(name="Ah Seng Rentals", email="s@example.invalid"),
+    )
+
+    reply = await api.patch(
+        f"/projects/{project_id}/negotiations/neg1/opening",
+        headers=headers,
+        json={
+            "subject": "About a mirror",
+            "body": "Do you hire mirrors?",
+            "to_email": "Me+Seller@Example.Invalid",
+        },
+    )
+
+    assert reply.status_code == 200, reply.text
+    record = await repo.get_negotiation(project_id, "neg1")
+    assert record is not None
+    assert record.recipient_override == "me+seller@example.invalid", "normalised"
+
+    supplier = await repo.get_supplier(project_id, "sup1")
+    assert supplier is not None
+    assert supplier.email == "s@example.invalid", "the seller's own record is untouched"
+
+
+async def test_a_mistyped_redirect_is_refused(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    """It does not fail loudly later — it posts into a void and waits two days.
+
+    Which on this screen is indistinguishable from a seller who is simply slow,
+    so the refusal has to happen while somebody is looking at it.
+    """
+    headers = _auth(tokens)
+    project_id = await _start(api, headers)
+    repo = await _pending_opening(firestore, project_id)
+
+    reply = await api.patch(
+        f"/projects/{project_id}/negotiations/neg1/opening",
+        headers=headers,
+        json={"subject": "s", "body": "b", "to_email": "me at example dot com"},
+    )
+
+    assert reply.status_code == 422
+    record = await repo.get_negotiation(project_id, "neg1")
+    assert record is not None
+    assert record.recipient_override == ""
+
+
+async def test_no_redirect_leaves_the_seller_where_they_were(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    """The ordinary case: an edit that only touches the words."""
+    headers = _auth(tokens)
+    project_id = await _start(api, headers)
+    repo = await _pending_opening(firestore, project_id)
+
+    reply = await api.patch(
+        f"/projects/{project_id}/negotiations/neg1/opening",
+        headers=headers,
+        json={"subject": "s", "body": "Rewritten."},
+    )
+
+    assert reply.status_code == 200, reply.text
+    record = await repo.get_negotiation(project_id, "neg1")
+    assert record is not None
+    assert record.recipient_override == ""
+    assert record.draft_body == "Rewritten."
+
+
+async def test_a_stranger_cannot_drop_or_redirect_an_opening(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    _ = await _owned_project(firestore, "someone-elses", "a-different-producer")
+    repo = await _pending_opening(firestore, "someone-elses")
+    headers = _auth(tokens, "outsider@example.invalid")
+
+    dropped = await api.post(
+        "/projects/someone-elses/openings/release",
+        headers=headers,
+        json={"openings": [{"negotiation_id": "neg1", "include": False}]},
+    )
+    redirected = await api.patch(
+        "/projects/someone-elses/negotiations/neg1/opening",
+        headers=headers,
+        json={"subject": "s", "body": "b", "to_email": "me@example.invalid"},
+    )
+
+    assert dropped.status_code == redirected.status_code == 404
+    record = await repo.get_negotiation("someone-elses", "neg1")
+    assert record is not None
+    assert record.state is NegotiationState.DRAFTED, "not dropped"
+    assert record.recipient_override == "", "and not redirected"

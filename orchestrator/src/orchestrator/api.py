@@ -103,6 +103,7 @@ from orchestrator.scripts import (
     is_document,
 )
 from orchestrator.settings import GMAIL_SCOPES, BrainBackend, Settings
+from orchestrator.sourcing import looks_like_an_address
 from orchestrator.state_machine import NegotiationEvent, apply_event
 
 log = logging.getLogger("orchestrator.api")
@@ -537,14 +538,43 @@ class EditOpening(BaseModel):
     would silently mail the version the producer just deleted.
     """
 
+    to_email: str = ""
+    """Send it somewhere other than the seller's own address.
+
+    Empty leaves the supplier's address in place, which is the ordinary case.
+    Anything else has to look like an address: a typo here does not fail
+    loudly, it sends a real production's opening email into a void and then
+    waits two days for a reply from nobody.
+
+    This exists to make the loop demonstrable — point it at an inbox you own,
+    reply as the seller, and the five days collapse into a minute.
+    """
+
+    @override
+    def model_post_init(self, _context: object, /) -> None:
+        if self.to_email and not looks_like_an_address(self.to_email):
+            raise ValueError(f"{self.to_email!r} is not an email address.")
+
+
+class OpeningChoice(BaseModel):
+    """What the producer decided about one drafted opening."""
+
+    negotiation_id: str
+    include: bool = True
+    """False drops it. The same word, and the same meaning, as on the prop
+    list: the thing is recorded as not wanted rather than quietly skipped."""
+
 
 class ReleaseOpenings(BaseModel):
-    negotiation_ids: list[str] = Field(default_factory=list)
-    """Empty means every opening still waiting on this production."""
+    openings: list[OpeningChoice] = Field(default_factory=list)
+    """Empty means release every opening still waiting on this production."""
 
 
 class OpeningsReleased(BaseModel):
     approved: list[str]
+    dropped: list[str] = Field(default_factory=list)
+    """Reported back rather than inferred, so the screen can say what happened
+    to the ones a producer unticked instead of only what it sent."""
 
 
 class AnswerSupplier(BaseModel):
@@ -818,6 +848,7 @@ async def edit_opening(
 
     record.draft_subject = body.subject
     record.draft_body = body.body
+    record.recipient_override = body.to_email.strip().lower()
     record.updated_at = await services.clock.now(project_id)
     await services.repo.save_negotiation(project_id, negotiation_id, record)
     return Draft(
@@ -837,38 +868,60 @@ async def release_openings(
     tick service holds the mailbox and does the sending. That split is the same
     one that keeps this service unable to write a purchase order, and it is
     worth not eroding for convenience.
+
+    Unticking one drops it, exactly as unticking a prop abandons it. That is a
+    positive act rather than an omission on purpose: leaving an unwanted draft
+    pending would put it back in the producer's queue on the next snapshot,
+    every time, forever — and a queue that fills with things somebody has
+    already decided against is a queue people stop reading.
+
+    Dropping is `HUMAN_CANCELLED`, which the state machine has always allowed
+    from DRAFTED. It moves no money, so it belongs on this service rather than
+    on the one that can.
     """
     services = services_of(request)
     _ = await _owned(services, project_id, producer)
 
     now = await services.clock.now(project_id)
-    wanted = set(body.negotiation_ids)
+    # An empty body still means "send everything waiting", which is what the
+    # card did before it had checkboxes.
+    decisions = {choice.negotiation_id: choice.include for choice in body.openings}
     approved: list[str] = []
+    dropped: list[str] = []
 
     for negotiation_id, record in (
         await services.repo.list_negotiations(project_id)
     ).items():
-        if wanted and negotiation_id not in wanted:
+        if decisions and negotiation_id not in decisions:
             continue
         if not _is_pending_opening(record):
             continue
-        record.opening_released_at = now
-        # Due immediately: approving is the producer saying send it, and a
-        # delay would read as the agent ignoring them.
-        record.next_action_due_at = now
+
+        if decisions.get(negotiation_id, True):
+            record.opening_released_at = now
+            # Due immediately: approving is the producer saying send it, and a
+            # delay would read as the agent ignoring them.
+            record.next_action_due_at = now
+            approved.append(negotiation_id)
+        else:
+            record.state = apply_event(record.state, NegotiationEvent.HUMAN_CANCELLED)
+            record.latest_reasoning = "You dropped this one before it was sent."
+            record.next_action_due_at = None
+            dropped.append(negotiation_id)
+
         record.updated_at = now
         await services.repo.save_negotiation(project_id, negotiation_id, record)
-        approved.append(negotiation_id)
 
     log.info(
-        "openings approved",
+        "openings decided",
         extra={
             "project_id": project_id,
             "uid": producer.uid,
             "approved": len(approved),
+            "dropped": len(dropped),
         },
     )
-    return OpeningsReleased(approved=approved)
+    return OpeningsReleased(approved=approved, dropped=dropped)
 
 
 @app.post("/producers/me")

@@ -43,9 +43,12 @@ export function Openings({
   projectId: string;
   pending: PendingOpening[];
 }) {
-  const [edits, setEdits] = useState<Record<string, { subject: string; body: string }>>(
-    {},
-  );
+  const [edits, setEdits] = useState<
+    Record<string, { subject: string; body: string; to: string }>
+  >({});
+  // Included by default, like the prop list. The producer's job is to catch
+  // the one they do not want, not to re-approve the ones they do.
+  const [dropped, setDropped] = useState<Record<string, boolean>>({});
   const [busy, setBusy] = useState(false);
   const [done, setDone] = useState("");
   const [error, setError] = useState("");
@@ -56,7 +59,11 @@ export function Openings({
     edits[opening.negotiationId] ?? {
       subject: opening.subject,
       body: opening.body,
+      to: opening.to,
     };
+
+  const keeping = (opening: PendingOpening) => dropped[opening.negotiationId] !== true;
+  const kept = pending.filter(keeping).length;
 
   const send = () => {
     setBusy(true);
@@ -68,12 +75,15 @@ export function Openings({
       try {
         for (const opening of pending) {
           const edited = edits[opening.negotiationId];
-          if (edited === undefined) continue;
+          // Only the dirtied ones, and never a dropped one — saving a draft
+          // about to be cancelled is a write nobody will ever read.
+          if (edited === undefined || !keeping(opening)) continue;
           const saved = await editOpening(
             projectId,
             opening.negotiationId,
             edited.subject,
             edited.body,
+            edited.to === opening.to ? "" : edited.to,
           );
           if (saved.kind === "error") {
             setError(saved.detail);
@@ -82,15 +92,20 @@ export function Openings({
         }
         const released = await releaseOpenings(
           projectId,
-          pending.map((o) => o.negotiationId),
+          pending.map((o) => ({
+            negotiation_id: o.negotiationId,
+            include: keeping(o),
+          })),
         );
         if (released.kind === "error") {
           setError(released.detail);
           return;
         }
+        const gone = pending.length - kept;
         setDone(
-          `${pending.length} email${pending.length === 1 ? "" : "s"} on the way. ` +
-            "The agent takes it from here and answers the replies itself.",
+          `${kept} email${kept === 1 ? "" : "s"} on the way` +
+            (gone > 0 ? `, ${gone} dropped` : "") +
+            ". The agent takes it from here and answers the replies itself.",
         );
       } finally {
         setBusy(false);
@@ -108,33 +123,70 @@ export function Openings({
       </p>
       <p className="mt-1 text-xs text-muted-foreground">
         Written by the agent, from your mailbox, over your name. Nothing has
-        gone yet — read them, change anything you like, then send.
+        gone yet — read them, change anything you like, untick any you do not
+        want, then send.
       </p>
 
       <div className="mt-3 space-y-3">
         {pending.map((opening) => {
           const text = textOf(opening);
-          const change = (next: Partial<{ subject: string; body: string }>) =>
+          const keep = keeping(opening);
+          const locked = busy || done !== "" || !keep;
+          const change = (next: Partial<{ subject: string; body: string; to: string }>) =>
             setEdits((prior) => ({
               ...prior,
               [opening.negotiationId]: { ...text, ...next },
             }));
           return (
-            <div key={opening.negotiationId} className="rounded-md border px-3 py-2">
-              <p className="text-xs text-muted-foreground">
-                To <span className="font-medium">{opening.supplier}</span> about{" "}
-                <span className="font-medium capitalize">{opening.itemName}</span>
-              </p>
+            <div
+              key={opening.negotiationId}
+              className={`rounded-md border px-3 py-2 ${keep ? "" : "opacity-50"}`}
+            >
+              <div className="flex flex-wrap items-center gap-2">
+                {/* Untick to drop it. Same control and same meaning as the
+                    prop list: the seller is not written to, and the record
+                    says so rather than the draft sitting in the queue
+                    forever. */}
+                <input
+                  type="checkbox"
+                  checked={keep}
+                  disabled={busy || done !== ""}
+                  onChange={(e) =>
+                    setDropped((prior) => ({
+                      ...prior,
+                      [opening.negotiationId]: !e.target.checked,
+                    }))
+                  }
+                />
+                <p className="text-xs text-muted-foreground">
+                  <span className="font-medium">{opening.supplier}</span> about{" "}
+                  <span className="font-medium capitalize">{opening.itemName}</span>
+                </p>
+              </div>
+              {/* The address, as an ordinary editable field. Point it at an
+                  inbox you own and you can answer as the seller, which turns
+                  a five-day negotiation into a minute — and because it is
+                  shown rather than hidden behind an edit affordance, a
+                  redirect is something you can see before you send. */}
+              <label className="mt-2 flex items-center gap-2 text-xs text-muted-foreground">
+                To
+                <input
+                  value={text.to}
+                  disabled={locked}
+                  onChange={(e) => change({ to: e.target.value })}
+                  className="flex-1 rounded border bg-background px-2 py-1 font-mono"
+                />
+              </label>
               <input
                 value={text.subject}
-                disabled={busy || done !== ""}
+                disabled={locked}
                 onChange={(e) => change({ subject: e.target.value })}
                 className="mt-2 w-full rounded border bg-background px-2 py-1 text-sm font-medium"
               />
               <textarea
                 value={text.body}
                 rows={7}
-                disabled={busy || done !== ""}
+                disabled={locked}
                 onChange={(e) => change({ body: e.target.value })}
                 className="mt-2 w-full resize-y rounded border bg-background px-2 py-1 font-mono text-xs"
               />
@@ -145,11 +197,13 @@ export function Openings({
 
       {done === "" ? (
         <div className="mt-3 flex items-center gap-3">
-          <Button size="sm" loading={busy} onClick={send}>
-            {busy ? "Sending…" : `Send ${pending.length}`}
+          <Button size="sm" loading={busy} disabled={kept === 0} onClick={send}>
+            {busy ? "Sending…" : `Send ${kept}`}
           </Button>
           <span className="text-xs text-muted-foreground">
-            Nothing reaches a seller until you do.
+            {kept === 0
+              ? "Everything here is unticked — nothing would be sent."
+              : "Nothing reaches a seller until you do. Unticked ones are dropped."}
           </span>
         </div>
       ) : (

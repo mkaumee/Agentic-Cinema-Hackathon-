@@ -162,7 +162,11 @@ def test_a_bounced_address_is_not_reported_as_no_reply() -> None:
     them off to chase somebody who never received a word.
     """
     silent = _negotiation("cup", "s1", None, state=NegotiationState.DEAD)
+    # Written to, and never answered. Without this the record says nobody was
+    # ever contacted, which is a different piece of news — see the test below.
+    silent.last_outbound_at = T0
     bounced = _negotiation("cup", "s2", None, state=NegotiationState.DEAD)
+    bounced.last_outbound_at = T0
     bounced.bounced_at = T0
     bounced.latest_reasoning = "Address not found, from mailer-daemon@googlemail.com."
 
@@ -185,6 +189,7 @@ def test_a_bounced_address_is_not_reported_as_no_reply() -> None:
 def test_a_bounce_is_not_counted_as_a_supplier_who_went_quiet() -> None:
     """The wording is the whole point, so assert it is not the other one."""
     bounced = _negotiation("cup", "s2", None, state=NegotiationState.DEAD)
+    bounced.last_outbound_at = T0
     bounced.bounced_at = T0
 
     digest = _digest({"cup": _item("Cup")}, {"n2": bounced}, {"s2": "Skyline"})
@@ -193,3 +198,29 @@ def test_a_bounce_is_not_counted_as_a_supplier_who_went_quiet() -> None:
 
     assert "no reply" not in text
     assert "the address bounced" in text
+
+
+def test_a_draft_you_dropped_is_not_a_seller_who_ignored_you() -> None:
+    """Nobody was written to, so nobody failed to answer.
+
+    The producer unticked this opening on the confirmation card, so it died
+    before first contact. Reporting it as "gave up on after no reply" would
+    send them chasing a conversation that never started — the same shape of
+    mistake the bounce split fixed, arriving through a different door.
+    """
+    dropped = _negotiation("cup", "s1", None, state=NegotiationState.DEAD)
+    ignored = _negotiation("cup", "s2", None, state=NegotiationState.DEAD)
+    ignored.last_outbound_at = T0
+
+    digest = _digest(
+        {"cup": _item("Cup")},
+        {"n1": dropped, "n2": ignored},
+        {"s1": "Ah Seng", "s2": "Skyline"},
+    )
+
+    text, _ = summarise(digest, "who is quiet?")
+
+    assert "1 you dropped before they were sent" in text
+    assert "Ah Seng" in text
+    assert "1 gave up on after no reply" in text
+    assert "Skyline" in text

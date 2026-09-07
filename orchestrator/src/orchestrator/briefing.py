@@ -129,7 +129,11 @@ def _quiet(digest: ProjectDigest) -> tuple[str, list[Referenced]]:
     chasing = [n for n in digest.negotiations if n.state == "CHASING"]
     dead = [n for n in digest.negotiations if n.state == "DEAD"]
     bounced = [n for n in dead if n.bounced]
-    silent = [n for n in dead if not n.bounced]
+    # Never written to, so nobody failed to answer. Today this is a draft the
+    # producer dropped from the openings card; it would also cover anything
+    # else that dies before first contact.
+    unsent = [n for n in dead if not n.bounced and not n.ever_written_to]
+    silent = [n for n in dead if not n.bounced and n.ever_written_to]
     if not chasing and not dead:
         return ("Every supplier who was written to has answered.", [])
 
@@ -143,6 +147,11 @@ def _quiet(digest: ProjectDigest) -> tuple[str, list[Referenced]]:
     if silent:
         lines.append(f"{len(silent)} gave up on after no reply:")
         for n in silent:
+            lines.append(f"  · {n.supplier} about {n.item_name}")
+            refs.append(("negotiation", n.negotiation_id, n.item_name))
+    if unsent:
+        lines.append(f"{len(unsent)} you dropped before they were sent:")
+        for n in unsent:
             lines.append(f"  · {n.supplier} about {n.item_name}")
             refs.append(("negotiation", n.negotiation_id, n.item_name))
     if bounced:

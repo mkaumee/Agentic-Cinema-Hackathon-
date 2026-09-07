@@ -303,30 +303,39 @@ export async function editOpening(
   negotiationId: string,
   subject: string,
   body: string,
+  toEmail = "",
 ): Promise<Done> {
   return completed(
     await send("PATCH", `/projects/${projectId}/negotiations/${negotiationId}/opening`, {
       subject,
       body,
+      to_email: toEmail,
     }),
   );
 }
 
 /**
- * Release the opening emails. This is the press-send.
+ * Decide the opening emails. This is the press-send.
  *
  * Nothing is sent by this call: it marks them approved and due, and the tick
  * service — which is the one holding the mailbox — posts them within the
  * minute. An empty list means every opening still waiting.
+ *
+ * `include: false` drops that one, exactly as unticking a prop abandons it.
+ * Leaving it merely unreleased would put it back in the producer's queue on
+ * every snapshot, forever.
  */
+export interface OpeningChoice {
+  negotiation_id: string;
+  include: boolean;
+}
+
 export async function releaseOpenings(
   projectId: string,
-  negotiationIds: string[] = [],
+  openings: OpeningChoice[] = [],
 ): Promise<Done> {
   return completed(
-    await send("POST", `/projects/${projectId}/openings/release`, {
-      negotiation_ids: negotiationIds,
-    }),
+    await send("POST", `/projects/${projectId}/openings/release`, { openings }),
   );
 }
 

@@ -183,6 +183,13 @@ export type PendingOpening = {
   itemName: string;
   subject: string;
   body: string;
+  /** Where this one is currently addressed.
+   *
+   * The seller's own address unless the producer has redirected it — which
+   * they do to drive a demo, pointing it at an inbox they own so they can
+   * answer as the seller. Shown as an ordinary field rather than hidden behind
+   * an edit affordance, so a redirect is something you can see. */
+  to: string;
 };
 
 /**

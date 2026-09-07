@@ -124,6 +124,9 @@ export interface Negotiation {
   opening_released_at?: Timestamp;
   created_at?: Timestamp;
   updated_at?: Timestamp;
+  /** Send to this address instead of the seller's. Set from the openings card
+   * before release, so a demo can be driven from an inbox you own. */
+  recipient_override?: string;
 }
 
 export interface Supplier {

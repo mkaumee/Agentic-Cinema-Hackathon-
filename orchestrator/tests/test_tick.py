@@ -1323,3 +1323,74 @@ async def test_a_vanished_attachment_does_not_stop_the_answer(
     sent = harness.mail.sent[-1]
     assert sent["body"] == "About 1.2 metres tall."
     assert sent["attachments"] == ""
+
+
+# --------------------------------------------------------------------------- #
+# Pointing an opening somewhere else
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_redirected_opening_goes_to_the_producers_address(
+    harness: _Harness,
+) -> None:
+    """The whole reason this exists: stand on both sides of the conversation.
+
+    A negotiation takes days because sellers take days. Point the opening at an
+    inbox you own and the five days collapse into a minute, which is the
+    difference between demonstrating the loop and describing it.
+    """
+    await harness.add_negotiation()
+    record = await harness.repo.get_negotiation(PID, "neg1")
+    assert record is not None
+    record.recipient_override = "me@example.invalid"
+    await harness.repo.save_negotiation(PID, "neg1", record)
+
+    _ = await harness.loop.run_tick(PID)
+
+    assert harness.mail.sent[0]["to"] == "me@example.invalid"
+    assert harness.mail.sent[0]["to"] != "ahseng@example.invalid"
+
+
+async def test_the_redirect_holds_for_every_later_round(
+    harness: _Harness,
+) -> None:
+    """Not just the opening — this is where the conversation lives.
+
+    The send path clears the stored draft after posting, so a counter cannot
+    inherit somebody's opening. The redirect is the opposite case and must
+    survive that: cleared, the seller would reply from the test inbox while the
+    agent's counter went to the real seller, which is both a stranger being
+    emailed and a demo that stops working halfway through.
+    """
+    await harness.add_negotiation(floor=Money(amount=900))
+    record = await harness.repo.get_negotiation(PID, "neg1")
+    assert record is not None
+    record.recipient_override = "me@example.invalid"
+    await harness.repo.save_negotiation(PID, "neg1", record)
+
+    _ = await harness.loop.run_tick(PID)
+    thread = harness.mail.sent[0]["thread_id"]
+
+    # Answer as the seller, which is exactly what the producer would do.
+    _ = harness.mail.deliver(thread_id=thread, body="RM1,250 per day.")
+    await harness.at(T0 + timedelta(hours=6))
+    _ = await harness.loop.run_tick(PID)
+
+    assert len(harness.mail.sent) > 1, "the agent countered"
+    assert harness.mail.sent[-1]["to"] == "me@example.invalid"
+
+    settled = await harness.repo.get_negotiation(PID, "neg1")
+    assert settled is not None
+    assert settled.recipient_override == "me@example.invalid", "never cleared"
+    assert settled.draft_body == "", "unlike the draft, which is"
+
+
+async def test_without_a_redirect_the_seller_hears_from_us(
+    harness: _Harness,
+) -> None:
+    """The ordinary case, asserted so the override cannot become the default."""
+    await harness.add_negotiation()
+
+    _ = await harness.loop.run_tick(PID)
+
+    assert harness.mail.sent[0]["to"] == "ahseng@example.invalid"

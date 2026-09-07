@@ -88,6 +88,13 @@ export function useGreenlitThread(sources: ThreadSources): GreenlitThread {
     [sources.suppliers],
   );
 
+  /** The seller's own address, for the openings card to show and edit. */
+  const emailOf = useCallback(
+    (id: string | undefined) =>
+      sources.suppliers.find((s) => s.id === id)?.email ?? "",
+    [sources.suppliers],
+  );
+
   const itemNamed = useCallback(
     (id: string | undefined) =>
       sources.items.find((i) => i.id === id)?.name ?? id ?? "an item",
@@ -228,6 +235,10 @@ export function useGreenlitThread(sources: ThreadSources): GreenlitThread {
         itemName: itemNamed(n.item_id),
         subject: n.draft_subject ?? "",
         body: n.draft_body ?? "",
+        // A redirect already set on a previous visit wins, so re-opening the
+        // card shows where the email is actually going rather than resetting
+        // to the seller and quietly undoing it on the next save.
+        to: (n.recipient_override ?? "") || emailOf(n.supplier_id),
       }));
     if (pending.length === 0) return [];
 
@@ -245,7 +256,7 @@ export function useGreenlitThread(sources: ThreadSources): GreenlitThread {
         at: at ?? new Date(),
       },
     ];
-  }, [sources.negotiations, named, itemNamed]);
+  }, [sources.negotiations, named, itemNamed, emailOf]);
 
   /**
    * The agent working, between confirmation and the first drafts.
