@@ -449,10 +449,15 @@ else
     ok "gs://${ATTACHMENTS_BUCKET}"
   fi
 
+  # `gcloud storage buckets get-iam-policy` takes neither --filter nor
+  # --flatten, unlike `gcloud projects get-iam-policy` a few lines up. Written
+  # in that shape once and it errored on every run: the `if` then failed, the
+  # else branch re-granted a binding that was already there, and the script
+  # printed a tick underneath the error as though nothing had happened.
+  #
+  # JSON and grep instead, which is what the secret check above does.
   if gcloud storage buckets get-iam-policy "gs://${ATTACHMENTS_BUCKET}" \
-       --flatten='bindings[].members' \
-       --filter="bindings.role:roles/storage.objectViewer AND bindings.members:serviceAccount:${AGENT_EMAIL}" \
-       --format='value(bindings.role)' | grep -q objectViewer; then
+       --format=json | grep -q "$AGENT_EMAIL"; then
     skip "objectViewer for the agent"
   else
     gcloud storage buckets add-iam-policy-binding "gs://${ATTACHMENTS_BUCKET}" \

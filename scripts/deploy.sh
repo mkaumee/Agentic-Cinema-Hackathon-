@@ -289,8 +289,21 @@ case "$MAIL_BACKEND" in
       | grep -c "^${TOKEN_SECRET}-" || true)
     [[ "$versions" -gt 0 || "$producers" -gt 0 ]] \
       || problems+=("no mailbox: '$TOKEN_SECRET' has no enabled version and no producer has connected Gmail from the panel")
-    [[ -n "$OAUTH_CLIENT_ID" ]] \
-      || problems+=("CINEMA_OAUTH_CLIENT_ID is not set — token refresh fails with invalid_client")
+    # Set, and set to something that could actually be a client id.
+    #
+    # "Is it non-empty" was the whole check, and a documentation placeholder
+    # copied verbatim — `your-client-id.apps.googleusercontent.com` — sails
+    # through it. That deploys a service whose token refresh fails with
+    # invalid_client hours later, on the first tick that tries to send, from a
+    # screen that just looks like a slow supplier.
+    #
+    # Google issues these as <numeric project number>-<hash>.apps.
+    # googleusercontent.com, so the leading digits are the cheap tell.
+    if [[ -z "$OAUTH_CLIENT_ID" ]]; then
+      problems+=("CINEMA_OAUTH_CLIENT_ID is not set — token refresh fails with invalid_client")
+    elif [[ ! "$OAUTH_CLIENT_ID" =~ ^[0-9]+-.*\.apps\.googleusercontent\.com$ ]]; then
+      problems+=("CINEMA_OAUTH_CLIENT_ID does not look like a real client id ('$OAUTH_CLIENT_ID') — copy it from the console, APIs & Services → Credentials")
+    fi
     [[ -n "$OAUTH_CLIENT_SECRET" ]] \
       || problems+=("CINEMA_OAUTH_CLIENT_SECRET is not set")
 
@@ -741,10 +754,11 @@ done
 # works — the answer route refuses a file and says why, and answering a seller
 # in words is most of what this is for.
 if gcloud storage buckets describe "gs://${ATTACHMENTS_BUCKET}" >/dev/null 2>&1; then
+  # JSON and grep, not --filter: `gcloud storage buckets get-iam-policy` does
+  # not accept --filter or --flatten the way `gcloud projects get-iam-policy`
+  # does. See the same fix in scripts/gcp_setup.sh.
   if gcloud storage buckets get-iam-policy "gs://${ATTACHMENTS_BUCKET}" \
-       --flatten='bindings[].members' \
-       --filter="bindings.role:roles/storage.objectCreator AND bindings.members:serviceAccount:${API_EMAIL}" \
-       --format='value(bindings.role)' | grep -q objectCreator; then
+       --format=json | grep -q "$API_EMAIL"; then
     skip "objectCreator on gs://${ATTACHMENTS_BUCKET} for $API_SA"
   else
     gcloud storage buckets add-iam-policy-binding "gs://${ATTACHMENTS_BUCKET}" \
