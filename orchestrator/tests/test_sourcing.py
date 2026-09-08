@@ -242,9 +242,13 @@ async def test_a_screenplay_becomes_negotiations_without_anything_hand_seeded(
         },
     )
 
-    # Research, then open negotiations, then send. Each is its own tick so that
-    # a process dying between them loses only that step.
-    for _ in range(3):
+    # Several passes, not three. Each step is its own tick so that a process
+    # dying between them loses only that step — and research is bounded to a
+    # few items per tick, because one item is a reasoning call plus several web
+    # searches and a pass that tries to do fifty is a pass Cloud Run kills at
+    # the wall. So a four-prop script is researched over several minutes rather
+    # than in one go, which is the point rather than a limitation.
+    for _ in range(8):
         _ = await api.post("/tick")
 
     repo = FirestoreRepository(firestore)
@@ -763,3 +767,52 @@ async def test_the_producer_can_overrule_the_route_before_anything_happens(
     negotiations = await repo.list_negotiations(PID)
     assert negotiations
     assert all(not n.listing_url for n in negotiations.values())
+
+
+async def test_research_is_bounded_far_below_the_negotiation_budget(
+    api: httpx.AsyncClient, firestore: AsyncClient
+) -> None:
+    """One number used to govern two jobs of wildly different cost.
+
+    `tick_limit` meant "advance up to 50 negotiations" and, because it was
+    handed to both, also "research up to 50 items". Researching one item is a
+    reasoning call plus several web searches; fifty cannot fit in the fifty
+    seconds Cloud Run allows the request. The pass was killed at the wall, the
+    rows it had claimed were parked for the lease, and everything behind them
+    waited — including openings a producer had already sent.
+    """
+    _ = _wire(firestore, ScriptedBrain())
+    await _new_project(api)
+    props = await _confirm_everything(api)
+    assert len(props) > 2, "the script needs more props than one tick may research"
+
+    _ = await api.post("/tick")
+
+    repo = FirestoreRepository(firestore)
+    items = await repo.list_items(PID)
+    researched = [i for i in items.values() if i.reference_band is not None]
+    assert len(researched) <= 3, "one pass does not try to research everything"
+
+
+async def test_nothing_is_lost_to_the_smaller_budget(
+    api: httpx.AsyncClient, firestore: AsyncClient
+) -> None:
+    """An item this pass did not reach stays due and is picked up next minute.
+
+    The bound is only defensible because of this. A cap that dropped work would
+    be trading a visible failure for an invisible one.
+    """
+    _ = _wire(firestore, ScriptedBrain())
+    await _new_project(api)
+    props = await _confirm_everything(api)
+
+    for _ in range(6):
+        _ = await api.post("/tick")
+
+    repo = FirestoreRepository(firestore)
+    items = await repo.list_items(PID)
+    assert len(items) == len(props)
+    assert all(i.reference_band is not None for i in items.values()), (
+        "every prop was researched, just over several passes"
+    )
+    assert all(i.status is ItemStatus.NEGOTIATING for i in items.values())

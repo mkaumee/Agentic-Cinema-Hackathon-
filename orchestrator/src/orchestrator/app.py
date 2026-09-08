@@ -566,7 +566,9 @@ async def tick(request: Request, project_id: str | None = None) -> TickResponse:
     for pid in project_ids:
         try:
             report = await services.loop.run_tick(
-                pid, limit=services.settings.tick_limit
+                pid,
+                limit=services.settings.tick_limit,
+                research_limit=services.settings.research_limit,
             )
         except Exception as exc:
             log.exception("tick failed", extra={"project_id": pid})

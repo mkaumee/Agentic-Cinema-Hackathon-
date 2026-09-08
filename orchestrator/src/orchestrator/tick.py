@@ -202,7 +202,25 @@ class TickLoop:
         # supplied only words needs no store at all.
         self._attachments = attachments
 
-    async def run_tick(self, project_id: str, *, limit: int = 50) -> TickReport:
+    async def run_tick(
+        self, project_id: str, *, limit: int = 50, research_limit: int = 3
+    ) -> TickReport:
+        """One pass over a project.
+
+        Two budgets, not one. `limit` is how many due negotiations may be
+        advanced; `research_limit` is how many items may be researched. They
+        used to be the same number, which meant "advance up to 50 negotiations"
+        also said "research up to 50 items" — and researching one item is a
+        reasoning call plus several web searches, by a wide margin the most
+        expensive thing this loop does.
+
+        Fifty of those cannot fit in a fifty-second request, so on the pass
+        after a producer confirmed a twenty-prop script Cloud Run killed the
+        tick at the wall. The rows it had claimed were then parked for the
+        lease, and everything behind them — including an opening a producer had
+        already pressed Send on — waited. Nothing errored; it simply took
+        minutes.
+        """
         now = await self._clock.advance(project_id)
         report = TickReport(sim_now=now)
 
@@ -235,7 +253,13 @@ class TickLoop:
 
         # Items first, so a negotiation opened by this pass gets its opening
         # email in the same pass rather than waiting a minute for the next one.
-        sourcing = await self._sourcing.run(now, limit=limit)
+        #
+        # Bounded far below `limit`, and that is the whole fix: nothing is lost
+        # to the smaller number, because an item this pass does not reach stays
+        # due and is picked up on the next one. A twenty-prop script is
+        # researched over a handful of ticks instead of in one pass that never
+        # finishes — and the sending step below still gets a turn.
+        sourcing = await self._sourcing.run(now, limit=research_limit)
         report.items_examined = sourcing.items_examined
         report.items_researched = sourcing.researched
         report.negotiations_opened = sourcing.negotiations_opened

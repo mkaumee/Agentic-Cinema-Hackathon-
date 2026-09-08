@@ -246,8 +246,26 @@ class Settings(BaseSettings):
     # -- loop -------------------------------------------------------------- #
 
     tick_limit: int = 50
-    """How many due negotiations one tick may take. Bounded so a tick that gets
-    killed has done a predictable amount of work."""
+    """How many due negotiations one tick may advance.
+
+    Only negotiations. This used to govern research as well, which meant one
+    number stood for two jobs of wildly different cost and the expensive one
+    silently inherited the cheap one's budget.
+    """
+
+    research_limit: int = 3
+    """How many items one tick may research.
+
+    Far below `tick_limit`, because researching a single item is a reasoning
+    call plus several web searches — the most expensive thing the loop does.
+    Fifty of them cannot fit in a fifty-second request, and Cloud Run killing
+    the attempt is what starved the sending step behind it.
+
+    Three fits comfortably with room for the rest of the pass. Nothing is lost
+    to the smaller number: an item not reached stays due and is picked up on
+    the next tick, so a twenty-prop script takes a handful of minutes instead
+    of one pass that never finishes.
+    """
 
     poll_query: str = "is:unread -from:me"
     """Gmail search for the by-hand inspection poll, and nothing else.
