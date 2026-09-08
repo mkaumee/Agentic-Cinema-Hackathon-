@@ -532,7 +532,10 @@ async def test_a_redelivered_reply_does_not_burn_a_round(harness: _Harness) -> N
 
     report = await harness.loop.run_tick(PID)
 
-    assert report.replies_skipped == 1
+    # Counted rather than pinned to a number: the thread also carries our own
+    # outbound, which is re-offered and skipped by the same check, so an exact
+    # total would move whenever the conversation gained a message.
+    assert report.replies_skipped >= 1
     assert report.replies_filed == 0
     messages = await harness.repo.list_messages(PID, "neg1")
     assert sum(1 for m in messages if m.gmail_message_id == reply.message_id) == 1
@@ -621,7 +624,10 @@ async def test_mail_for_an_unknown_thread_is_never_even_fetched(
 
     assert report.unmatched_replies == 0
     assert not report.errors
-    assert harness.mail.pending() == [foreign], "it must still be sitting unread"
+    # Our own outbound sits in the fake inbox too now, exactly as Gmail keeps
+    # it in the thread, so this asserts on the foreign message rather than on
+    # the whole list.
+    assert foreign in harness.mail.pending(), "it must still be sitting unread"
 
 
 class _ForgetfulRepository(FirestoreRepository):
@@ -1181,7 +1187,7 @@ async def test_a_reply_the_producer_already_opened_is_still_answered(
     # re-offering the whole thread every minute affordable.
     await harness.at(T0 + timedelta(hours=12))
     second = await harness.loop.run_tick(PID)
-    assert second.replies_skipped == 1
+    assert second.replies_skipped >= 1
     assert second.replies_filed == 0
 
 
@@ -1394,3 +1400,60 @@ async def test_without_a_redirect_the_seller_hears_from_us(
     _ = await harness.loop.run_tick(PID)
 
     assert harness.mail.sent[0]["to"] == "ahseng@example.invalid"
+
+
+async def test_the_producer_answering_from_their_own_address_is_heard(
+    harness: _Harness,
+) -> None:
+    """The demo setup, end to end: redirect to yourself, reply, get a counter.
+
+    The point of a redirect is to send to an address you own. When that is the
+    same account the agent sends from, Gmail labels your reply SENT — because
+    you sent it — and poll used to drop every SENT message as "ours". So the
+    one message the loop was waiting for was the one it threw away.
+
+    Here the reply comes back from the same address the opening went to, which
+    is exactly that case.
+    """
+    await harness.add_negotiation(floor=Money(amount=900))
+    record = await harness.repo.get_negotiation(PID, "neg1")
+    assert record is not None
+    record.recipient_override = "me@example.invalid"
+    await harness.repo.save_negotiation(PID, "neg1", record)
+
+    _ = await harness.loop.run_tick(PID)
+    thread = harness.mail.sent[0]["thread_id"]
+
+    _ = harness.mail.deliver(
+        thread_id=thread,
+        body="RM1,250 per day.",
+        from_email="me@example.invalid",
+    )
+    await harness.at(T0 + timedelta(hours=6))
+    report = await harness.loop.run_tick(PID)
+
+    assert report.replies_filed == 1, "the producer's own words were heard"
+    assert len(harness.mail.sent) > 1, "and answered"
+
+
+async def test_the_agent_does_not_answer_its_own_email(harness: _Harness) -> None:
+    """The thing the SENT filter was there for, kept by a durable record.
+
+    Gmail keeps our outbound in the same thread, so poll hands it back every
+    pass. Filing it would have the agent reading its own opening as a supplier
+    reply and negotiating with itself. What stops that is no longer a label: it
+    is that every outbound was filed under its Gmail message id, so
+    `_file_reply` recognises it and skips before the brain is ever called.
+    """
+    await harness.add_negotiation()
+    _ = await harness.loop.run_tick(PID)
+    sent_before = len(harness.mail.sent)
+
+    # Nothing is delivered here on purpose. The mailbox re-offers what we sent
+    # all by itself, which is what the real transport does — that is the whole
+    # point of the message being in the thread.
+    await harness.at(T0 + timedelta(hours=6))
+    report = await harness.loop.run_tick(PID)
+
+    assert report.replies_filed == 0, "our own message is not a supplier reply"
+    assert len(harness.mail.sent) == sent_before, "so nothing was answered"

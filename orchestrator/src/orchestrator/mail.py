@@ -129,6 +129,10 @@ class MailTransport(Protocol):
         ...
 
 
+AGENT_ADDRESS = "agent@example.invalid"
+"""Who the fake's own outbound appears to come from."""
+
+
 class InMemoryMailbox:
     """A transport with no network behind it.
 
@@ -185,6 +189,25 @@ class InMemoryMailbox:
                 # producer's file went out reads it with `in`.
                 "attachments": ", ".join(a.filename for a in attachments),
             }
+        )
+        # Our own outbound goes into the inbox too, because that is what the
+        # real transport does: Gmail keeps every message of a conversation in
+        # its thread, and `poll` fetches threads by id, so each pass re-offers
+        # what we sent. The fake not doing this was another way it was kinder
+        # than the thing it stands for — and it is how a SENT-labelled reply
+        # from the producer's own address got dropped in production while every
+        # test here passed. What stops the agent answering itself is
+        # `_file_reply` recognising the message id it filed, and that is only
+        # under test if the fake hands it back.
+        self._inbox.append(
+            RawInbound(
+                message_id=message_id,
+                rfc822_message_id=rfc822,
+                thread_id=resolved_thread,
+                from_email=AGENT_ADDRESS,
+                subject=subject,
+                body=body,
+            )
         )
         return SentMessage(
             message_id=message_id,

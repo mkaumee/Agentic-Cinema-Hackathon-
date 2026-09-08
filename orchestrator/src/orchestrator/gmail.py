@@ -464,17 +464,28 @@ class GmailTransport:
 
             for message in thread.get("messages") or []:
                 labels: list[str] = message.get("labelIds") or []
-                if "SENT" in labels:
-                    continue  # our own outbound, echoed back in the thread
 
-                # Deliberately *not* filtered on UNREAD any more. That label was
-                # the "already filed" marker, and it stopped being ours to rely
-                # on the day negotiations moved into the producer's own mailbox:
-                # they open the seller's reply — of course they do, it is their
-                # inbox — and the agent then never sees it. Nothing errors, the
-                # rounds run out, and the negotiation dies as though nobody
-                # answered. Filing dedupes on the Gmail message id we stored,
-                # which is a document we wrote and nobody else can clear.
+                # Neither UNREAD nor SENT is filtered here any more, and they
+                # were wrong for the same reason: both are Gmail's labels, and
+                # both stopped describing what we needed the moment
+                # negotiations moved into the producer's own mailbox.
+                #
+                # UNREAD was the "already filed" marker. The producer opens the
+                # seller's reply — of course they do, it is their inbox — and
+                # the agent never sees it again.
+                #
+                # SENT was the "this one is ours" marker. But the whole point
+                # of redirecting an opening is to send it to an address the
+                # producer owns, and when that is the same account the agent
+                # sends from, *their reply carries SENT too* — so the one
+                # message the agent was waiting for was the one it threw away.
+                # It then chased, timed out at 48 hours and died as though
+                # nobody had answered.
+                #
+                # Both are answered instead by a document we wrote: every
+                # outbound is filed under its Gmail message id, so `_file_reply`
+                # asks `has_message` and skips what we sent. Nobody else can
+                # clear that, and no label can lie about it.
                 received.append(self._to_inbound(message, thread_id))
                 if "UNREAD" in labels:
                     # A courtesy to the producer's inbox, not a mechanism.
