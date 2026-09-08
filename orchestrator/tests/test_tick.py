@@ -13,6 +13,7 @@ The two that matter most:
 """
 
 import asyncio
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import final, override
 
@@ -32,7 +33,13 @@ from google.auth.exceptions import RefreshError
 from google.cloud.firestore_v1 import AsyncClient
 from orchestrator.attachments import StoredFile
 from orchestrator.clock import ClockState, FrozenRealTime, SimClock
-from orchestrator.mail import InMemoryMailbox, MailTransport, RawInbound
+from orchestrator.mail import (
+    Attachment,
+    InMemoryMailbox,
+    MailTransport,
+    RawInbound,
+    SentMessage,
+)
 from orchestrator.mailboxes import SingleMailbox
 from orchestrator.records import (
     ItemRecord,
@@ -466,8 +473,10 @@ async def test_a_tick_killed_halfway_leaves_the_rest_still_due(
             f"neg{index}", due=T0 - timedelta(hours=index + 1)
         )
 
+    # A send budget beyond what this test sends, because it is about what a
+    # killed tick leaves behind — not about how much post goes out in a minute.
     with pytest.raises(_Reaped):
-        _ = await harness.loop.run_tick(PID)
+        _ = await harness.loop.run_tick(PID, send_limit=50)
 
     # Two negotiations got their opening mail out before the process died.
     assert len(harness.mail.sent) == 2
@@ -504,7 +513,9 @@ async def test_one_failing_negotiation_does_not_stop_the_others(
             f"neg{index}", due=T0 - timedelta(hours=index + 1)
         )
 
-    report = await harness.loop.run_tick(PID)
+    # Budget raised past what this sends: the subject here is that one
+    # broken row does not stop the others, not how many go out a minute.
+    report = await harness.loop.run_tick(PID, send_limit=50)
 
     assert report.messages_sent == 4, "only the broken one is skipped"
     assert len(report.errors) == 1
@@ -1457,3 +1468,126 @@ async def test_the_agent_does_not_answer_its_own_email(harness: _Harness) -> Non
 
     assert report.replies_filed == 0, "our own message is not a supplier reply"
     assert len(harness.mail.sent) == sent_before, "so nothing was answered"
+
+
+# --------------------------------------------------------------------------- #
+# Living inside somebody else's rate limits
+# --------------------------------------------------------------------------- #
+
+
+class _RationedMailbox(InMemoryMailbox):
+    """Refuses every send with the error Gmail actually returns when throttled."""
+
+    @override
+    async def send(
+        self,
+        *,
+        to: str,
+        subject: str,
+        body: str,
+        thread_id: str = "",
+        in_reply_to: str = "",
+        references: str = "",
+        attachments: Sequence[Attachment] = (),
+    ) -> SentMessage:
+        raise RuntimeError(
+            '<HttpError 403 when requesting .../messages/send returned "Quota '
+            "exceeded for quota metric 'Total Query Cost' and limit 'Units per "
+            "minute per user'\". Details: \"[{'domain': 'usageLimits', "
+            "'reason': 'rateLimitExceeded'}]\">"
+        )
+
+
+async def test_a_rate_limit_comes_back_in_a_minute_not_a_quarter_hour(
+    firestore: AsyncClient,
+) -> None:
+    """A quota error is Google being busy, not this negotiation being broken.
+
+    The row was claimed before the send, so it already carries the fifteen
+    minute lease. Left there, a limit that clears in seconds stops the
+    negotiation for a quarter of an hour — and the retry spends another
+    reasoning call and another send into the same full quota.
+    """
+    harness = _Harness(firestore)
+    harness.mail = _RationedMailbox()
+    harness.loop = TickLoop(
+        harness.repo, harness.clock, ScriptedBrain(), SingleMailbox(harness.mail)
+    )
+    await harness.setup_project()
+    await harness.add_negotiation()
+
+    report = await harness.loop.run_tick(PID)
+
+    assert report.quota_backoffs == 1
+    assert report.errors == [], "nothing is wrong with this negotiation"
+
+    record = await harness.repo.get_negotiation(PID, "neg1")
+    assert record is not None
+    assert record.next_action_due_at is not None
+    waiting = (record.next_action_due_at - T0).total_seconds() / 60
+    assert waiting < 5, f"parked for {waiting:.0f} minutes, expected about one"
+
+
+async def test_a_real_failure_still_backs_off_hard(firestore: AsyncClient) -> None:
+    """The other half. A broken row must not retry every minute forever.
+
+    Anything the detector does not recognise keeps the claim lease, so a
+    negotiation that can never succeed cannot spin and burn a reasoning call
+    each pass.
+    """
+
+    class _Broken(InMemoryMailbox):
+        @override
+        async def send(
+            self,
+            *,
+            to: str,
+            subject: str,
+            body: str,
+            thread_id: str = "",
+            in_reply_to: str = "",
+            references: str = "",
+            attachments: Sequence[Attachment] = (),
+        ) -> SentMessage:
+            raise RuntimeError("Delegation denied for this mailbox")
+
+    harness = _Harness(firestore)
+    harness.mail = _Broken()
+    harness.loop = TickLoop(
+        harness.repo, harness.clock, ScriptedBrain(), SingleMailbox(harness.mail)
+    )
+    await harness.setup_project()
+    await harness.add_negotiation()
+
+    report = await harness.loop.run_tick(PID)
+
+    assert report.quota_backoffs == 0
+    assert len(report.errors) == 1
+
+    record = await harness.repo.get_negotiation(PID, "neg1")
+    assert record is not None
+    assert record.next_action_due_at is not None
+    waiting = (record.next_action_due_at - T0).total_seconds() / 60
+    assert waiting > 10, "a broken row keeps the full lease"
+
+
+async def test_one_tick_does_not_empty_the_outbox(harness: _Harness) -> None:
+    """Three sellers per item all fall due together, and Gmail bills by minute.
+
+    Sent back to back they were refused as a batch — three rejections inside
+    one second on the deployment. The overflow is left *due* rather than
+    claimed, so the next tick takes it: claiming and skipping would park it for
+    the lease, which is the failure this whole area keeps having.
+    """
+    for index in range(4):
+        await harness.add_negotiation(f"neg{index}", item_id="item1")
+
+    first = await harness.loop.run_tick(PID)
+
+    assert first.messages_sent == 2, "the budget held"
+
+    still_due = await harness.repo.due_negotiations(T0)
+    assert len(still_due) == 2, "the rest are due, not parked"
+
+    second = await harness.loop.run_tick(PID)
+    assert second.messages_sent == 2, "and go out on the next pass"

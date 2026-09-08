@@ -40,7 +40,14 @@ from orchestrator.tick import TickLoop
 PID = "nasi-lemak-nights"
 REAL0 = datetime(2026, 8, 12, 14, 0, tzinfo=UTC)
 
-SETTINGS = Settings(_env_file=None, gcp_project="demo-cinema")  # pyright: ignore[reportCallIssue]
+# A send budget past anything here: these tests are about a screenplay
+# becoming negotiations, not about pacing post against Gmail's per-minute
+# cost limit. The pacing has its own tests in test_tick.py.
+SETTINGS = Settings(
+    _env_file=None,  # pyright: ignore[reportCallIssue]
+    gcp_project="demo-cinema",
+    send_limit=50,
+)
 
 SCRIPT = """INT. BAR - NIGHT
 

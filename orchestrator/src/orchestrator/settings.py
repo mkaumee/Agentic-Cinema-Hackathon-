@@ -253,6 +253,21 @@ class Settings(BaseSettings):
     silently inherited the cheap one's budget.
     """
 
+    send_limit: int = 2
+    """How many messages one tick may post.
+
+    Gmail bills a send heavily against a per-minute, per-user cost limit, and
+    this loop is bursty by construction: three sellers are approached per item
+    and all three become due in the same instant. Without a budget one pass
+    fires them back to back and Gmail refuses the lot — which is exactly what
+    the deployment logged, three rejections inside one second.
+
+    Two per minute is a hundred and twenty an hour, far more than a production
+    generates, and it reads as a person working through their post rather than
+    a machine emptying a queue. Nothing is lost: rows over budget are left due
+    and taken by the next tick.
+    """
+
     research_limit: int = 3
     """How many items one tick may research.
 

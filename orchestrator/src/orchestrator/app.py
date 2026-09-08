@@ -348,6 +348,10 @@ class TickResult(BaseModel):
     messages_sent: int
     openings_drafted: int
     escalated: int
+    quota_backoffs: int
+    bounced: int
+    listings_parked: int
+    stood_down: int
     errors: list[str]
 
     @classmethod
@@ -366,6 +370,14 @@ class TickResult(BaseModel):
             claims_lost=report.claims_lost,
             messages_sent=report.messages_sent,
             openings_drafted=report.openings_drafted,
+            # Counted on the report since bounces, listings and stand-downs
+            # landed, and never carried across to here — so none of them have
+            # ever appeared in Cloud Logging. A counter nobody can read is a
+            # counter that does not exist.
+            quota_backoffs=report.quota_backoffs,
+            bounced=report.bounced,
+            listings_parked=report.listings_parked,
+            stood_down=report.stood_down,
             escalated=report.escalated,
             errors=report.errors,
         )
@@ -569,6 +581,7 @@ async def tick(request: Request, project_id: str | None = None) -> TickResponse:
                 pid,
                 limit=services.settings.tick_limit,
                 research_limit=services.settings.research_limit,
+                send_limit=services.settings.send_limit,
             )
         except Exception as exc:
             log.exception("tick failed", extra={"project_id": pid})

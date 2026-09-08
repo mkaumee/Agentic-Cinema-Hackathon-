@@ -52,6 +52,7 @@ from orchestrator.bounces import bounce_note, looks_like_a_bounce
 from orchestrator.clock import SimClock
 from orchestrator.mail import Attachment, MailTransport, RawInbound
 from orchestrator.mailboxes import MailboxProvider, is_expired_credential
+from orchestrator.quota import looks_like_a_quota_error
 from orchestrator.records import (
     ITEM_TERMINAL_STATUSES,
     MessageRecord,
@@ -80,6 +81,16 @@ production, and a suggestion of zero would spin the loop.
 
 SILENCE_HOURS = 48.0
 """Simulated hours of supplier silence before the loop raises SILENCE_TIMEOUT."""
+
+QUOTA_BACKOFF_HOURS = 1.0 / 60.0
+"""How long to wait out a rate limit. A minute — one tick.
+
+Not the claim lease. A row that fails mid-pass keeps the lease it was claimed
+with, which is fifteen minutes, and for a quota error that is a stall rather
+than a pause: Google was busy for a moment and the negotiation stopped for a
+quarter of an hour. Long enough for the limit to clear, short enough that the
+next scheduled tick simply picks it back up.
+"""
 
 CLAIM_LEASE_HOURS = 0.25
 """How far ahead claiming a row parks it before anyone may retry.
@@ -140,6 +151,14 @@ class TickReport:
 
     stood_down: int = 0
     """Negotiations stopped because the prop was already bought."""
+
+    quota_backoffs: int = 0
+    """Rows that stepped back because Google was rate limiting us.
+
+    Counted apart from `errors`, because nothing is wrong. A loop waiting on a
+    quota and a loop with nothing to do look identical from outside, and
+    telling them apart took a dig through Cloud Logging once already.
+    """
 
     openings_drafted: int = 0
     """Opening emails written and left for a person to read.
@@ -203,7 +222,12 @@ class TickLoop:
         self._attachments = attachments
 
     async def run_tick(
-        self, project_id: str, *, limit: int = 50, research_limit: int = 3
+        self,
+        project_id: str,
+        *,
+        limit: int = 50,
+        research_limit: int = 3,
+        send_limit: int = 2,
     ) -> TickReport:
         """One pass over a project.
 
@@ -275,6 +299,19 @@ class TickLoop:
             return report
 
         for due in await self._repo.due_negotiations(now, limit=limit):
+            if report.messages_sent >= send_limit:
+                # Enough post for one minute. Three sellers are approached per
+                # item and all three become due together, so without this a
+                # single pass fires them back to back and Gmail refuses the
+                # lot on its per-minute cost limit — seen on the deployment,
+                # three sends inside the same second, all rejected.
+                #
+                # The rows left over are untouched and therefore still due:
+                # they have not been claimed, so the next tick takes them.
+                # Claiming and then skipping would park them for the lease,
+                # which is the trap this whole change is about.
+                break
+
             try:
                 await self._advance_negotiation(due, mail, now, report)
             except Exception as exc:
@@ -285,9 +322,30 @@ class TickLoop:
                 # Safe to swallow only because the row has been claimed by now:
                 # it is parked for the lease rather than retried on every tick,
                 # so a permanently broken negotiation cannot spin.
-                report.errors.append(f"{due.negotiation_id}: {exc}")
+                if looks_like_a_quota_error(exc):
+                    await self._back_off(due, now, report)
+                else:
+                    report.errors.append(f"{due.negotiation_id}: {exc}")
 
         return report
+
+    async def _back_off(
+        self, due: DueNegotiation, now: datetime, report: TickReport
+    ) -> None:
+        """Google was busy. Come back in a minute, not in fifteen.
+
+        The row was claimed before the call that failed, so it is already parked
+        for the claim lease — which for a rate limit is a stall rather than a
+        pause, and one that costs another reasoning call and another send when
+        it finally does come back. This pulls the due date in to the next tick.
+
+        Not recorded as an error: nothing about this negotiation is wrong.
+        """
+        record = due.record
+        record.next_action_due_at = now + timedelta(hours=QUOTA_BACKOFF_HOURS)
+        record.updated_at = now
+        await self._repo.save_negotiation(due.project_id, due.negotiation_id, record)
+        report.quota_backoffs += 1
 
     # ------------------------------------------------------------------ #
     # Inbound
