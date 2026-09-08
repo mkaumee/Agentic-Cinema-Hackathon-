@@ -15,7 +15,13 @@ import { explain } from "@/authErrors";
 import { enrolAsProducer } from "@/chat/api";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
-import { auth, signIn, signOutOfEverything, USE_EMULATOR } from "@/firebase";
+import {
+  auth,
+  resetSession,
+  signIn,
+  signOutOfEverything,
+  USE_EMULATOR,
+} from "@/firebase";
 import type { User } from "@/firebase";
 import { useItems, useNegotiations, useProjects, useSuppliers } from "@/hooks/useProject";
 import type { ProjectRow } from "@/hooks/useProject";
@@ -35,6 +41,8 @@ export function App() {
   // `auth/cancelled-popup-request`. The person then sees an error for having
   // done nothing wrong.
   const [signingIn, setSigningIn] = useState(false);
+  // Whether the wait has gone on long enough to be a fault rather than a load.
+  const [stuck, setStuck] = useState(false);
 
   useEffect(
     // Fires once with the restored session before any interaction, which is
@@ -47,13 +55,19 @@ export function App() {
     [],
   );
 
+  useEffect(() => {
+    if (ready) return;
+    // The callback above normally arrives within a moment. When it does not it
+    // never does, and the screen had no timeout and no button — so a session
+    // the SDK cannot resolve left somebody on a spinner with no way out and
+    // nothing to read. That is the state this is for: seen signing in fine on
+    // a second device while the first hung forever.
+    const timer = setTimeout(() => setStuck(true), STUCK_AFTER_MS);
+    return () => clearTimeout(timer);
+  }, [ready]);
+
   if (!ready) {
-    return (
-      <Centred>
-        <Spinner className="text-muted-foreground" />
-        <p className="text-sm text-muted-foreground">Checking sign-in…</p>
-      </Centred>
-    );
+    return <Waking stuck={stuck} />;
   }
 
   if (user === null) {
@@ -92,6 +106,50 @@ export function App() {
     <Router>
       <SignedIn user={user} />
     </Router>
+  );
+}
+
+/** How long the wait can be an ordinary load before it is a fault.
+ *
+ * Long enough not to flash an alarming message at a slow connection, short
+ * enough that nobody concludes the app is simply broken and closes the tab. */
+const STUCK_AFTER_MS = 6000;
+
+export function Waking({ stuck }: { stuck: boolean }) {
+  const [clearing, setClearing] = useState(false);
+
+  return (
+    <Centred>
+      <Spinner className="text-muted-foreground" />
+      <p className="text-sm text-muted-foreground">Checking sign-in…</p>
+      {stuck && (
+        <>
+          <p className="max-w-md text-sm text-muted-foreground">
+            This is taking longer than it should. Usually it means the sign-in
+            stored in <em>this</em> browser has gone bad — the same account
+            normally works fine elsewhere, which is the giveaway.
+            {USE_EMULATOR && (
+              <> This build talks to the local emulators; check they are running.</>
+            )}
+          </p>
+          <Button
+            loading={clearing}
+            onClick={() => {
+              setClearing(true);
+              void resetSession().finally(() => {
+                window.location.reload();
+              });
+            }}
+          >
+            {clearing ? "Clearing…" : "Clear it and start again"}
+          </Button>
+          <p className="max-w-md text-xs text-muted-foreground">
+            Nothing on the production is touched. This only throws away what
+            this browser remembered about being signed in.
+          </p>
+        </>
+      )}
+    </Centred>
   );
 }
 
