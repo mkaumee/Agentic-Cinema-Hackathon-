@@ -985,3 +985,47 @@ async def test_a_producer_cannot_approve_on_somebody_elses_production(
 
     assert response.status_code == 404, "and not a 403, which would confirm it exists"
     assert await OrdersRepository(orders_firestore).get_purchase_order("mirror") is None
+
+
+async def test_a_floor_gives_the_agent_room_to_use_it(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    """ "Push for 10% less" has to leave the agent something to push with.
+
+    Almost every negotiation reaches a producer with its budget spent —
+    ROUNDS_EXHAUSTED is one of the two usual reasons it stopped, and even a
+    good quote tends to arrive at 4 of 4. Handing it back without moving the
+    ceiling asks the agent to try again while telling it there are no attempts
+    left, and the brain, reading exactly those two numbers out of its context,
+    escalates straight back without writing to anyone. The button appears to do
+    nothing, which is what was reported.
+
+    The count is not rewound. `rounds_used` is what the transcript and the
+    briefing report, and resetting it would have the record claim a shorter
+    conversation than the one that happened.
+    """
+    repo = FirestoreRepository(firestore)
+    await _seed(repo)
+    producer = await _adopt(firestore, tokens)
+
+    spent = await repo.get_negotiation(PROJECT, "neg1")
+    assert spent is not None
+    spent.rounds_used = spent.max_rounds
+    await repo.save_negotiation(PROJECT, "neg1", spent)
+
+    response = await api.post(
+        "/negotiations/neg1/floor",
+        json={
+            "project_id": PROJECT,
+            "floor_price": {"amount": 600, "currency": "MYR"},
+        },
+        headers=_as(producer),
+    )
+
+    assert response.status_code == 200, response.text
+    record = await repo.get_negotiation(PROJECT, "neg1")
+    assert record is not None
+    assert record.max_rounds > record.rounds_used, "somewhere left to go"
+    assert record.rounds_used == 4, "and an honest account of what already happened"
+    assert record.floor_price is not None
+    assert record.floor_price.amount == 600

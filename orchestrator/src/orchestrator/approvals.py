@@ -120,6 +120,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
 
 app = FastAPI(title="Greenlit approvals", lifespan=lifespan)
 
+FLOOR_EXTRA_ROUNDS = 2
+"""How many more attempts a producer's floor buys.
+
+Two, not one: the first is the counter carrying the new ceiling, and the second
+leaves the agent somewhere to go when the seller answers it. One would make the
+reply itself the last word, which is a strange shape for a conversation the
+producer has just asked to continue.
+"""
+
 # The panel runs on Firebase Hosting and this service on Cloud Run — different
 # origins, so every approval is a cross-origin POST and the browser sends a
 # preflight first. Without this the Approve button fails before the request
@@ -423,6 +432,21 @@ async def set_floor(
     record.state = apply_event(record.state, NegotiationEvent.HUMAN_RETURNED_WITH_FLOOR)
     record.floor_price = body.floor_price
     record.escalation_reason = ""
+
+    # Room to actually do it. Almost every negotiation reaches the producer
+    # with its budget spent — ROUNDS_EXHAUSTED is one of the two usual reasons
+    # it stopped, and even a good quote tends to arrive at 4 of 4 — so handing
+    # it back without extending the budget asks the agent to go and try again
+    # while telling it, in the same breath, that it has no attempts left. The
+    # brain reads `rounds_used` and `max_rounds` from the context it is given
+    # and does the sensible thing: escalates straight back, without writing to
+    # anyone. From the producer's side the button does nothing at all.
+    #
+    # The ceiling moves rather than the count resetting. `rounds_used` is what
+    # the transcript and the briefing report, and rewinding it would make the
+    # record claim a shorter conversation than the one that happened.
+    record.max_rounds = record.rounds_used + FLOOR_EXTRA_ROUNDS
+
     record.next_action_due_at = now
     record.updated_at = now
     await services.repo.save_negotiation(body.project_id, negotiation_id, record)
