@@ -141,6 +141,11 @@ ALLOWED_ORIGINS: list[str] = []
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
+    # Only what this service routes, which really is just these — it has no
+    # PATCH or DELETE. Kept explicit rather than widened to match the api
+    # service: this is the one that can spend money, and its surface should
+    # stay the smallest thing that works. See the note in api.py for what
+    # happens when this list and the routes disagree.
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )

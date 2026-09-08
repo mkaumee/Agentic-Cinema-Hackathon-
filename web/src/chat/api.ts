@@ -469,6 +469,20 @@ const detailOf = async (reply: Response): Promise<string> => {
   try {
     const body = (await reply.json()) as { detail?: unknown };
     if (typeof body.detail === "string") return body.detail;
+    // FastAPI's validation errors arrive as a *list* of objects, not a string,
+    // so this fell through to the bare status line — every 422 in the whole
+    // panel read "422 Unprocessable Entity", which tells somebody they got
+    // something wrong and not what.
+    if (Array.isArray(body.detail)) {
+      const said = body.detail
+        .map((entry) =>
+          typeof entry === "object" && entry !== null && "msg" in entry
+            ? String((entry as { msg: unknown }).msg)
+            : "",
+        )
+        .filter((msg) => msg !== "");
+      if (said.length > 0) return said.join("; ");
+    }
   } catch {
     // A non-JSON body from a proxy or a 502 page. The status is still useful.
   }

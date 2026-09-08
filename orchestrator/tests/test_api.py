@@ -39,6 +39,7 @@ from cinema_contracts import (
 )
 from cinema_contracts.testing import ScriptedBrain
 from conftest import TokenMinter
+from fastapi.middleware.cors import CORSMiddleware
 from firebase_admin import auth as firebase_auth
 from google.cloud.firestore_v1 import AsyncClient
 from orchestrator.api import MAX_REASON, ApiServices, app, build_api_services
@@ -1888,3 +1889,36 @@ async def test_a_stranger_cannot_drop_or_redirect_an_opening(
     assert record is not None
     assert record.state is NegotiationState.DRAFTED, "not dropped"
     assert record.recipient_override == "", "and not redirected"
+
+
+def test_cors_allows_every_method_this_app_routes() -> None:
+    """The list and the routes have to agree, and once they did not.
+
+    ``allow_methods`` said GET/POST/OPTIONS while the app served PATCH and
+    DELETE. Nothing failed in any test, because a test client does not do CORS
+    — but in a browser the *preflight* is refused, so the real request is never
+    sent, nothing reaches a server log, and the page can only report fetch's
+    own "Failed to fetch". Renaming a production, deleting one and editing an
+    opening email were all inert on the deployment for as long as they existed.
+
+    Derived from ``app.routes`` rather than written out, so adding a verb
+    cannot silently leave this behind.
+    """
+    routed: set[str] = set()
+    for route in app.routes:
+        routed |= getattr(route, "methods", set()) or set()
+    # HEAD comes free with GET and is never sent by this panel.
+    routed.discard("HEAD")
+
+    cors = [m for m in _cors_methods() if m != "OPTIONS"]
+
+    assert routed <= set(cors), f"routed but not allowed by CORS: {routed - set(cors)}"
+    assert "OPTIONS" in _cors_methods(), "the preflight itself has to be allowed"
+
+
+def _cors_methods() -> list[str]:
+    for middleware in app.user_middleware:
+        if middleware.cls is CORSMiddleware:
+            allowed = cast(list[str], middleware.kwargs["allow_methods"])
+            return list(allowed)
+    raise AssertionError("no CORS middleware on the api app")

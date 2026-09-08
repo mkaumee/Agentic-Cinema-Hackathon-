@@ -191,10 +191,22 @@ app = FastAPI(title="Greenlit API", lifespan=lifespan)
 # rather than read at import, because settings are built once at startup.
 ALLOWED_ORIGINS: list[str] = []
 
+# Every method this app actually routes, not the two anyone thought of.
+#
+# This list said GET/POST/OPTIONS while the app served PATCH and DELETE, and
+# the failure is silent in the worst way: a browser refuses the *preflight*, so
+# the real request is never sent, nothing reaches a log, and the only thing the
+# page can report is fetch's own "Failed to fetch". Renaming a production,
+# deleting one, and editing an opening email were all inert on the deployment
+# while working perfectly against a test client — because a test client does
+# not do CORS.
+#
+# `test_cors_allows_every_method_this_app_routes` derives the set from
+# `app.routes`, so a new verb cannot be added without this following.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
 
