@@ -52,6 +52,15 @@ export interface ReferenceBand {
   source_urls?: string[];
 }
 
+/** One shop page selling this item, ready to click. */
+export interface Listing {
+  title?: string;
+  url?: string;
+  price?: Money;
+  seller?: string;
+  in_stock?: boolean;
+}
+
 /** A line of the screenplay this prop was found in — the evidence a producer
  * checks the agent against, so it belongs on screen and not behind a link. */
 export interface SceneMention {
@@ -69,11 +78,25 @@ export interface Item {
   scenes?: string[];
   mentions?: SceneMention[];
   reference_band?: ReferenceBand;
+  /** Sellers research found for this item. Written with the item, after the
+   * supplier documents themselves. */
+  supplier_ids?: string[];
   status?: string;
   floor_price?: Money;
   chosen_quote?: Quote;
-  updated_at?: Timestamp;
   next_action_due_at?: Timestamp;
+  /** When this item was last written. Dates the restored confirmation card, so
+   * it sorts into the transcript where the script was read rather than jumping
+   * to the bottom on every snapshot. */
+  updated_at?: Timestamp;
+  /** BUY or NEGOTIATE — a shop page, or a person to write to. */
+  route?: string;
+  listings?: Listing[];
+  /** Set once the producer says the shop checkout actually completed.
+   * Approving a listing only records that they were sent to a shop. */
+  purchase_confirmed_at?: Timestamp;
+  /** What they said when it did not go through. */
+  purchase_note?: string;
 }
 
 export interface Negotiation {
@@ -91,6 +114,23 @@ export interface Negotiation {
   last_outbound_at?: Timestamp;
   escalation_reason?: string;
   latest_reasoning?: string;
+  /** A shop page, not a conversation.
+   *
+   * The marker every listing-aware branch reads. A field rather than a
+   * particular `escalation_reason`, because a dozen places need to tell a
+   * listing from a negotiated quote and a reason string only one of them
+   * happens to check is a convention waiting to be forgotten. */
+  listing_url?: string;
+
+  draft_subject?: string;
+  draft_body?: string;
+  /** Unset while the opening email is still waiting to be read and released. */
+  opening_released_at?: Timestamp;
+  created_at?: Timestamp;
+  updated_at?: Timestamp;
+  /** Send to this address instead of the seller's. Set from the openings card
+   * before release, so a demo can be driven from an inbox you own. */
+  recipient_override?: string;
 }
 
 export interface Supplier {
@@ -99,6 +139,9 @@ export interface Supplier {
   email?: string;
   source_url?: string;
   verified?: boolean;
+  /** Set when this is a shop rather than a person. Its presence is the marker;
+   * `email` is empty for these, which is what keeps them out of the mail path. */
+  listing_url?: string;
 }
 
 export interface Message {
@@ -167,11 +210,31 @@ export const useSuppliers = (projectId: string) =>
  * Returns nothing while signed out rather than erroring — that is a state the
  * shell renders, not a failure.
  */
-export function useProjects(): { ids: string[]; error: string } {
-  const [state, setState] = useState<{ ids: string[]; error: string }>({
-    ids: [],
-    error: "",
-  });
+/** One production, as the rail lists it. */
+export interface ProjectRow {
+  id: string;
+  /** What the producer calls it. Empty on productions made before titles were
+   * shown, which is why every caller falls back to the id. */
+  title: string;
+}
+
+export function useProjects(): {
+  rows: ProjectRow[];
+  ids: string[];
+  error: string;
+  loading: boolean;
+} {
+  // Starts loading, unlike `useCollection` which is handed a project id it can
+  // check. Here there is nothing to check: until the auth observer fires there
+  // is no user, and until the first snapshot lands "no productions" and "not
+  // asked yet" are the same empty array. Telling them apart is the whole
+  // reason this flag exists — a producer who owns three productions should not
+  // be shown "none yet" on the way in.
+  const [state, setState] = useState<{
+    rows: ProjectRow[];
+    error: string;
+    loading: boolean;
+  }>({ rows: [], error: "", loading: true });
 
   useEffect(() => {
     // Same leak as useMailbox had: what an auth observer returns is discarded,
@@ -186,13 +249,23 @@ export function useProjects(): { ids: string[]; error: string } {
     const stopAuth = onAuthStateChanged(auth, (user) => {
       close();
       if (user === null) {
-        setState({ ids: [], error: "" });
+        // Signed out is an answer, not a wait.
+        setState({ rows: [], error: "", loading: false });
         return;
       }
+      setState({ rows: [], error: "", loading: true });
       stopSnapshot = onSnapshot(
         query(collection(db, "projects"), where("owner_uid", "==", user.uid)),
-        (snap) => setState({ ids: snap.docs.map((d) => d.id), error: "" }),
-        (cause) => setState({ ids: [], error: cause.message }),
+        (snap) =>
+          setState({
+            rows: snap.docs.map((d) => ({
+              id: d.id,
+              title: String((d.data() as { title?: string }).title ?? ""),
+            })),
+            error: "",
+            loading: false,
+          }),
+        (cause) => setState({ rows: [], error: cause.message, loading: false }),
       );
     });
 
@@ -202,7 +275,10 @@ export function useProjects(): { ids: string[]; error: string } {
     };
   }, []);
 
-  return state;
+  // `ids` alongside `rows` because most callers only ever need to know which
+  // production is selected, and threading a pair of arrays through them all to
+  // save one `map` would be the tail wagging the dog.
+  return { ...state, ids: state.rows.map((r) => r.id) };
 }
 
 /**
@@ -328,7 +404,7 @@ export function useMessages(projectId: string, negotiationId: string) {
 export function useAllMessages(
   projectId: string,
   negotiationIds: string[],
-): Record<string, Message[]> {
+): { rows: Record<string, Message[]>; loading: boolean } {
   const [byNegotiation, setByNegotiation] = useState<Record<string, Message[]>>({});
   const key = negotiationIds.join(",");
 
@@ -364,7 +440,15 @@ export function useAllMessages(
     return () => stops.forEach((stop) => stop());
   }, [projectId, key]);
 
-  return byNegotiation;
+  // Every subscription writes its own key on its first snapshot, including the
+  // failure path, so a short count means at least one negotiation has not
+  // reported yet. Worth telling the transcript about: this is the window where
+  // it has negotiations but no correspondence, which looks exactly like a
+  // production nobody has uploaded a script to.
+  const expected = key === "" ? 0 : key.split(",").length;
+  const loading = expected > 0 && Object.keys(byNegotiation).length < expected;
+
+  return { rows: byNegotiation, loading };
 }
 
 export function useItem(projectId: string, itemId: string) {

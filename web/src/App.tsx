@@ -12,10 +12,19 @@ import { useEffect, useState } from "react";
 import { NavLink, Route, HashRouter as Router, Routes } from "react-router-dom";
 
 import { explain } from "@/authErrors";
+import { enrolAsProducer } from "@/chat/api";
 import { Button } from "@/components/ui/button";
-import { auth, signIn, signOutOfEverything, USE_EMULATOR } from "@/firebase";
+import { Spinner } from "@/components/ui/spinner";
+import {
+  auth,
+  resetSession,
+  signIn,
+  signOutOfEverything,
+  USE_EMULATOR,
+} from "@/firebase";
 import type { User } from "@/firebase";
 import { useItems, useNegotiations, useProjects, useSuppliers } from "@/hooks/useProject";
+import type { ProjectRow } from "@/hooks/useProject";
 import { Breakdown } from "@/screens/Breakdown";
 import { Chat } from "@/screens/Chat";
 import { DebugPanel } from "@/screens/DebugPanel";
@@ -26,6 +35,14 @@ export function App() {
   const [user, setUser] = useState<User | null>(null);
   const [ready, setReady] = useState(false);
   const [error, setError] = useState("");
+  // This did not exist, and it was a bug rather than missing polish: signing
+  // in opens a Google popup, and a button that looks unpressed gets pressed
+  // again — which opens a second popup and cancels the first with
+  // `auth/cancelled-popup-request`. The person then sees an error for having
+  // done nothing wrong.
+  const [signingIn, setSigningIn] = useState(false);
+  // Whether the wait has gone on long enough to be a fault rather than a load.
+  const [stuck, setStuck] = useState(false);
 
   useEffect(
     // Fires once with the restored session before any interaction, which is
@@ -38,8 +55,19 @@ export function App() {
     [],
   );
 
+  useEffect(() => {
+    if (ready) return;
+    // The callback above normally arrives within a moment. When it does not it
+    // never does, and the screen had no timeout and no button — so a session
+    // the SDK cannot resolve left somebody on a spinner with no way out and
+    // nothing to read. That is the state this is for: seen signing in fine on
+    // a second device while the first hung forever.
+    const timer = setTimeout(() => setStuck(true), STUCK_AFTER_MS);
+    return () => clearTimeout(timer);
+  }, [ready]);
+
   if (!ready) {
-    return <Centred>Checking sign-in…</Centred>;
+    return <Waking stuck={stuck} />;
   }
 
   if (user === null) {
@@ -51,12 +79,23 @@ export function App() {
           negotiates with sellers over days. It never buys anything — you do.
         </p>
         <Button
+          loading={signingIn}
           onClick={() => {
             setError("");
-            void signIn().catch((cause: unknown) => setError(explain(cause)));
+            setSigningIn(true);
+            void signIn()
+              // Being signed in is enough to be a producer here, and this is
+              // where that gets claimed. It refreshes the token itself, so the
+              // very next call carries the role — no sign out and back in.
+              .then(() => enrolAsProducer())
+              .catch((cause: unknown) => setError(explain(cause)))
+              // The popup resolving does not mean this component unmounts:
+              // `onAuthStateChanged` does that, one tick later. Clearing here
+              // keeps the button live if sign-in was dismissed instead.
+              .finally(() => setSigningIn(false));
           }}
         >
-          Sign in with Google
+          {signingIn ? "Waiting for Google…" : "Sign in with Google"}
         </Button>
         {error !== "" && <p className="max-w-md text-sm text-destructive">{error}</p>}
       </Centred>
@@ -70,14 +109,75 @@ export function App() {
   );
 }
 
+/** How long the wait can be an ordinary load before it is a fault.
+ *
+ * Long enough not to flash an alarming message at a slow connection, short
+ * enough that nobody concludes the app is simply broken and closes the tab. */
+const STUCK_AFTER_MS = 6000;
+
+export function Waking({ stuck }: { stuck: boolean }) {
+  const [clearing, setClearing] = useState(false);
+
+  return (
+    <Centred>
+      <Spinner className="text-muted-foreground" />
+      <p className="text-sm text-muted-foreground">Checking sign-in…</p>
+      {stuck && (
+        <>
+          <p className="max-w-md text-sm text-muted-foreground">
+            This is taking longer than it should. Usually it means the sign-in
+            stored in <em>this</em> browser has gone bad — the same account
+            normally works fine elsewhere, which is the giveaway.
+            {USE_EMULATOR && (
+              <> This build talks to the local emulators; check they are running.</>
+            )}
+          </p>
+          <Button
+            loading={clearing}
+            onClick={() => {
+              setClearing(true);
+              void resetSession().finally(() => {
+                window.location.reload();
+              });
+            }}
+          >
+            {clearing ? "Clearing…" : "Clear it and start again"}
+          </Button>
+          <p className="max-w-md text-xs text-muted-foreground">
+            Nothing on the production is touched. This only throws away what
+            this browser remembered about being signed in.
+          </p>
+        </>
+      )}
+    </Centred>
+  );
+}
+
 function SignedIn({ user }: { user: User }) {
-  const { ids, error: projectsError } = useProjects();
+  const {
+    rows: projects,
+    ids,
+    error: projectsError,
+    loading: projectsLoading,
+  } = useProjects();
   const [chosen, setChosen] = useState("");
   const projectId = chosen !== "" && ids.includes(chosen) ? chosen : (ids[0] ?? "");
 
-  const { rows: items, error: itemsError } = useItems(projectId);
-  const { rows: negotiations, error: negotiationsError } = useNegotiations(projectId);
+  const { rows: items, error: itemsError, loading: itemsLoading } = useItems(projectId);
+  const {
+    rows: negotiations,
+    error: negotiationsError,
+    loading: negotiationsLoading,
+  } = useNegotiations(projectId);
   const { rows: suppliers, error: suppliersError } = useSuppliers(projectId);
+
+  // Every hook here already returned this and every caller threw it away, so
+  // "No items yet" was shown to a production that was still loading — the same
+  // shape of bug as the mailbox card offering Connect Gmail to an account that
+  // was already connected. One flag, because the panels below all wait on the
+  // same read: while the production list is still arriving there is not even a
+  // project id to query with.
+  const loading = projectsLoading || itemsLoading || negotiationsLoading;
 
   // These were read and discarded, so a rules refusal on any collection
   // rendered as a production with nothing in it — the same silent failure the
@@ -105,13 +205,14 @@ function SignedIn({ user }: { user: User }) {
           <Chat
             user={user}
             projectId={projectId}
-            projectIds={ids}
+            projects={projects}
             onPickProject={setChosen}
             items={items}
             negotiations={negotiations}
             suppliers={suppliers}
             supplierName={supplierName}
             readError={readError}
+            loading={loading}
           />
         }
       />
@@ -120,13 +221,14 @@ function SignedIn({ user }: { user: User }) {
         element={
           <Panels
             user={user}
-            ids={ids}
+            projects={projects}
             projectId={projectId}
             setChosen={setChosen}
             items={items}
             negotiations={negotiations}
             supplierName={supplierName}
             waiting={waiting}
+            loading={loading}
           />
         }
       />
@@ -136,22 +238,24 @@ function SignedIn({ user }: { user: User }) {
 
 function Panels({
   user,
-  ids,
+  projects,
   projectId,
   setChosen,
   items,
   negotiations,
   supplierName,
   waiting,
+  loading,
 }: {
   user: User;
-  ids: string[];
+  projects: ProjectRow[];
   projectId: string;
   setChosen: (id: string) => void;
   items: ReturnType<typeof useItems>["rows"];
   negotiations: ReturnType<typeof useNegotiations>["rows"];
   supplierName: (id: string | undefined) => string;
   waiting: number;
+  loading: boolean;
 }) {
   return (
     <div className="mx-auto max-w-5xl px-6 py-8">
@@ -163,15 +267,15 @@ function Panels({
           )}
         </div>
         <div className="flex items-center gap-3 text-sm">
-          {ids.length > 1 && (
+          {projects.length > 1 && (
             <select
               className="rounded-md border bg-background px-2 py-1"
               onChange={(e) => setChosen(e.target.value)}
               value={projectId}
             >
-              {ids.map((id) => (
-                <option key={id} value={id}>
-                  {id}
+              {projects.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.title || p.id}
                 </option>
               ))}
             </select>
@@ -200,16 +304,25 @@ function Panels({
               items={items}
               negotiations={negotiations}
               supplierName={supplierName}
+              loading={loading}
             />
           }
         />
         <Route
           path="/breakdown"
-          element={<Breakdown items={items} negotiations={negotiations} />}
+          element={
+            <Breakdown
+              items={items}
+              negotiations={negotiations}
+              loading={loading}
+            />
+          }
         />
         <Route
           path="/savings"
-          element={<Savings items={items} negotiations={negotiations} />}
+          element={
+            <Savings items={items} negotiations={negotiations} loading={loading} />
+          }
         />
         <Route path="/debug" element={<DebugPanel />} />
       </Routes>

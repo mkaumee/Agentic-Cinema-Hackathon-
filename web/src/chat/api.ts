@@ -174,6 +174,9 @@ export type Prop = {
   qty: number;
   consumable: boolean;
   confidence: number;
+  /** The agent's proposed route: BUY or NEGOTIATE. A proposal, not a decision
+   * — the confirmation list lets a producer flip it before anything happens. */
+  route?: string;
   scenes: string[];
   /** The script lines it was found in. The receipt. */
   lines: string[];
@@ -199,7 +202,11 @@ export type ConfirmResult =
  * renders them differently, and because a thrown error inside a React event
  * handler is a blank screen.
  */
-async function post(path: string, body: unknown): Promise<Response | string> {
+async function send(
+  method: "POST" | "PATCH" | "DELETE",
+  path: string,
+  body?: unknown,
+): Promise<Response | string> {
   const url = base();
   if (url === "") {
     return (
@@ -209,14 +216,18 @@ async function post(path: string, body: unknown): Promise<Response | string> {
   }
   try {
     return await fetch(`${url}${path}`, {
-      method: "POST",
+      method,
       headers: await authorised(),
-      body: JSON.stringify(body),
+      // A DELETE carries nothing. Sending `"undefined"` as a body is not the
+      // same as sending none, and some proxies mind.
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
   } catch (cause) {
     return describe(cause);
   }
 }
+
+const post = (path: string, body: unknown) => send("POST", path, body);
 
 export async function startProject(title: string): Promise<Started> {
   const reply = await post("/projects", { title });
@@ -226,6 +237,171 @@ export async function startProject(title: string): Promise<Started> {
   }
   const body = (await reply.json()) as { project_id: string; title: string };
   return { kind: "started", projectId: body.project_id, title: body.title };
+}
+
+export type Done = { kind: "done" } | { kind: "error"; detail: string };
+
+async function completed(reply: Response | string): Promise<Done> {
+  if (typeof reply === "string") return { kind: "error", detail: reply };
+  if (!reply.ok) return { kind: "error", detail: await detailOf(reply) };
+  return { kind: "done" };
+}
+
+/**
+ * Change what a production is called.
+ *
+ * Only the title. The id it is filed under was derived from the original name
+ * and is now in the path of every prop, supplier and email underneath it, so
+ * it stays — a production is allowed to be called one thing and stored as
+ * another.
+ */
+export async function renameProject(
+  projectId: string,
+  title: string,
+): Promise<Done> {
+  return completed(await send("PATCH", `/projects/${projectId}`, { title }));
+}
+
+/**
+ * Remove a production, its props, its negotiations and its correspondence.
+ *
+ * Not reversible, and not partial: the service walks the subcollections,
+ * because the tick finds work through queries that never look at which
+ * productions exist. Purchase orders are the exception and stay — they live in
+ * a database this cannot reach, and an approved order outliving the production
+ * it belonged to is the correct way round.
+ */
+export async function deleteProject(projectId: string): Promise<Done> {
+  return completed(await send("DELETE", `/projects/${projectId}`));
+}
+
+/**
+ * Claim the producer role for whoever is signed in.
+ *
+ * Called once after every sign-in. It used to take a shell command and an
+ * admin to make an account usable, which does not survive a room full of
+ * judges; now being signed in is enough, on a deployment that allows it.
+ *
+ * The forced token refresh is the load-bearing half. A custom claim is baked
+ * into an ID token when it is issued, so the token in hand while this returns
+ * still does not carry it — without the refresh a newly enrolled producer
+ * would be told to sign out and back in, which is the friction being removed.
+ *
+ * Failures are deliberately quiet at the call site: a closed deployment
+ * answers 403 and the right thing is to carry on and let the next call say so
+ * properly, rather than block sign-in behind a message about a role.
+ */
+/**
+ * Rewrite an opening email before it goes.
+ *
+ * Refused once the opening has been released — an edit box over a message
+ * already in somebody's inbox is a promise the screen cannot keep, so the
+ * server says 409 and the component stops offering it.
+ */
+export async function editOpening(
+  projectId: string,
+  negotiationId: string,
+  subject: string,
+  body: string,
+  toEmail = "",
+): Promise<Done> {
+  return completed(
+    await send("PATCH", `/projects/${projectId}/negotiations/${negotiationId}/opening`, {
+      subject,
+      body,
+      to_email: toEmail,
+    }),
+  );
+}
+
+/**
+ * Decide the opening emails. This is the press-send.
+ *
+ * Nothing is sent by this call: it marks them approved and due, and the tick
+ * service — which is the one holding the mailbox — posts them within the
+ * minute. An empty list means every opening still waiting.
+ *
+ * `include: false` drops that one, exactly as unticking a prop abandons it.
+ * Leaving it merely unreleased would put it back in the producer's queue on
+ * every snapshot, forever.
+ */
+export interface OpeningChoice {
+  negotiation_id: string;
+  include: boolean;
+}
+
+export async function releaseOpenings(
+  projectId: string,
+  openings: OpeningChoice[] = [],
+): Promise<Done> {
+  return completed(
+    await send("POST", `/projects/${projectId}/openings/release`, { openings }),
+  );
+}
+
+/**
+ * Give a seller what they asked for, and let the agent carry on.
+ *
+ * Nothing is emailed by this call. The api service holds no mailbox — it
+ * stores the file, records the words and makes the row due, and the tick
+ * service posts it within the minute. Same split that keeps this side of the
+ * deployment unable to write a purchase order.
+ *
+ * The words go out as the producer typed them. They answered a question that
+ * was put to them, and having the brain paraphrase it is how a seller ends up
+ * being told something nobody said.
+ */
+export async function answerSupplier(
+  projectId: string,
+  negotiationId: string,
+  answer: string,
+  file?: Upload,
+): Promise<Done> {
+  return completed(
+    await send(
+      "POST",
+      `/projects/${projectId}/negotiations/${negotiationId}/answer`,
+      {
+        answer,
+        filename: file?.filename ?? "",
+        mime_type: file?.mimeType ?? "application/octet-stream",
+        content_b64: file?.contentB64 ?? "",
+      },
+    ),
+  );
+}
+
+/**
+ * Say whether the shop checkout actually went through.
+ *
+ * Approving a listing records that the producer was *sent to a shop*. Nothing
+ * here can know they finished paying — that happens on somebody else's site —
+ * so an item reading ORDERED on the strength of a click is the screen
+ * guessing, and this is where it stops guessing.
+ *
+ * Saying it did not go through does **not** un-order anything. The purchase
+ * order is create-only and is never rewritten; what changes is that the item
+ * stops claiming to be sorted and carries the note about why.
+ */
+export async function confirmReceipt(
+  projectId: string,
+  itemId: string,
+  received: boolean,
+  note = "",
+): Promise<Done> {
+  return completed(
+    await send("POST", `/projects/${projectId}/items/${itemId}/receipt`, {
+      received,
+      note,
+    }),
+  );
+}
+
+export async function enrolAsProducer(): Promise<Done> {
+  const reply = await send("POST", "/producers/me");
+  const result = await completed(reply);
+  if (result.kind === "done") await auth.currentUser?.getIdToken(true);
+  return result;
 }
 
 /** What the browser hands the API: text, or a file it has already read. */
@@ -264,6 +440,8 @@ export interface Choice {
   item_id: string;
   qty: number;
   include: boolean;
+  /** BUY or NEGOTIATE. Omitted means "leave the agent's proposal alone". */
+  route?: string;
 }
 
 export async function confirmProps(
@@ -291,6 +469,20 @@ const detailOf = async (reply: Response): Promise<string> => {
   try {
     const body = (await reply.json()) as { detail?: unknown };
     if (typeof body.detail === "string") return body.detail;
+    // FastAPI's validation errors arrive as a *list* of objects, not a string,
+    // so this fell through to the bare status line — every 422 in the whole
+    // panel read "422 Unprocessable Entity", which tells somebody they got
+    // something wrong and not what.
+    if (Array.isArray(body.detail)) {
+      const said = body.detail
+        .map((entry) =>
+          typeof entry === "object" && entry !== null && "msg" in entry
+            ? String((entry as { msg: unknown }).msg)
+            : "",
+        )
+        .filter((msg) => msg !== "");
+      if (said.length > 0) return said.join("; ");
+    }
   } catch {
     // A non-JSON body from a proxy or a 502 page. The status is still useful.
   }

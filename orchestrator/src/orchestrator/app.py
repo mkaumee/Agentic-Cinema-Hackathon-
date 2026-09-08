@@ -36,7 +36,7 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 
-from cinema_contracts import AgentBrain, Money, ScriptSource
+from cinema_contracts import AgentBrain, Money, ScriptSource, SourcingRoute
 from cinema_contracts.testing import ScriptedBrain
 from fastapi import FastAPI, HTTPException, Request
 from google.api_core.exceptions import AlreadyExists
@@ -44,6 +44,7 @@ from google.cloud.firestore_v1 import AsyncClient
 from pydantic import BaseModel, Field
 
 from orchestrator import intake
+from orchestrator.attachments import AttachmentStore
 from orchestrator.clock import SimClock
 from orchestrator.gmail import GmailTransport, build_credentials, token_store_for
 from orchestrator.logs import configure_logging
@@ -246,7 +247,22 @@ def build_services(settings: Settings | None = None) -> Services:
         clock=clock,
         brain=brain,
         mail=mail,
-        loop=TickLoop(repo, clock, brain, build_mailboxes(resolved, repo, mail)),
+        loop=TickLoop(
+            repo,
+            clock,
+            brain,
+            build_mailboxes(resolved, repo, mail),
+            # Read-only, from a bucket this account has objectViewer on and
+            # nothing more. It fetches what a producer already uploaded and
+            # attaches it; it cannot put anything there. None when the
+            # deployment has no bucket, which the send path treats as "the
+            # words go without the file" rather than as a failure.
+            attachments=(
+                AttachmentStore(resolved.attachments_bucket)
+                if resolved.attachments_bucket
+                else None
+            ),
+        ),
     )
 
 
@@ -330,7 +346,12 @@ class TickResult(BaseModel):
     negotiations_examined: int
     claims_lost: int
     messages_sent: int
+    openings_drafted: int
     escalated: int
+    quota_backoffs: int
+    bounced: int
+    listings_parked: int
+    stood_down: int
     errors: list[str]
 
     @classmethod
@@ -348,6 +369,15 @@ class TickResult(BaseModel):
             negotiations_examined=report.negotiations_examined,
             claims_lost=report.claims_lost,
             messages_sent=report.messages_sent,
+            openings_drafted=report.openings_drafted,
+            # Counted on the report since bounces, listings and stand-downs
+            # landed, and never carried across to here — so none of them have
+            # ever appeared in Cloud Logging. A counter nobody can read is a
+            # counter that does not exist.
+            quota_backoffs=report.quota_backoffs,
+            bounced=report.bounced,
+            listings_parked=report.listings_parked,
+            stood_down=report.stood_down,
             escalated=report.escalated,
             errors=report.errors,
         )
@@ -424,6 +454,7 @@ class FoundProp(BaseModel):
     qty: int
     consumable: bool
     confidence: float
+    route: SourcingRoute = SourcingRoute.NEGOTIATE
     scenes: list[str]
     lines: list[str]
     """The script lines it was found in. The receipt."""
@@ -438,6 +469,7 @@ class ConfirmedItem(BaseModel):
     qty: int = Field(ge=1, default=1)
     include: bool = True
     floor_price: Money | None = None
+    route: SourcingRoute | None = None
 
 
 class ConfirmItems(BaseModel):
@@ -515,6 +547,7 @@ async def confirm_items(
                     qty=c.qty,
                     include=c.include,
                     floor_price=c.floor_price,
+                    route=c.route,
                 )
                 for c in body.items
             ],
@@ -545,7 +578,10 @@ async def tick(request: Request, project_id: str | None = None) -> TickResponse:
     for pid in project_ids:
         try:
             report = await services.loop.run_tick(
-                pid, limit=services.settings.tick_limit
+                pid,
+                limit=services.settings.tick_limit,
+                research_limit=services.settings.research_limit,
+                send_limit=services.settings.send_limit,
             )
         except Exception as exc:
             log.exception("tick failed", extra={"project_id": pid})

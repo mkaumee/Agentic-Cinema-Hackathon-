@@ -19,7 +19,7 @@ timestamp comes from ``clock.now()``, per Hard Rule 2.
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from cinema_contracts import AgentBrain, Money, ScriptSource
+from cinema_contracts import AgentBrain, Money, ScriptSource, SourcingRoute
 
 from orchestrator.clock import SimClock, initial_state
 from orchestrator.records import ItemRecord, ItemStatus, ProjectRecord
@@ -37,6 +37,9 @@ class FoundProp:
     qty: int
     consumable: bool
     confidence: float
+    route: SourcingRoute = SourcingRoute.NEGOTIATE
+    """The agent's proposal, shown on the confirmation list with a toggle."""
+
     scenes: list[str] = field(default_factory=list)
     lines: list[str] = field(default_factory=list)
     """The script lines it was found in. The receipt, and the reason a producer
@@ -51,6 +54,12 @@ class Choice:
     qty: int = 1
     include: bool = True
     floor_price: Money | None = None
+    route: SourcingRoute | None = None
+    """How this prop should be sourced, if the producer disagreed.
+
+    None leaves the brain's proposal in place. That is the common case: they
+    skim the list, fix a quantity or two, and press Confirm.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,6 +136,7 @@ async def read_script(
                 notes=draft.notes,
                 mentions=list(draft.mentions),
                 consumable=draft.consumable,
+                route=draft.route,
                 status=ItemStatus.DRAFT,
                 updated_at=now,
             ),
@@ -139,6 +149,7 @@ async def read_script(
                 qty=draft.qty,
                 consumable=draft.consumable,
                 confidence=draft.confidence,
+                route=draft.route,
                 scenes=scenes,
                 lines=[m.line for m in draft.mentions],
             )
@@ -173,6 +184,12 @@ async def confirm_items(
         if choice.include:
             item.qty = choice.qty
             item.floor_price = choice.floor_price
+            if choice.route is not None:
+                # The producer knows the birdcage is being built and the mugs
+                # are not. This is the last moment before anything is
+                # researched or written, which is why the toggle lives on this
+                # screen rather than on a card that appears afterwards.
+                item.route = choice.route
             item.status = ItemStatus.RESEARCHING
             # Due immediately: confirming is the producer saying go, and a
             # delay here would look like the agent ignoring them.

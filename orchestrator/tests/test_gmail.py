@@ -646,9 +646,23 @@ async def test_a_reply_is_found_under_a_hundred_newer_unread_messages() -> None:
     assert fake.queries == [], "the loop must not list the mailbox at all"
 
 
-async def test_our_own_sent_mail_in_the_thread_is_not_read_back_as_a_reply() -> None:
-    """Gmail keeps our outbound in the same thread. Filing it would have the
-    agent answering itself."""
+async def test_a_sent_labelled_message_is_still_handed_over() -> None:
+    """The inversion of what this test used to assert, and the bug it hid.
+
+    It used to say our own outbound is filtered out by the SENT label, which
+    was true while the agent wrote to strangers. It stopped being true the
+    moment a producer could point an opening at an address they own: when that
+    is the same account the agent sends from, *their reply carries SENT too*,
+    because they sent it. The one message the loop was waiting for was the one
+    it threw away — then it chased, timed out at 48 hours, and closed as though
+    nobody had answered.
+
+    Same shape as the UNREAD bug one field over. Both were Gmail's labels
+    standing in for a fact about our own records, and both stopped describing
+    that fact once the producer's mailbox was in the loop. Filing dedupes on
+    the message ids we stored — see `_file_reply`, which asks `has_message`
+    before it calls the brain — and nobody but us can write those.
+    """
     transport, fake = _transport()
     fake.inbox = [
         _inbound(message_id="ours-out", thread_id="t-1", labels=["SENT", "UNREAD"]),
@@ -657,21 +671,33 @@ async def test_our_own_sent_mail_in_the_thread_is_not_read_back_as_a_reply() -> 
 
     got = await transport.poll(threads=frozenset({"t-1"}))
 
-    assert [m.message_id for m in got] == ["theirs"]
-    assert [message_id for message_id, _ in fake.modified] == ["theirs"]
+    assert [m.message_id for m in got] == ["ours-out", "theirs"]
 
 
-async def test_a_message_already_filed_is_not_returned_a_second_time() -> None:
-    """UNREAD is the only record of what a previous tick consumed."""
+async def test_a_message_the_producer_already_opened_is_still_returned() -> None:
+    """The inversion of what this test used to assert, and the bug it hid.
+
+    It used to say "UNREAD is the only record of what a previous tick
+    consumed", which was true while the agent had a mailbox to itself. Once
+    negotiations moved into the producer's own Gmail it stopped being: they
+    open the seller's reply — of course they do, it is their inbox — the label
+    clears, and the agent never sees the message again. Nothing errors. The
+    negotiation runs out its rounds and dies as though nobody answered.
+
+    So poll hands over everything in a live thread, and "have I already read
+    this" is answered by the message ids we stored, which nobody else can
+    clear. Our own outbound is filtered the same way, for the same reason —
+    see the SENT test above.
+    """
     transport, fake = _transport()
     fake.inbox = [
-        _inbound(message_id="filed", thread_id="t-1", labels=["INBOX"]),
-        _inbound(message_id="fresh", thread_id="t-1"),
+        _inbound(message_id="opened", thread_id="t-1", labels=["INBOX"]),
+        _inbound(message_id="unread", thread_id="t-1"),
     ]
 
     got = await transport.poll(threads=frozenset({"t-1"}))
 
-    assert [m.message_id for m in got] == ["fresh"]
+    assert [m.message_id for m in got] == ["opened", "unread"]
 
 
 async def test_a_thread_that_no_longer_exists_does_not_stop_the_tick() -> None:

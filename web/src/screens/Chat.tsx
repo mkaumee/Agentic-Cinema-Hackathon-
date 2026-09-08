@@ -29,13 +29,18 @@ import { Link } from "react-router-dom";
 import type { Row } from "@/chat/rows";
 import { useGreenlitThread } from "@/chat/useGreenlitThread";
 import { Decision } from "@/components/chat/DecisionPart";
+import { Listing } from "@/components/chat/ListingPart";
+import { Question } from "@/components/chat/QuestionPart";
 import { signOutOfEverything, USE_EMULATOR, type User } from "@/firebase";
 import { MailboxCard } from "@/components/chat/MailboxCard";
 import { NewProduction } from "@/components/chat/NewProduction";
 import { PendingProject } from "@/components/chat/context";
+import { ProductionMenu } from "@/components/chat/ProductionMenu";
 import { Transcript } from "@/components/chat/Transcript";
+import { Skeleton, SkeletonRows } from "@/components/ui/skeleton";
 import type { Item, Negotiation, Supplier } from "@/hooks/useProject";
 import { useAllMessages, useMailbox } from "@/hooks/useProject";
+import type { ProjectRow } from "@/hooks/useProject";
 import { Breakdown } from "@/screens/Breakdown";
 import { Inbox } from "@/screens/Inbox";
 import { Savings } from "@/screens/Savings";
@@ -45,17 +50,18 @@ type Panel = "needs-you" | "breakdown" | "savings";
 export function Chat({
   user,
   projectId,
-  projectIds,
+  projects,
   onPickProject,
   items,
   negotiations,
   suppliers,
   supplierName,
   readError,
+  loading,
 }: {
   user: User;
   projectId: string;
-  projectIds: string[];
+  projects: ProjectRow[];
   onPickProject: (id: string) => void;
   items: Item[];
   negotiations: Negotiation[];
@@ -63,6 +69,8 @@ export function Chat({
   supplierName: (id: string | undefined) => string;
   /** Whatever Firestore refused, if anything. Empty when all reads are fine. */
   readError: string;
+  /** True while the reads behind every panel on this screen are still open. */
+  loading: boolean;
 }) {
   const mailbox = useMailbox();
   const [panel, setPanel] = useState<Panel>("needs-you");
@@ -71,9 +79,13 @@ export function Chat({
     () => negotiations.map((n) => n.id),
     [negotiations],
   );
-  const messages = useAllMessages(projectId, negotiationIds);
+  const { rows: messages, loading: messagesLoading } = useAllMessages(
+    projectId,
+    negotiationIds,
+  );
 
-  const { runtime, waiting, readScript } = useGreenlitThread({
+  const { runtime, waiting, openings, questions, listings, readScript, busy } =
+    useGreenlitThread({
     projectId,
     items,
     negotiations,
@@ -92,15 +104,29 @@ export function Chat({
           <Rail
             user={user}
             projectId={projectId}
-            projectIds={projectIds}
+            projects={projects}
             onPickProject={onPickProject}
+            negotiations={negotiations}
             mailbox={mailbox}
             waiting={waiting}
+            openings={openings}
+            questions={questions}
+            listings={listings}
             readError={readError}
+            loading={loading}
           />
 
           <div className="flex min-h-0 flex-col">
-            <Transcript onScript={(file) => void readScript(file)} />
+            <Transcript
+              busy={busy}
+              // Not the same `loading` the panels get. The transcript is empty
+              // for longer: its rows come from the correspondence, which is a
+              // subscription per negotiation and cannot even start until the
+              // negotiations themselves have arrived.
+              loading={loading || messagesLoading}
+              ready={projectId !== ""}
+              onScript={(file) => void readScript(file)}
+            />
           </div>
 
           <aside className="flex min-h-0 flex-col overflow-hidden">
@@ -116,13 +142,18 @@ export function Chat({
                   items={items}
                   negotiations={negotiations}
                   supplierName={supplierName}
+                  loading={loading}
                 />
               )}
               {panel === "breakdown" && (
-                <Breakdown items={items} negotiations={negotiations} />
+                <Breakdown
+                  items={items}
+                  negotiations={negotiations}
+                  loading={loading}
+                />
               )}
               {panel === "savings" && (
-                <Savings items={items} negotiations={negotiations} />
+                <Savings items={items} negotiations={negotiations} loading={loading} />
               )}
             </div>
           </aside>
@@ -135,20 +166,47 @@ export function Chat({
 function Rail({
   user,
   projectId,
-  projectIds,
+  projects,
   onPickProject,
   mailbox,
   waiting,
+  openings,
+  questions,
+  listings,
   readError,
+  loading,
+  negotiations,
 }: {
   user: User;
   projectId: string;
-  projectIds: string[];
+  projects: ProjectRow[];
   onPickProject: (id: string) => void;
   mailbox: ReturnType<typeof useMailbox>;
   waiting: Row[];
+  openings: Row[];
+  questions: Row[];
+  listings: Row[];
   readError: string;
+  loading: boolean;
+  negotiations: Negotiation[];
 }) {
+  const current = projects.find((p) => p.id === projectId);
+  // How many sellers are mid-conversation, for the delete confirmation.
+  //
+  // Listed rather than excluded, because the exclusions are what went wrong
+  // first: `DRAFTED` is a negotiation nobody has sent yet, and a near-miss
+  // spelling of it silently counted those as people waiting on a reply. A
+  // warning that overstates is a warning producers learn to click past.
+  const live = negotiations.filter((n) =>
+    [
+      "SENT",
+      "AWAITING_REPLY",
+      "QUOTED",
+      "NEGOTIATING",
+      "CHASING",
+      "READY_FOR_HUMAN",
+    ].includes(n.state ?? ""),
+  ).length;
   return (
     <aside className="flex min-h-0 flex-col gap-4 overflow-y-auto p-4">
       <div className="flex items-center gap-2">
@@ -162,21 +220,36 @@ function Rail({
         <p className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
           Production
         </p>
-        {projectIds.length > 1 ? (
+        {projects.length > 1 ? (
           <select
             className="mt-1 w-full rounded-md border bg-background px-2 py-1 text-sm"
             onChange={(e) => onPickProject(e.target.value)}
             value={projectId}
           >
-            {projectIds.map((id) => (
-              <option key={id} value={id}>
-                {id}
+            {projects.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.title || p.id}
               </option>
             ))}
           </select>
+        ) : loading ? (
+          // "none yet" is what a producer who owns three productions saw on
+          // the way in, for as long as the query took.
+          <Skeleton className="mt-1 h-5 w-32" />
         ) : (
-          <p className="mt-1 text-sm break-all">{projectId || "none yet"}</p>
+          // The title, not the id. The id is a slug of whatever it was first
+          // called and stops being the truth the moment anyone renames it.
+          <p className="mt-1 text-sm break-all">
+            {current?.title || projectId || "none yet"}
+          </p>
         )}
+
+        <ProductionMenu
+          projectId={projectId}
+          title={current?.title ?? ""}
+          live={live}
+          onDeleted={() => onPickProject("")}
+        />
       </div>
 
       {/* A refused read is why an empty screen and a broken one look the same.
@@ -200,19 +273,36 @@ function Rail({
       <div>
         <p className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
           Needs you
-          {waiting.length > 0 && (
+          {/* Openings count too. A drafted email nobody has read is a thing
+              waiting on a person exactly as much as a quote is, and it is the
+              one the producer will not go looking for — the agent writes it
+              while they are elsewhere. */}
+          {waiting.length + openings.length + questions.length + listings.length >
+            0 && (
             <span className="ml-2 rounded-full bg-foreground px-1.5 py-0.5 text-xs text-background">
-              {waiting.length}
+              {waiting.length +
+                openings.length +
+                questions.length +
+                listings.length}
             </span>
           )}
         </p>
-        {waiting.length === 0 ? (
+        {loading ? (
+          <SkeletonRows rows={2} className="mt-1" />
+        ) : waiting.length + openings.length + questions.length + listings.length ===
+          0 ? (
           <p className="mt-1 text-xs text-muted-foreground">
             Nothing is waiting on a decision. The agent stops here every time,
             so this filling in is how you find out.
           </p>
         ) : (
           <div className="mt-1 space-y-2">
+            {openings.length > 0 && (
+              <p className="rounded-md border px-2 py-1.5 text-xs">
+                {openings.length === 1 ? "An opening email is" : "Opening emails are"}{" "}
+                waiting to be read, in the thread.
+              </p>
+            )}
             {waiting.map((row) =>
               row.kind === "decision" ? (
                 <Decision
@@ -226,6 +316,40 @@ function Rail({
                     rounds: row.roundsUsed,
                     reason: row.reason,
                     rivals: row.rivals,
+                  }}
+                  negotiationId={row.negotiationId}
+                  projectId={projectId}
+                />
+              ) : null,
+            )}
+            {listings.map((row) =>
+              row.kind === "listing" ? (
+                <Listing
+                  key={row.id}
+                  compact
+                  args={{
+                    negotiationId: row.negotiationId,
+                    itemId: row.itemId,
+                    item: row.itemName,
+                    shop: row.shop,
+                    price: row.price,
+                    url: row.url,
+                    rivals: row.rivals,
+                  }}
+                  projectId={projectId}
+                />
+              ) : null,
+            )}
+            {questions.map((row) =>
+              row.kind === "question" ? (
+                <Question
+                  key={row.id}
+                  compact
+                  args={{
+                    negotiationId: row.negotiationId,
+                    item: row.itemName,
+                    supplier: row.supplier,
+                    asked: row.asked,
                   }}
                   negotiationId={row.negotiationId}
                   projectId={projectId}

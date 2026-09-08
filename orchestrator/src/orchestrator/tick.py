@@ -35,6 +35,7 @@ from datetime import datetime, timedelta
 
 from cinema_contracts import (
     AgentBrain,
+    EscalationReason,
     InboundMessage,
     ItemBrief,
     MessageDirection,
@@ -46,12 +47,20 @@ from cinema_contracts import (
     SupplierCandidate,
 )
 
+from orchestrator.attachments import AttachmentReader, StoredFile
+from orchestrator.bounces import bounce_note, looks_like_a_bounce
 from orchestrator.clock import SimClock
-from orchestrator.mail import MailTransport, RawInbound
+from orchestrator.mail import Attachment, MailTransport, RawInbound
 from orchestrator.mailboxes import MailboxProvider, is_expired_credential
-from orchestrator.records import MessageRecord, NegotiationRecord
+from orchestrator.quota import looks_like_a_quota_error
+from orchestrator.records import (
+    ITEM_TERMINAL_STATUSES,
+    MessageRecord,
+    NegotiationRecord,
+    is_listing,
+)
 from orchestrator.repository import DueNegotiation, FirestoreRepository
-from orchestrator.sourcing import SourcingLoop
+from orchestrator.sourcing import SourcingLoop, looks_like_an_address
 from orchestrator.state_machine import (
     NegotiationEvent,
     allowed_events,
@@ -72,6 +81,16 @@ production, and a suggestion of zero would spin the loop.
 
 SILENCE_HOURS = 48.0
 """Simulated hours of supplier silence before the loop raises SILENCE_TIMEOUT."""
+
+QUOTA_BACKOFF_HOURS = 1.0 / 60.0
+"""How long to wait out a rate limit. A minute — one tick.
+
+Not the claim lease. A row that fails mid-pass keeps the lease it was claimed
+with, which is fifteen minutes, and for a quota error that is a stall rather
+than a pause: Google was busy for a moment and the negotiation stopped for a
+quarter of an hour. Long enough for the limit to clear, short enough that the
+next scheduled tick simply picks it back up.
+"""
 
 CLAIM_LEASE_HOURS = 0.25
 """How far ahead claiming a row parks it before anyone may retry.
@@ -120,6 +139,34 @@ class TickReport:
     """Rows another tick was already working on. Zero unless ticks overlap, and
     a number that climbs is the signal that ticks are running long."""
     messages_sent: int = 0
+    bounced: int = 0
+    """Addresses that turned out to be dead. Counted apart from replies filed,
+    because a bounce is not a supplier answering."""
+    listings_parked: int = 0
+    """Shop rows that became due and were put back.
+
+    Should be zero. A number that is not zero means something made a listing
+    due — the floor or answer endpoint getting past its guard — and is worth
+    seeing rather than absorbing silently."""
+
+    stood_down: int = 0
+    """Negotiations stopped because the prop was already bought."""
+
+    quota_backoffs: int = 0
+    """Rows that stepped back because Google was rate limiting us.
+
+    Counted apart from `errors`, because nothing is wrong. A loop waiting on a
+    quota and a loop with nothing to do look identical from outside, and
+    telling them apart took a dig through Cloud Logging once already.
+    """
+
+    openings_drafted: int = 0
+    """Opening emails written and left for a person to read.
+
+    Distinct from `messages_sent` on purpose: a tick that drafted five and sent
+    none is working exactly as intended, and one number covering both would
+    make that indistinguishable from a tick that mailed five strangers.
+    """
     escalated: int = 0
     mailbox_missing: bool = False
     """No mailbox to send from, so negotiations were left where they were.
@@ -154,6 +201,7 @@ class TickLoop:
     _brain: AgentBrain
     _mailboxes: MailboxProvider
     _sourcing: SourcingLoop
+    _attachments: AttachmentReader | None
 
     def __init__(
         self,
@@ -161,14 +209,42 @@ class TickLoop:
         clock: SimClock,
         brain: AgentBrain,
         mailboxes: MailboxProvider,
+        attachments: AttachmentReader | None = None,
     ) -> None:
         self._repo = repo
         self._clock = clock
         self._brain = brain
         self._mailboxes = mailboxes
         self._sourcing = SourcingLoop(repo, brain)
+        # Optional: the loop runs without a bucket on a laptop and in every
+        # test that is not about attachments. A negotiation whose producer
+        # supplied only words needs no store at all.
+        self._attachments = attachments
 
-    async def run_tick(self, project_id: str, *, limit: int = 50) -> TickReport:
+    async def run_tick(
+        self,
+        project_id: str,
+        *,
+        limit: int = 50,
+        research_limit: int = 3,
+        send_limit: int = 2,
+    ) -> TickReport:
+        """One pass over a project.
+
+        Two budgets, not one. `limit` is how many due negotiations may be
+        advanced; `research_limit` is how many items may be researched. They
+        used to be the same number, which meant "advance up to 50 negotiations"
+        also said "research up to 50 items" — and researching one item is a
+        reasoning call plus several web searches, by a wide margin the most
+        expensive thing this loop does.
+
+        Fifty of those cannot fit in a fifty-second request, so on the pass
+        after a producer confirmed a twenty-prop script Cloud Run killed the
+        tick at the wall. The rows it had claimed were then parked for the
+        lease, and everything behind them — including an opening a producer had
+        already pressed Send on — waited. Nothing errored; it simply took
+        minutes.
+        """
         now = await self._clock.advance(project_id)
         report = TickReport(sim_now=now)
 
@@ -201,7 +277,13 @@ class TickLoop:
 
         # Items first, so a negotiation opened by this pass gets its opening
         # email in the same pass rather than waiting a minute for the next one.
-        sourcing = await self._sourcing.run(now, limit=limit)
+        #
+        # Bounded far below `limit`, and that is the whole fix: nothing is lost
+        # to the smaller number, because an item this pass does not reach stays
+        # due and is picked up on the next one. A twenty-prop script is
+        # researched over a handful of ticks instead of in one pass that never
+        # finishes — and the sending step below still gets a turn.
+        sourcing = await self._sourcing.run(now, limit=research_limit)
         report.items_examined = sourcing.items_examined
         report.items_researched = sourcing.researched
         report.negotiations_opened = sourcing.negotiations_opened
@@ -217,6 +299,19 @@ class TickLoop:
             return report
 
         for due in await self._repo.due_negotiations(now, limit=limit):
+            if report.messages_sent >= send_limit:
+                # Enough post for one minute. Three sellers are approached per
+                # item and all three become due together, so without this a
+                # single pass fires them back to back and Gmail refuses the
+                # lot on its per-minute cost limit — seen on the deployment,
+                # three sends inside the same second, all rejected.
+                #
+                # The rows left over are untouched and therefore still due:
+                # they have not been claimed, so the next tick takes them.
+                # Claiming and then skipping would park them for the lease,
+                # which is the trap this whole change is about.
+                break
+
             try:
                 await self._advance_negotiation(due, mail, now, report)
             except Exception as exc:
@@ -227,9 +322,30 @@ class TickLoop:
                 # Safe to swallow only because the row has been claimed by now:
                 # it is parked for the lease rather than retried on every tick,
                 # so a permanently broken negotiation cannot spin.
-                report.errors.append(f"{due.negotiation_id}: {exc}")
+                if looks_like_a_quota_error(exc):
+                    await self._back_off(due, now, report)
+                else:
+                    report.errors.append(f"{due.negotiation_id}: {exc}")
 
         return report
+
+    async def _back_off(
+        self, due: DueNegotiation, now: datetime, report: TickReport
+    ) -> None:
+        """Google was busy. Come back in a minute, not in fifteen.
+
+        The row was claimed before the call that failed, so it is already parked
+        for the claim lease — which for a rate limit is a stall rather than a
+        pause, and one that costs another reasoning call and another send when
+        it finally does come back. This pulls the due date in to the next tick.
+
+        Not recorded as an error: nothing about this negotiation is wrong.
+        """
+        record = due.record
+        record.next_action_due_at = now + timedelta(hours=QUOTA_BACKOFF_HOURS)
+        record.updated_at = now
+        await self._repo.save_negotiation(due.project_id, due.negotiation_id, record)
+        report.quota_backoffs += 1
 
     # ------------------------------------------------------------------ #
     # Inbound
@@ -276,6 +392,28 @@ class TickLoop:
             return
 
         record = target.record
+
+        # Two checks before the brain, for two different reasons.
+        #
+        # Already filed: the transport no longer uses Gmail's UNREAD label to
+        # mean "new" — the producer clears that by opening their own inbox — so
+        # poll returns every message in a live thread and this is what makes
+        # that affordable. Without it a five-day negotiation would cost an
+        # extract_quote call per message per minute.
+        if await self._repo.has_message(
+            target.project_id, target.negotiation_id, raw.message_id
+        ):
+            report.replies_skipped += 1
+            return
+
+        # A bounce: the mail system saying the address is dead, arriving in the
+        # supplier's own thread and matching it. Handed to the brain it reads as
+        # a seller writing "Address not found", and the brain does its job and
+        # produces a counter-offer to a mailbox nobody is reading.
+        if looks_like_a_bounce(from_email=raw.from_email, subject=raw.subject):
+            await self._file_bounce(target, raw, now, report)
+            return
+
         extraction = await self._brain.extract_quote(
             InboundMessage(
                 message_id=raw.message_id,
@@ -334,6 +472,70 @@ class TickLoop:
             target.project_id, target.negotiation_id, record
         )
 
+    async def _attachments_for(self, record: NegotiationRecord) -> StoredFile | None:
+        """The producer's file, if there is one and it is still there.
+
+        None covers three cases that all mean the same thing to a send: no
+        store configured (the tick runs without one in tests and on a laptop),
+        nothing uploaded, and an object that has since gone. A missing
+        attachment must not take the negotiation down — the answer is still
+        worth sending.
+        """
+        if self._attachments is None or not record.producer_attachment_key:
+            return None
+        return await self._attachments.get(record.producer_attachment_key)
+
+    async def _file_bounce(
+        self,
+        target: DueNegotiation,
+        raw: RawInbound,
+        now: datetime,
+        report: TickReport,
+    ) -> None:
+        """Stop writing to a dead address, quietly, and write down why.
+
+        Quietly is deliberate. There is no decision here for a person to make —
+        the address does not work — and a "needs you" queue filling with dead
+        mailboxes is a queue people stop reading, which costs them the
+        approvals that actually matter.
+
+        Quiet is not unaccountable, though, which is why the note goes in the
+        timeline and onto the record. The producer is never interrupted and can
+        always ask; the briefing draws on both.
+
+        The item is untouched. Its other suppliers carry on.
+        """
+        record = target.record
+        note = bounce_note(raw.from_email, raw.subject)
+
+        _ = await self._repo.append_message(
+            target.project_id,
+            target.negotiation_id,
+            raw.message_id,
+            MessageRecord(
+                direction=MessageDirection.INBOUND,
+                body=raw.body,
+                subject=raw.subject,
+                sim_sent_at=now,
+                gmail_message_id=raw.message_id,
+                bounced=True,
+            ),
+        )
+
+        if not is_terminal(record.state):
+            record.state = apply_event(record.state, NegotiationEvent.AGENT_WALKED_AWAY)
+        record.latest_reasoning = note
+        record.bounced_at = now
+        record.next_action_due_at = None
+        record.updated_at = now
+        await self._repo.save_negotiation(
+            target.project_id, target.negotiation_id, record
+        )
+        # Counted rather than logged: this module reports through TickReport
+        # and has no logger of its own, and the note above is the durable
+        # record a producer can actually read.
+        report.bounced += 1
+
     def _apply_extraction(
         self, record: NegotiationRecord, extraction: QuoteExtraction, now: datetime
     ) -> None:
@@ -379,6 +581,27 @@ class TickLoop:
         # put a finished negotiation back into the very queue that
         # save_negotiation drops it from.
         if is_terminal(record.state):
+            return
+
+        # A shop page has nobody on the other end. It should never be due at
+        # all — listings are created with no due date precisely so they stay
+        # out of this queue — but "should never" is not a guard, and the ways
+        # back in are ordinary producer actions: the floor endpoint and the
+        # answer endpoint both set `next_action_due_at = now`. Without this,
+        # one press of "Push for 10% less" hands a shop URL to the brain and
+        # then mails an empty To: header every fifteen minutes, forever.
+        if is_listing(record):
+            await self._park_listing(due, now, report)
+            return
+
+        # The item is already bought. Its other sellers are still mid-
+        # conversation and would carry on for days about a prop that is
+        # settled — which costs a real person's time and reads, from their
+        # inbox, as being strung along. Rare when approval came after a week
+        # of mail; routine now that a listing can be approved on tick one
+        # while three email negotiations are still in flight.
+        if await self._item_is_settled(due):
+            await self._stand_down(due, now, report)
             return
 
         if not await self._repo.claim_negotiation(
@@ -448,6 +671,62 @@ class TickLoop:
                 report.errors.append(f"{due.negotiation_id}: supplier record vanished")
                 return
 
+            opening = move.action is MoveAction.SEND_OPENING
+            if opening and record.opening_released_at is None:
+                # The gate. A model has written the first message to a stranger,
+                # from this producer's mailbox and over their name, and until
+                # now it went out before they saw it. Park the draft and stop.
+                #
+                # `next_action_due_at` is cleared rather than pushed forward: a
+                # draft is not late, it is waiting on a person, and a due time
+                # would have this row re-decided every sixty seconds for as long
+                # as they take. Approving is what makes it due again.
+                record.draft_subject = (
+                    move.draft_subject or f"Regarding {record.item_id}"
+                )
+                record.draft_body = move.draft_body
+                record.next_action_due_at = None
+                record.updated_at = now
+                await self._repo.save_negotiation(
+                    due.project_id, due.negotiation_id, record
+                )
+                report.openings_drafted += 1
+                return
+
+            # What actually goes out. For an approved opening it is the stored
+            # draft, because the producer may have rewritten it — re-asking the
+            # brain here and sending that instead would leave the edit box
+            # working perfectly and changing nothing. Every later round uses the
+            # brain's fresh text, which is the only thing it can use.
+            #
+            # The fallback covers an approved opening with nothing stored, which
+            # means the draft step never ran rather than that somebody cleared
+            # the box: the API refuses to save an empty subject or body, so
+            # empty here is only ever "never written". Without this, that case
+            # mails a stranger a blank message.
+            subject = (record.draft_subject if opening else "") or (
+                move.draft_subject or f"Regarding {record.item_id}"
+            )
+            body = (record.draft_body if opening else "") or move.draft_body
+
+            # What the producer supplied when the seller asked them something.
+            # Their words go out as written and the brain's are dropped: they
+            # answered a question that was put to them, and paraphrasing that
+            # is how you end up telling a seller something nobody said.
+            attachments: list[Attachment] = []
+            if record.producer_answer or record.producer_attachment_key:
+                if record.producer_answer:
+                    body = record.producer_answer
+                stored = await self._attachments_for(record)
+                if stored is not None:
+                    attachments.append(
+                        Attachment(
+                            filename=stored.filename,
+                            content_type=stored.content_type,
+                            data=stored.data,
+                        )
+                    )
+
             # Threading is built from RFC-822 header ids, never from the
             # transport's own message id. See SentMessage in mail.py for why
             # confusing the two silently shreds the supplier's thread.
@@ -457,13 +736,36 @@ class TickLoop:
             # ticking. Expiry surfaces on the poll above, which every tick does
             # first and unconditionally — so a dead mailbox is noticed on the
             # same pass either way, and recording it twice would be noise.
+            # The producer may have pointed this negotiation somewhere else
+            # before releasing it — at an address they own, so they can answer
+            # as the seller and drive the whole loop in a minute instead of
+            # over five days. Read on every round, not only the opening: a
+            # redirect that lapsed after the first message would send the
+            # counter to the real seller while the reply came from the test
+            # inbox.
+            to_address = record.recipient_override or supplier.email
+
+            if not looks_like_an_address(to_address):
+                # Last line before the transport. A supplier with no address is
+                # a shop, and every earlier guard for that is a condition some
+                # future edit can slip past; this one is on the instruction
+                # that actually sends. Gmail would take `To: ""` and fail with
+                # a 400 that unwinds into the per-negotiation catch, so the
+                # visible symptom of losing this would be a silent retry every
+                # fifteen minutes rather than anything anyone notices.
+                raise RuntimeError(
+                    f"refusing to send to {record.supplier_id}: no address. "
+                    "This is a shop listing, not a correspondent."
+                )
+
             sent = await mail.send(
-                to=supplier.email,
-                subject=move.draft_subject or f"Regarding {record.item_id}",
-                body=move.draft_body,
+                to=to_address,
+                subject=subject,
+                body=body,
                 thread_id=record.gmail_thread_id,
                 in_reply_to=record.last_rfc822_id,
                 references=_references(record),
+                attachments=attachments,
             )
             record.gmail_thread_id = sent.thread_id
             record.last_msg_id = sent.message_id
@@ -479,12 +781,26 @@ class TickLoop:
                 sent.message_id,
                 MessageRecord(
                     direction=MessageDirection.OUTBOUND,
-                    body=move.draft_body,
-                    subject=move.draft_subject,
+                    body=body,
+                    subject=subject,
                     sim_sent_at=now,
                     gmail_message_id=sent.message_id,
                 ),
             )
+
+            # COUNTER and CHASE share this path, so a draft left lying here
+            # would eventually be sent as somebody's counter-offer. The same
+            # goes for the producer's answer and their photograph.
+            #
+            # `recipient_override` is deliberately NOT cleared here, and that
+            # is the opposite case rather than an oversight: it is where this
+            # conversation lives, not something said once. Clear it and the
+            # seller replies to the address the opening went to while every
+            # counter after it goes to the real one.
+            record.draft_subject = ""
+            record.draft_body = ""
+            record.producer_answer = ""
+            record.producer_attachment_key = ""
 
             if move.action is MoveAction.COUNTER:
                 record.rounds_used += 1
@@ -516,6 +832,49 @@ class TickLoop:
         )
         record.updated_at = now
         await self._repo.save_negotiation(due.project_id, due.negotiation_id, record)
+
+    async def _park_listing(
+        self, due: DueNegotiation, now: datetime, report: TickReport
+    ) -> None:
+        """Put a shop row back where it belongs: waiting on a person, not due.
+
+        Not an error and not a walk-away. The listing is still a perfectly good
+        decision for the producer to make; something just made it due that had
+        no business doing so, and the fix is to clear the date and leave the
+        card where it was.
+        """
+        record = due.record
+        record.state = NegotiationState.READY_FOR_HUMAN
+        record.escalation_reason = EscalationReason.LISTING_FOUND.value
+        record.next_action_due_at = None
+        record.updated_at = now
+        await self._repo.save_negotiation(due.project_id, due.negotiation_id, record)
+        report.listings_parked += 1
+
+    async def _item_is_settled(self, due: DueNegotiation) -> bool:
+        """Has this prop already been bought, by any route?"""
+        item = await self._repo.get_item(due.project_id, due.record.item_id)
+        return item is not None and item.status in ITEM_TERMINAL_STATUSES
+
+    async def _stand_down(
+        self, due: DueNegotiation, now: datetime, report: TickReport
+    ) -> None:
+        """Stop writing to a seller about something already sourced.
+
+        DEAD rather than a quiet unschedule, because the transcript should say
+        what happened. The producer bought it elsewhere; this seller was not
+        rejected on their price and the record should not imply they were.
+        """
+        record = due.record
+        if not is_terminal(record.state):
+            record.state = apply_event(record.state, NegotiationEvent.AGENT_WALKED_AWAY)
+        record.latest_reasoning = (
+            "Stopped: this prop was sourced elsewhere and is already ordered."
+        )
+        record.next_action_due_at = None
+        record.updated_at = now
+        await self._repo.save_negotiation(due.project_id, due.negotiation_id, record)
+        report.stood_down += 1
 
     async def _raise_silence(
         self, due: DueNegotiation, now: datetime, report: TickReport

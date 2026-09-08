@@ -85,6 +85,7 @@ IMAGE_TAG="${IMAGE_TAG:-$(git rev-parse --short HEAD 2>/dev/null || echo latest)
 AGENT_SA="${AGENT_SA:-cinema-agent}"
 APPROVALS_SA="${APPROVALS_SA:-cinema-approvals}"
 API_SA="${API_SA:-cinema-api}"
+ATTACHMENTS_BUCKET="${ATTACHMENTS_BUCKET:-${PROJECT_ID}-attachments}"
 SCHEDULER_SA="${SCHEDULER_SA:-cinema-scheduler}"
 ORDERS_DB="${ORDERS_DB:-orders}"
 TOKEN_SECRET="${TOKEN_SECRET:-gmail-agent-refresh-token}"
@@ -145,6 +146,14 @@ VERTEX_LOCATION="${VERTEX_LOCATION:-global}"
 # error says nothing about approvals. Both default hosting domains, because
 # Firebase serves the same site on each.
 ALLOWED_ORIGINS="${CINEMA_ALLOWED_ORIGINS:-https://${PROJECT_ID}.web.app,https://${PROJECT_ID}.firebaseapp.com}"
+
+# Whether signing in is enough to become a producer.
+#
+# On, because the alternative is running scripts/grant_producer.py once per
+# person and that does not survive a room full of judges. Set to 0 and redeploy
+# to close the deployment afterwards; the claim then comes only from that
+# script, and everyone already enrolled keeps it.
+OPEN_ENROLMENT="${OPEN_ENROLMENT:-1}"
 
 # `memory` unless explicitly asked otherwise. See the header.
 MAIL_BACKEND="${MAIL_BACKEND:-memory}"
@@ -266,12 +275,35 @@ case "$MAIL_BACKEND" in
     ;;
   gmail)
     problems=()
+
+    # Two ways a mailbox can exist, and this used to know about only one.
+    #
+    # `$TOKEN_SECRET` is the single agent mailbox that oauth_bootstrap.py fills.
+    # Since per-producer mailboxes landed, a producer connecting Gmail from the
+    # panel writes `$TOKEN_SECRET-<uid>` instead — so a deployment with a
+    # perfectly good mailbox was refused here and pointed at a bootstrap script
+    # it did not need. Either shape counts.
     versions=$(gcloud secrets versions list "$TOKEN_SECRET" \
       --filter='state:ENABLED' --format='value(name)' 2>/dev/null | wc -l | tr -d ' ')
-    [[ "$versions" -gt 0 ]] \
-      || problems+=("secret '$TOKEN_SECRET' has no enabled version — the refresh token has not been bootstrapped into it")
-    [[ -n "$OAUTH_CLIENT_ID" ]] \
-      || problems+=("CINEMA_OAUTH_CLIENT_ID is not set — token refresh fails with invalid_client")
+    producers=$(gcloud secrets list --format='value(name)' 2>/dev/null \
+      | grep -c "^${TOKEN_SECRET}-" || true)
+    [[ "$versions" -gt 0 || "$producers" -gt 0 ]] \
+      || problems+=("no mailbox: '$TOKEN_SECRET' has no enabled version and no producer has connected Gmail from the panel")
+    # Set, and set to something that could actually be a client id.
+    #
+    # "Is it non-empty" was the whole check, and a documentation placeholder
+    # copied verbatim — `your-client-id.apps.googleusercontent.com` — sails
+    # through it. That deploys a service whose token refresh fails with
+    # invalid_client hours later, on the first tick that tries to send, from a
+    # screen that just looks like a slow supplier.
+    #
+    # Google issues these as <numeric project number>-<hash>.apps.
+    # googleusercontent.com, so the leading digits are the cheap tell.
+    if [[ -z "$OAUTH_CLIENT_ID" ]]; then
+      problems+=("CINEMA_OAUTH_CLIENT_ID is not set — token refresh fails with invalid_client")
+    elif [[ ! "$OAUTH_CLIENT_ID" =~ ^[0-9]+-.*\.apps\.googleusercontent\.com$ ]]; then
+      problems+=("CINEMA_OAUTH_CLIENT_ID does not look like a real client id ('$OAUTH_CLIENT_ID') — copy it from the console, APIs & Services → Credentials")
+    fi
     [[ -n "$OAUTH_CLIENT_SECRET" ]] \
       || problems+=("CINEMA_OAUTH_CLIENT_SECRET is not set")
 
@@ -286,7 +318,8 @@ case "$MAIL_BACKEND" in
 
     PROJECT_ID=$PROJECT_ID $0
 
-  or finish the Gmail side first (docs/oauth-runbook.md):
+  or connect a mailbox first — either a producer pressing Connect Gmail in
+  the panel, or the single agent mailbox (docs/oauth-runbook.md):
 
     CINEMA_TOKEN_BACKEND=secret-manager CINEMA_GCP_PROJECT=$PROJECT_ID \\
       uv run python scripts/oauth_bootstrap.py
@@ -295,7 +328,7 @@ case "$MAIL_BACKEND" in
 EOF
       exit 5
     fi
-    ok "refresh token present ($versions version(s)) and OAuth client configured"
+    ok "mailbox present (agent: $versions version(s), producers: $producers) and OAuth client configured"
     printf '  \033[33m!\033[0m this deploy WILL email real sellers once it ticks\n'
     ;;
   *)
@@ -613,6 +646,27 @@ else
   ok "datastore.user for $API_SA — (default) only, CONDITIONED"
 fi
 
+# Setting the producer claim, so a new account does not need a shell.
+#
+# Only this service account. The agent's is deliberately not here: enrolment
+# needs a verified Firebase ID token, which a service account never holds, and
+# the tick service serves no route that could write a claim — but the IAM
+# should say so too rather than relying on both of those staying true.
+#
+# This is the one grant in this file that hands out a permission the deployment
+# previously had nowhere at all. `POST /producers/me` only ever writes the
+# caller's own uid, which is what keeps it bounded; `CINEMA_OPEN_ENROLMENT=0`
+# closes the route without removing the binding.
+if has_role "$API_EMAIL" "roles/firebaseauth.admin"; then
+  skip "firebaseauth.admin for $API_SA"
+else
+  gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+    --member="serviceAccount:${API_EMAIL}" \
+    --role="roles/firebaseauth.admin" \
+    --condition=None >/dev/null
+  ok "firebaseauth.admin for $API_SA — self-enrolment only, never the agent"
+fi
+
 # Writing a producer's refresh token, without being able to read one.
 #
 # Every predefined Secret Manager role that can write can also read, so the
@@ -683,6 +737,41 @@ for reasoner in "$AGENT_SA:$AGENT_EMAIL" "$API_SA:$API_EMAIL"; do
     ok "aiplatform.user for $reasoner_sa — Gemini through Vertex, no API key"
   fi
 done
+
+# The attachments bucket, granted one way each.
+#
+# `cinema-api` takes the upload from the producer's browser and puts it in the
+# bucket; the tick reads it back when it sends. Neither holds both halves, and
+# that is the point rather than an accident of ordering: the service a browser
+# can reach cannot read back what any other producer uploaded, and the service
+# that emails strangers cannot put a new object anywhere.
+#
+# objectViewer for the agent is granted in scripts/gcp_setup.sh, alongside the
+# bucket itself. Only the writer is here, because the api service account is
+# created by this script.
+#
+# Skipped silently when there is no bucket. A deployment without one still
+# works — the answer route refuses a file and says why, and answering a seller
+# in words is most of what this is for.
+if gcloud storage buckets describe "gs://${ATTACHMENTS_BUCKET}" >/dev/null 2>&1; then
+  # JSON and grep, not --filter: `gcloud storage buckets get-iam-policy` does
+  # not accept --filter or --flatten the way `gcloud projects get-iam-policy`
+  # does. See the same fix in scripts/gcp_setup.sh.
+  if gcloud storage buckets get-iam-policy "gs://${ATTACHMENTS_BUCKET}" \
+       --format=json | grep -q "$API_EMAIL"; then
+    skip "objectCreator on gs://${ATTACHMENTS_BUCKET} for $API_SA"
+  else
+    gcloud storage buckets add-iam-policy-binding "gs://${ATTACHMENTS_BUCKET}" \
+      --member="serviceAccount:${API_EMAIL}" \
+      --role="roles/storage.objectCreator" >/dev/null
+    ok "objectCreator for $API_SA — writes uploads, cannot read them back"
+  fi
+else
+  printf '  \033[90m·\033[0m no gs://%s — files are off, answers in words still work.\n' \
+    "$ATTACHMENTS_BUCKET"
+  printf '    Run make gcp-setup to create it.\n'
+  ATTACHMENTS_BUCKET=""
+fi
 
 # Reading the token secret is the tick service's business only. The approvals
 # service never sends mail.
@@ -777,7 +866,8 @@ fi
 # the tick has — but not PARALLEL_API_KEY. Only research_item searches the web,
 # and that runs on the tick; a key here would be a credential in an environment
 # that has no use for it.
-API_BRAIN_ENV="@CINEMA_BRAIN_BACKEND=${BRAIN_BACKEND}"
+API_BRAIN_ENV="@CINEMA_OPEN_ENROLMENT=${OPEN_ENROLMENT}"
+API_BRAIN_ENV="${API_BRAIN_ENV}@CINEMA_BRAIN_BACKEND=${BRAIN_BACKEND}"
 API_BRAIN_ENV="${API_BRAIN_ENV}@CINEMA_GEMINI_MODEL=${GEMINI_MODEL}"
 API_BRAIN_ENV="${API_BRAIN_ENV}@GOOGLE_GENAI_USE_VERTEXAI=true"
 API_BRAIN_ENV="${API_BRAIN_ENV}@GOOGLE_CLOUD_PROJECT=${PROJECT_ID}"
@@ -793,6 +883,15 @@ if [[ -n "$OAUTH_CLIENT_ID" ]]; then
 fi
 if [[ -n "${CINEMA_AGENT_EMAIL:-}" ]]; then
   TICK_ENV="${TICK_ENV}@CINEMA_AGENT_EMAIL=${CINEMA_AGENT_EMAIL}"
+fi
+
+# Emptied above when the bucket does not exist, so an absent bucket reaches
+# the services as an absent variable rather than as a name that 404s at the
+# moment a producer presses Send.
+API_ATTACHMENTS_ENV=""
+if [[ -n "$ATTACHMENTS_BUCKET" ]]; then
+  TICK_ENV="${TICK_ENV}@CINEMA_ATTACHMENTS_BUCKET=${ATTACHMENTS_BUCKET}"
+  API_ATTACHMENTS_ENV="@CINEMA_ATTACHMENTS_BUCKET=${ATTACHMENTS_BUCKET}"
 fi
 
 # --timeout is under the one-minute schedule on purpose, so a wedged tick
@@ -849,7 +948,7 @@ gcloud run deploy "$API_SERVICE" \
   --timeout=60s \
   --max-instances=2 \
   --memory=512Mi \
-  --set-env-vars="^@^CINEMA_GCP_PROJECT=${PROJECT_ID}@CINEMA_LOG_FORMAT=json@CINEMA_ALLOWED_ORIGINS=${ALLOWED_ORIGINS}@CINEMA_TOKEN_BACKEND=secret-manager@CINEMA_REFRESH_TOKEN_SECRET=${TOKEN_SECRET}${API_BRAIN_ENV}${API_OAUTH_ENV}" \
+  --set-env-vars="^@^CINEMA_GCP_PROJECT=${PROJECT_ID}@CINEMA_LOG_FORMAT=json@CINEMA_ALLOWED_ORIGINS=${ALLOWED_ORIGINS}@CINEMA_TOKEN_BACKEND=secret-manager@CINEMA_REFRESH_TOKEN_SECRET=${TOKEN_SECRET}${API_BRAIN_ENV}${API_OAUTH_ENV}${API_ATTACHMENTS_ENV}" \
   --quiet >/dev/null
 ok "$API_SERVICE  (orchestrator.api:app, as $API_SA)"
 

@@ -16,12 +16,18 @@ guessing at an unreadable quote, never accepting above the floor, never buying.
 import re
 from decimal import Decimal
 
-from cinema_contracts.enums import EscalationReason, MessageDirection, MoveAction
+from cinema_contracts.enums import (
+    EscalationReason,
+    MessageDirection,
+    MoveAction,
+    SourcingRoute,
+)
 from cinema_contracts.models import (
     ExtractedQuote,
     InboundMessage,
     ItemBrief,
     ItemResearch,
+    Listing,
     NegotiationContext,
     NextMove,
     ProducerBriefing,
@@ -193,6 +199,23 @@ class ScriptedBrain:
                     confidence=0.4,
                 )
             ],
+            # Only for an item asked to be bought. A real brain would search
+            # differently for the two roads, and a stand-in that returned
+            # listings for everything would let a NEGOTIATE item silently take
+            # the buy route in every test that uses this.
+            listings=(
+                [
+                    Listing(
+                        title=f"{brief.name} — scripted listing",
+                        url=f"https://shop.example.invalid/{brief.item_id}",
+                        price=self._anchor.scaled_by(Decimal("0.9")),
+                        seller="Scripted Shop",
+                        notes="Scripted listing. Not a real product page.",
+                    )
+                ]
+                if brief.route is SourcingRoute.BUY
+                else []
+            ),
         )
 
     async def extract_quote(self, message: InboundMessage) -> QuoteExtraction:

@@ -15,13 +15,33 @@
  * with no body.
  */
 
-import { ComposerPrimitive, MessagePrimitive, ThreadPrimitive } from "@assistant-ui/react";
+import {
+  ComposerPrimitive,
+  MessagePrimitive,
+  ThreadPrimitive,
+} from "@assistant-ui/react";
+import { useReducedMotion, motion } from "motion/react";
 import { useRef, useState } from "react";
 
-import { DECISION_TOOL, EMAIL_TOOL, PROPS_TOOL } from "@/chat/convert";
+import type { Busy } from "@/chat/busy";
+import {
+  DECISION_TOOL,
+  EMAIL_TOOL,
+  LISTING_TOOL,
+  OPENINGS_TOOL,
+  PROPS_TOOL,
+  QUESTION_TOOL,
+  RESEARCH_TOOL,
+} from "@/chat/convert";
 import { DecisionPart } from "@/components/chat/DecisionPart";
 import { EmailPart } from "@/components/chat/EmailPart";
+import { ListingPart } from "@/components/chat/ListingPart";
+import { OpeningsPart } from "@/components/chat/OpeningsPart";
 import { PropsPart } from "@/components/chat/PropsPart";
+import { QuestionPart } from "@/components/chat/QuestionPart";
+import { ResearchPart } from "@/components/chat/ResearchPart";
+import { Working } from "@/components/chat/Working";
+import { Skeleton } from "@/components/ui/skeleton";
 
 const TOOLS = {
   tools: {
@@ -29,15 +49,28 @@ const TOOLS = {
       [EMAIL_TOOL]: EmailPart,
       [DECISION_TOOL]: DecisionPart,
       [PROPS_TOOL]: PropsPart,
+      [OPENINGS_TOOL]: OpeningsPart,
+      [RESEARCH_TOOL]: ResearchPart,
+      [QUESTION_TOOL]: QuestionPart,
+      [LISTING_TOOL]: ListingPart,
     },
   },
 } as const;
 
 export function Transcript({
   onScript,
+  busy,
+  loading,
+  ready,
 }: {
   /** A screenplay dropped anywhere on the thread. */
   onScript: (file: File) => void;
+  /** What is in flight, for the indicator below the last row. */
+  busy: Busy;
+  /** True while the reads that fill this thread are still open. */
+  loading: boolean;
+  /** False when there is no production yet, so nothing here can be uploaded to. */
+  ready: boolean;
 }) {
   const [over, setOver] = useState(false);
 
@@ -55,19 +88,33 @@ export function Transcript({
       onDrop={(e) => {
         e.preventDefault();
         setOver(false);
+        // With no production there is nowhere to put a screenplay, and the
+        // upload would post to `/projects//script` — an empty path segment
+        // matches no route, so the answer is a bare 404 that explains nothing.
+        if (!ready) return;
         const file = e.dataTransfer.files[0];
         if (file) onScript(file);
       }}
     >
       <ThreadPrimitive.Viewport className="flex-1 overflow-y-auto px-6 py-4">
+        {/* Inside `Empty`, so this only ever decides *why* the thread has no
+            rows. A production with twenty props and six negotiations is empty
+            for a moment on every cold load, and it was being shown the pitch
+            written for one that has never had a script — the same
+            loading-read-as-empty this pass keeps finding. */}
         <ThreadPrimitive.Empty>
-          <Empty />
+          {loading ? <Waking /> : ready ? <Empty /> : <NoProduction />}
         </ThreadPrimitive.Empty>
         <ThreadPrimitive.Messages>
           {({ message }) =>
             message.role === "user" ? <Producer /> : <Agent />
           }
         </ThreadPrimitive.Messages>
+
+        {/* Always mounted; it decides for itself whether to show, by reading
+            the runtime's `isRunning`. Gating it from out here would unmount it
+            the instant the thread stopped and kill its exit animation. */}
+        <Working busy={busy} />
       </ThreadPrimitive.Viewport>
 
       <div className="border-t px-6 py-4">
@@ -78,7 +125,7 @@ export function Transcript({
             placeholder="Ask what needs you, who has gone quiet, what things cost…"
             className="max-h-40 flex-1 resize-none rounded-md border bg-background px-3 py-2 text-sm outline-none focus-visible:ring-1 focus-visible:ring-ring"
           />
-          <ScriptButton onScript={onScript} />
+          <ScriptButton onScript={onScript} disabled={!ready} />
           <ComposerPrimitive.Send className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50">
             Ask
           </ComposerPrimitive.Send>
@@ -88,7 +135,13 @@ export function Transcript({
   );
 }
 
-function ScriptButton({ onScript }: { onScript: (file: File) => void }) {
+function ScriptButton({
+  onScript,
+  disabled,
+}: {
+  onScript: (file: File) => void;
+  disabled: boolean;
+}) {
   const picker = useRef<HTMLInputElement>(null);
   return (
     <>
@@ -107,9 +160,14 @@ function ScriptButton({ onScript }: { onScript: (file: File) => void }) {
       />
       <button
         type="button"
+        disabled={disabled}
         onClick={() => picker.current?.click()}
-        className="rounded-md border px-3 py-2 text-sm hover:bg-accent"
-        title="Read a screenplay: text, Fountain, Final Draft or PDF"
+        className="rounded-md border px-3 py-2 text-sm hover:bg-accent disabled:opacity-50"
+        title={
+          disabled
+            ? "Start a production first — there is nowhere to put a script yet"
+            : "Read a screenplay: text, Fountain, Final Draft or PDF"
+        }
       >
         Script
       </button>
@@ -120,9 +178,9 @@ function ScriptButton({ onScript }: { onScript: (file: File) => void }) {
 function Producer() {
   return (
     <MessagePrimitive.Root className="my-3 flex justify-end">
-      <div className="max-w-[80%] rounded-lg bg-muted px-4 py-2 text-sm">
+      <Arrives className="max-w-[80%] rounded-lg bg-muted px-4 py-2 text-sm">
         <MessagePrimitive.Parts />
-      </div>
+      </Arrives>
     </MessagePrimitive.Root>
   );
 }
@@ -130,15 +188,94 @@ function Producer() {
 function Agent() {
   return (
     <MessagePrimitive.Root className="my-3 text-sm">
-      {/* Answers from `/chat` are plain text with newlines the briefing put
-          there on purpose — a list of decisions is a list, not a paragraph. */}
-      <MessagePrimitive.Parts
-        components={{
-          ...TOOLS,
-          Text: ({ text }) => <p className="whitespace-pre-wrap">{text}</p>,
-        }}
-      />
+      <Arrives>
+        {/* Answers from `/chat` are plain text with newlines the briefing put
+            there on purpose — a list of decisions is a list, not a paragraph. */}
+        <MessagePrimitive.Parts
+          components={{
+            ...TOOLS,
+            Text: ({ text }) => <p className="whitespace-pre-wrap">{text}</p>,
+          }}
+        />
+      </Arrives>
     </MessagePrimitive.Root>
+  );
+}
+
+/**
+ * A row easing in rather than appearing.
+ *
+ * The demo argument for this: most of what lands in this transcript was not
+ * typed by anybody. An email to a supplier, a reply that came back days later
+ * — they arrive from Firestore while nobody is watching, and a row that pops
+ * into existence at full opacity is indistinguishable from one that was always
+ * there. The motion is what makes "this happened just now" legible.
+ *
+ * Short and small on purpose. A long entrance on a transcript that fills
+ * itself becomes a screen that will not sit still.
+ */
+function Arrives({
+  children,
+  className,
+}: {
+  children: React.ReactNode;
+  className?: string;
+}) {
+  const still = useReducedMotion();
+
+  if (still) return <div className={className}>{children}</div>;
+
+  return (
+    <motion.div
+      className={className}
+      initial={{ opacity: 0, y: 6 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.22, ease: "easeOut" }}
+    >
+      {children}
+    </motion.div>
+  );
+}
+
+/**
+ * Placeholders shaped like a transcript, not a spinner.
+ *
+ * Right, then left, then left: a producer's turn and two of the agent's, which
+ * is what is about to be there. The shape is the information — it says "rows
+ * are coming" where a spinner says only "wait".
+ */
+function Waking() {
+  return (
+    <div className="mt-4 space-y-3" role="status" aria-label="Loading the transcript">
+      <div className="flex justify-end">
+        <Skeleton className="h-10 w-1/3" />
+      </div>
+      <Skeleton className="h-20 w-4/5" delay={0.12} />
+      <Skeleton className="h-16 w-2/3" delay={0.24} />
+    </div>
+  );
+}
+
+/**
+ * What to say before there is anywhere to put a screenplay.
+ *
+ * The pitch below is right and was being shown too early: a producer with no
+ * production was told to press Script, and pressing it posted to
+ * `/projects//script`, which matches no route and comes back as a bare 404.
+ * The app was inviting the one action that could not work.
+ */
+function NoProduction() {
+  return (
+    <div className="mx-auto mt-16 max-w-md text-center text-sm text-muted-foreground">
+      <p className="text-base font-medium text-foreground">
+        Start a production first.
+      </p>
+      <p className="mt-2">
+        Give it a name under <span className="font-medium">New production</span>{" "}
+        on the left. Everything else — the screenplay, the props, the
+        negotiations — hangs off it.
+      </p>
+    </div>
   );
 }
 

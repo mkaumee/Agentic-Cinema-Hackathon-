@@ -73,4 +73,48 @@ export const signOutOfEverything = async (): Promise<void> => {
   await signOut(auth);
 };
 
+/**
+ * Throw away whatever is stored locally and start again.
+ *
+ * The escape hatch for a session the SDK cannot resolve. `onAuthStateChanged`
+ * normally fires within a moment of load — with the restored user, or with
+ * null — and the app waits for it before rendering anything, because
+ * rendering "signed out" to somebody who is signed in is worse than a brief
+ * spinner. When that callback never fires, though, the wait has no end and no
+ * button on it: the person is stuck on a spinner with no way back to a sign-in
+ * screen, which is the one thing this must never do on somebody else's laptop.
+ *
+ * Seen for real: signs in perfectly on a second device, hangs forever on the
+ * first. That is a local artefact, and this is how you clear it without
+ * knowing what DevTools is.
+ *
+ * `signOut` is raced rather than awaited, because it goes through the same
+ * wedged machinery and can hang exactly as hard. Getting the person back to a
+ * usable screen is the point; a tidy sign-out that never resolves defeats it.
+ */
+export const resetSession = async (): Promise<void> => {
+  await Promise.race([
+    signOut(auth).catch(() => undefined),
+    new Promise((resolve) => setTimeout(resolve, 2000)),
+  ]);
+
+  // Where the SDK persists a session. A corrupt record here is the usual
+  // reason the callback never comes.
+  try {
+    indexedDB.deleteDatabase("firebaseLocalStorageDb");
+  } catch {
+    // Private windows and blocked site data both throw on access rather than
+    // returning empty. There is nothing to clear in that case anyway.
+  }
+  try {
+    // Only Firebase's own keys: this is a repair, not a factory reset, and
+    // wiping somebody's unrelated storage to fix a login is overreach.
+    for (const key of Object.keys(localStorage)) {
+      if (key.startsWith("firebase:")) localStorage.removeItem(key);
+    }
+  } catch {
+    // As above.
+  }
+};
+
 export type { User };

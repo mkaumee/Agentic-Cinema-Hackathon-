@@ -37,16 +37,24 @@ Get that wrong and somebody who can replay a state value attaches their mailbox
 to another producer's account — or worse, has the agent send as them.
 """
 
+import base64
+import binascii
 import logging
 import secrets
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from datetime import timedelta
-from typing import Annotated
+from typing import Annotated, override
 from urllib.parse import urlencode
 
-from cinema_contracts import AgentBrain, Money, ScriptSource
+from cinema_contracts import (
+    AgentBrain,
+    Money,
+    NegotiationState,
+    ScriptSource,
+    SourcingRoute,
+)
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
@@ -56,7 +64,19 @@ from pydantic import BaseModel, Field
 
 from orchestrator import intake
 from orchestrator.app import build_brain, gemini_credentials_route
-from orchestrator.auth import Producer, init_firebase, require_producer
+from orchestrator.attachments import (
+    AttachmentStore,
+    AttachmentWriter,
+    StoredFile,
+    TooLargeError,
+)
+from orchestrator.auth import (
+    Claims,
+    Producer,
+    enrol_producer,
+    init_firebase,
+    require_producer,
+)
 from orchestrator.briefing import summarise
 from orchestrator.clock import SimClock
 from orchestrator.digest import ProjectDigest, as_question, build_digest
@@ -66,7 +86,14 @@ from orchestrator.gmail import (
     producer_token_store,
 )
 from orchestrator.logs import configure_logging
-from orchestrator.records import MailboxRecord, MailboxStatus, ProjectRecord
+from orchestrator.records import (
+    ItemStatus,
+    MailboxRecord,
+    MailboxStatus,
+    NegotiationRecord,
+    ProjectRecord,
+    is_listing,
+)
 from orchestrator.repository import FirestoreRepository
 from orchestrator.scripts import (
     PDF_MIME,
@@ -76,6 +103,8 @@ from orchestrator.scripts import (
     is_document,
 )
 from orchestrator.settings import GMAIL_SCOPES, BrainBackend, Settings
+from orchestrator.sourcing import looks_like_an_address
+from orchestrator.state_machine import NegotiationEvent, apply_event
 
 log = logging.getLogger("orchestrator.api")
 
@@ -109,6 +138,14 @@ class ApiServices:
     it every upload fails at request time rather than at startup, which is why
     `scripts/deploy.sh` grants it to both accounts."""
 
+    attachments: AttachmentWriter | None = None
+    """Where a producer's reference photo waits for the tick that sends it.
+
+    None on a deployment with no bucket, and on a laptop. The answer route
+    refuses a *file* in that case and says so; an answer in words still works,
+    because most of what a seller asks for is words.
+    """
+
 
 def build_api_services(settings: Settings | None = None) -> ApiServices:
     resolved = settings or Settings()
@@ -124,6 +161,11 @@ def build_api_services(settings: Settings | None = None) -> ApiServices:
         # searches the web and it runs on the tick, so a PARALLEL_API_KEY here
         # would be a credential in an environment with no use for it.
         brain=build_brain(resolved, needs_research=False),
+        attachments=(
+            AttachmentStore(resolved.attachments_bucket)
+            if resolved.attachments_bucket
+            else None
+        ),
     )
 
 
@@ -149,10 +191,22 @@ app = FastAPI(title="Greenlit API", lifespan=lifespan)
 # rather than read at import, because settings are built once at startup.
 ALLOWED_ORIGINS: list[str] = []
 
+# Every method this app actually routes, not the two anyone thought of.
+#
+# This list said GET/POST/OPTIONS while the app served PATCH and DELETE, and
+# the failure is silent in the worst way: a browser refuses the *preflight*, so
+# the real request is never sent, nothing reaches a log, and the only thing the
+# page can report is fetch's own "Failed to fetch". Renaming a production,
+# deleting one, and editing an opening email were all inert on the deployment
+# while working perfectly against a test client — because a test client does
+# not do CORS.
+#
+# `test_cors_allows_every_method_this_app_routes` derives the set from
+# `app.routes`, so a new verb cannot be added without this following.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
 
@@ -475,6 +529,104 @@ class ProjectStarted(BaseModel):
     title: str
 
 
+class Enrolled(BaseModel):
+    uid: str
+    email: str
+
+
+class Draft(BaseModel):
+    negotiation_id: str
+    subject: str
+    body: str
+
+
+class EditOpening(BaseModel):
+    subject: str = Field(min_length=1, max_length=300)
+    body: str = Field(min_length=1)
+    """Neither may be emptied.
+
+    An empty stored draft has to keep meaning "never written" — the tick falls
+    back to the brain's text when it sees one, so accepting a cleared box here
+    would silently mail the version the producer just deleted.
+    """
+
+    to_email: str = ""
+    """Send it somewhere other than the seller's own address.
+
+    Empty leaves the supplier's address in place, which is the ordinary case.
+    Anything else has to look like an address: a typo here does not fail
+    loudly, it sends a real production's opening email into a void and then
+    waits two days for a reply from nobody.
+
+    This exists to make the loop demonstrable — point it at an inbox you own,
+    reply as the seller, and the five days collapse into a minute.
+    """
+
+    @override
+    def model_post_init(self, _context: object, /) -> None:
+        if self.to_email and not looks_like_an_address(self.to_email):
+            raise ValueError(f"{self.to_email!r} is not an email address.")
+
+
+class OpeningChoice(BaseModel):
+    """What the producer decided about one drafted opening."""
+
+    negotiation_id: str
+    include: bool = True
+    """False drops it. The same word, and the same meaning, as on the prop
+    list: the thing is recorded as not wanted rather than quietly skipped."""
+
+
+class ReleaseOpenings(BaseModel):
+    openings: list[OpeningChoice] = Field(default_factory=list)
+    """Empty means release every opening still waiting on this production."""
+
+
+class OpeningsReleased(BaseModel):
+    approved: list[str]
+    dropped: list[str] = Field(default_factory=list)
+    """Reported back rather than inferred, so the screen can say what happened
+    to the ones a producer unticked instead of only what it sent."""
+
+
+class AnswerSupplier(BaseModel):
+    """What a producer supplies when a seller asks them something.
+
+    Both optional individually and not together: an answer with neither words
+    nor a file is a button that appears to do something and does not.
+    """
+
+    answer: str = ""
+    filename: str = ""
+    mime_type: str = "application/octet-stream"
+    content_b64: str = ""
+
+    @override
+    def model_post_init(self, _context: object, /) -> None:
+        if not self.answer.strip() and not self.content_b64.strip():
+            raise ValueError(
+                "Send an answer, a file, or both — this reply has neither."
+            )
+
+
+class Answered(BaseModel):
+    negotiation_id: str
+    attached: str = ""
+
+
+class RenameProject(BaseModel):
+    title: str = Field(min_length=1, max_length=120)
+
+
+class ProjectRenamed(BaseModel):
+    project_id: str
+    title: str
+
+
+class ProjectDeleted(BaseModel):
+    project_id: str
+
+
 class UploadScript(BaseModel):
     """Either text, or a file. Not both, and not neither.
 
@@ -496,6 +648,7 @@ class FoundProp(BaseModel):
     qty: int
     consumable: bool
     confidence: float
+    route: SourcingRoute = SourcingRoute.NEGOTIATE
     scenes: list[str]
     lines: list[str]
     """The script lines it was found in. The receipt."""
@@ -510,6 +663,12 @@ class ConfirmedItem(BaseModel):
     qty: int = Field(ge=1, default=1)
     include: bool = True
     floor_price: Money | None = None
+    route: SourcingRoute | None = None
+    """The producer overriding how this prop gets sourced.
+
+    None means "leave the agent's proposal alone", which is what an older
+    client sends and what the checkbox sends when nobody touched it.
+    """
 
 
 class ConfirmItems(BaseModel):
@@ -643,6 +802,7 @@ async def confirm_items(
                     qty=c.qty,
                     include=c.include,
                     floor_price=c.floor_price,
+                    route=c.route,
                 )
                 for c in body.items
             ],
@@ -660,6 +820,371 @@ async def confirm_items(
         },
     )
     return ItemsConfirmed(confirmed=result.confirmed, abandoned=result.abandoned)
+
+
+def _is_pending_opening(record: NegotiationRecord) -> bool:
+    """An opening written, not released, and not yet gone."""
+    return (
+        record.state is NegotiationState.DRAFTED
+        and record.opening_released_at is None
+        and record.draft_body != ""
+    )
+
+
+@app.patch("/projects/{project_id}/negotiations/{negotiation_id}/opening")
+async def edit_opening(
+    request: Request,
+    project_id: str,
+    negotiation_id: str,
+    body: EditOpening,
+    producer: Signed,
+) -> Draft:
+    """Rewrite an opening email before it goes.
+
+    Refused once the opening has been released or the negotiation has moved on.
+    An edit box over a message already in somebody's inbox is a promise the
+    screen cannot keep, and letting it appear to succeed is worse than not
+    offering it.
+    """
+    services = services_of(request)
+    _ = await _owned(services, project_id, producer)
+
+    record = await services.repo.get_negotiation(project_id, negotiation_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"no negotiation {negotiation_id}")
+    if not _is_pending_opening(record):
+        raise HTTPException(
+            status_code=409,
+            detail="that opening has already been sent or approved for sending.",
+        )
+
+    record.draft_subject = body.subject
+    record.draft_body = body.body
+    record.recipient_override = body.to_email.strip().lower()
+    record.updated_at = await services.clock.now(project_id)
+    await services.repo.save_negotiation(project_id, negotiation_id, record)
+    return Draft(
+        negotiation_id=negotiation_id,
+        subject=record.draft_subject,
+        body=record.draft_body,
+    )
+
+
+@app.post("/projects/{project_id}/openings/release")
+async def release_openings(
+    request: Request, project_id: str, body: ReleaseOpenings, producer: Signed
+) -> OpeningsReleased:
+    """Release the opening emails. This is what puts them in the post.
+
+    Nothing is sent here. Approval writes the intent and makes the row due; the
+    tick service holds the mailbox and does the sending. That split is the same
+    one that keeps this service unable to write a purchase order, and it is
+    worth not eroding for convenience.
+
+    Unticking one drops it, exactly as unticking a prop abandons it. That is a
+    positive act rather than an omission on purpose: leaving an unwanted draft
+    pending would put it back in the producer's queue on the next snapshot,
+    every time, forever — and a queue that fills with things somebody has
+    already decided against is a queue people stop reading.
+
+    Dropping is `HUMAN_CANCELLED`, which the state machine has always allowed
+    from DRAFTED. It moves no money, so it belongs on this service rather than
+    on the one that can.
+    """
+    services = services_of(request)
+    _ = await _owned(services, project_id, producer)
+
+    now = await services.clock.now(project_id)
+    # An empty body still means "send everything waiting", which is what the
+    # card did before it had checkboxes.
+    decisions = {choice.negotiation_id: choice.include for choice in body.openings}
+    approved: list[str] = []
+    dropped: list[str] = []
+
+    for negotiation_id, record in (
+        await services.repo.list_negotiations(project_id)
+    ).items():
+        if decisions and negotiation_id not in decisions:
+            continue
+        if not _is_pending_opening(record):
+            continue
+
+        if decisions.get(negotiation_id, True):
+            record.opening_released_at = now
+            # Due immediately: approving is the producer saying send it, and a
+            # delay would read as the agent ignoring them.
+            record.next_action_due_at = now
+            approved.append(negotiation_id)
+        else:
+            record.state = apply_event(record.state, NegotiationEvent.HUMAN_CANCELLED)
+            record.latest_reasoning = "You dropped this one before it was sent."
+            record.next_action_due_at = None
+            dropped.append(negotiation_id)
+
+        record.updated_at = now
+        await services.repo.save_negotiation(project_id, negotiation_id, record)
+
+    log.info(
+        "openings decided",
+        extra={
+            "project_id": project_id,
+            "uid": producer.uid,
+            "approved": len(approved),
+            "dropped": len(dropped),
+        },
+    )
+    return OpeningsReleased(approved=approved, dropped=dropped)
+
+
+@app.post("/producers/me")
+async def enrol_me(request: Request, claims: Claims) -> Enrolled:
+    """Become a producer, if being signed in is enough here.
+
+    Behind `Claims` — a verified token — rather than `Signed`, which is a
+    verified token *plus* the claim this route exists to grant. A route gated on
+    its own output would never be reachable.
+
+    It takes no body. `uid` comes from the token, so there is no field a caller
+    could use to enrol somebody else, and that is a property of the signature
+    rather than a check somebody could delete.
+
+    None of this reaches the agent. It authenticates as a service account and
+    never holds a Firebase ID token, the tick service does not serve this route,
+    and its account has no IAM to write a claim. The binding that actually stops
+    the agent spending money is still the one it does not have on the orders
+    database.
+    """
+    services = services_of(request)
+    if not services.settings.open_enrolment:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "this deployment is not taking new producers. An admin grants "
+                "the role with scripts/grant_producer.py."
+            ),
+        )
+
+    producer = enrol_producer(claims)
+    return Enrolled(uid=producer.uid, email=producer.email)
+
+
+@app.post("/projects/{project_id}/negotiations/{negotiation_id}/answer")
+async def answer_supplier(
+    request: Request,
+    project_id: str,
+    negotiation_id: str,
+    body: AnswerSupplier,
+    producer: Signed,
+) -> Answered:
+    """Give the seller what they asked for, and let the agent carry on.
+
+    A seller asking for a reference photo is not a quote and not a failure —
+    it is a reasonable question the agent cannot answer by trying harder. The
+    negotiation parked; this un-parks it.
+
+    The words are sent as written rather than rewritten by the brain: the
+    producer answered a question that was put to them, and paraphrasing that is
+    how a seller ends up being told something nobody said.
+
+    Nothing is emailed here. This service holds no mailbox; it records what to
+    send and makes the row due, and the tick posts it within the minute.
+    """
+    services = services_of(request)
+    _ = await _owned(services, project_id, producer)
+
+    record = await services.repo.get_negotiation(project_id, negotiation_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"no negotiation {negotiation_id}")
+    if is_listing(record):
+        # A shop page cannot have asked anything, so nothing should ever reach
+        # here for one. If it did, the damage is the same as the floor
+        # endpoint's: this route sets `next_action_due_at = now`, which puts a
+        # row with no email address into the tick's send path.
+        raise HTTPException(
+            status_code=409,
+            detail=("This is a shop listing. There is no seller here to answer."),
+        )
+
+    key = ""
+    if body.content_b64:
+        if services.attachments is None:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "This deployment has no attachment bucket configured, so a "
+                    "file cannot be sent. An answer on its own still can."
+                ),
+            )
+        try:
+            raw = base64.b64decode(body.content_b64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise HTTPException(
+                status_code=422, detail="That upload was not valid base64."
+            ) from exc
+        try:
+            key = await services.attachments.put(
+                project_id,
+                negotiation_id,
+                StoredFile(
+                    filename=body.filename or "attachment",
+                    content_type=body.mime_type,
+                    data=raw,
+                ),
+            )
+        except TooLargeError as exc:
+            raise HTTPException(status_code=413, detail=str(exc)) from exc
+
+    now = await services.clock.now(project_id)
+    record.producer_answer = body.answer.strip()
+    record.producer_attachment_key = key
+    record.escalation_reason = ""
+    # Due immediately: the producer has just answered, and a delay here reads
+    # as the agent ignoring them.
+    record.next_action_due_at = now
+    record.updated_at = now
+    if record.state is NegotiationState.READY_FOR_HUMAN:
+        record.state = apply_event(record.state, NegotiationEvent.HUMAN_ANSWERED)
+    await services.repo.save_negotiation(project_id, negotiation_id, record)
+
+    log.info(
+        "producer answered a supplier",
+        extra={
+            "project_id": project_id,
+            "negotiation_id": negotiation_id,
+            "uid": producer.uid,
+            "attached": bool(key),
+        },
+    )
+    return Answered(negotiation_id=negotiation_id, attached=key)
+
+
+class ConfirmReceipt(BaseModel):
+    """Did the shop checkout actually go through?"""
+
+    received: bool
+    note: str = Field(default="", max_length=500)
+
+
+class ReceiptConfirmed(BaseModel):
+    item_id: str
+    received: bool
+
+
+@app.post("/projects/{project_id}/items/{item_id}/receipt")
+async def confirm_receipt(
+    request: Request,
+    project_id: str,
+    item_id: str,
+    body: ConfirmReceipt,
+    producer: Signed,
+) -> ReceiptConfirmed:
+    """Say whether the shop checkout completed.
+
+    Not called ``/purchase``: `test_this_service_cannot_spend_money` refuses any
+    route on this service whose path contains "approve" or "purchase", and it
+    was right to refuse this one. Those words are reserved for the service that
+    can actually spend, and a route here wearing one would read like a second
+    way to buy something. It is the same rule that made releasing the opening
+    emails ``/openings/release``.
+
+    Approving a listing records that the producer was *sent to a shop*. Nothing
+    in this system can know they finished paying — the payment happens on
+    somebody else's site — so an item reading ORDERED on the strength of a
+    click is the screen guessing, and this is where it stops guessing.
+
+    Note where this does not write. `purchase_orders` is create-only by Hard
+    Rule 4 and `firestore.orders.rules` denies update outright, so this cannot
+    and must not amend the order. It writes to the item, in the default
+    database, from the service that has no orders binding at all — which is
+    right on its own terms as well: saying "yes I bought it" moves no money and
+    has no business on the money path.
+
+    **A failed checkout does not un-order anything.** The purchase order stands,
+    because that document is never rewritten and making the one receipt in this
+    system mutable to fix a UI state would cost more than it buys. What changes
+    is that the item stops claiming to be sorted, and carries the producer's
+    note about why.
+    """
+    services = services_of(request)
+    _ = await _owned(services, project_id, producer)
+
+    item = await services.repo.get_item(project_id, item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail=f"no item {item_id}")
+    if item.status is not ItemStatus.ORDERED:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{item_id} is {item.status.value}, not ORDERED. There is no "
+                "purchase to confirm until one has been approved."
+            ),
+        )
+
+    now = await services.clock.now(project_id)
+    item.purchase_confirmed_at = now if body.received else None
+    item.purchase_note = "" if body.received else body.note.strip()
+    item.updated_at = now
+    await services.repo.save_item(project_id, item_id, item)
+
+    log.info(
+        "shop checkout reported",
+        extra={
+            "project_id": project_id,
+            "item_id": item_id,
+            "received": body.received,
+            "uid": producer.uid,
+        },
+    )
+    return ReceiptConfirmed(item_id=item_id, received=body.received)
+
+
+@app.patch("/projects/{project_id}")
+async def rename_project(
+    request: Request, project_id: str, body: RenameProject, producer: Signed
+) -> ProjectRenamed:
+    """Change what a production is called.
+
+    Only the title. The id was derived from the original title and is now in
+    the path of everything underneath, so it stays whatever it was — a
+    production called one thing and filed under another is fine, and rewriting
+    those paths to chase a retyped name is how correspondence goes missing.
+    """
+    services = services_of(request)
+    _ = await _owned(services, project_id, producer)
+
+    await services.repo.rename_project(project_id, body.title)
+    log.info(
+        "project renamed",
+        extra={"project_id": project_id, "uid": producer.uid},
+    )
+    return ProjectRenamed(project_id=project_id, title=body.title)
+
+
+@app.delete("/projects/{project_id}")
+async def delete_project(
+    request: Request, project_id: str, producer: Signed
+) -> ProjectDeleted:
+    """Remove a production and everything underneath it.
+
+    Everything underneath is not a flourish. The tick finds work through
+    collection-group queries on ``next_action_due_at``, which do not consult
+    the list of projects at all, so a production whose document alone was
+    deleted goes on emailing suppliers out of orphaned rows nobody can see.
+
+    Purchase orders are not touched and cannot be: they live in another
+    database this service has no binding on, and nothing may delete one. An
+    approved order outlives the production it was approved for, which is the
+    correct way round — money left the building.
+    """
+    services = services_of(request)
+    _ = await _owned(services, project_id, producer)
+
+    await services.repo.delete_project(project_id)
+    log.info(
+        "project deleted",
+        extra={"project_id": project_id, "uid": producer.uid},
+    )
+    return ProjectDeleted(project_id=project_id)
 
 
 def _source_for(body: UploadScript) -> ScriptSource:

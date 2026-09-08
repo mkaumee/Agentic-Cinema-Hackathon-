@@ -201,6 +201,34 @@ class Settings(BaseSettings):
     def origin_list(self) -> list[str]:
         return [o.strip() for o in self.allowed_origins.split(",") if o.strip()]
 
+    attachments_bucket: str = ""
+    """Cloud Storage bucket holding files a producer sends to a seller.
+
+    Empty means no attachments on this deployment: the answer route refuses a
+    file and says so, and words still go through. Deliberately not defaulted to
+    a guessed name — a bucket that does not exist fails at send time, hours
+    after the producer thought they had attached something.
+    """
+
+    open_enrolment: bool = True
+    """Whether signing in is enough to become a producer.
+
+    On, a producer claims the role for themselves at first sign-in and the
+    panel works for anybody who can reach it. Off, the claim comes only from
+    ``scripts/grant_producer.py`` and a new account gets a 403 until somebody
+    runs it.
+
+    Defaulted on because the alternative was a shell command per person, which
+    does not survive contact with a room full of judges. It is a setting rather
+    than a constant so the deployment can be closed afterwards without a code
+    change — this is the one knob in the system that decides who may spend
+    money on their own behalf, and it should be turnable.
+
+    Either way this never reaches the agent: enrolment needs a verified Firebase
+    ID token, the tick service has no such route, and its account has no IAM to
+    write a claim.
+    """
+
     auth_emulator_host: str = ""
     """Mirrors FIREBASE_AUTH_EMULATOR_HOST, for reporting on /health.
 
@@ -218,8 +246,41 @@ class Settings(BaseSettings):
     # -- loop -------------------------------------------------------------- #
 
     tick_limit: int = 50
-    """How many due negotiations one tick may take. Bounded so a tick that gets
-    killed has done a predictable amount of work."""
+    """How many due negotiations one tick may advance.
+
+    Only negotiations. This used to govern research as well, which meant one
+    number stood for two jobs of wildly different cost and the expensive one
+    silently inherited the cheap one's budget.
+    """
+
+    send_limit: int = 2
+    """How many messages one tick may post.
+
+    Gmail bills a send heavily against a per-minute, per-user cost limit, and
+    this loop is bursty by construction: three sellers are approached per item
+    and all three become due in the same instant. Without a budget one pass
+    fires them back to back and Gmail refuses the lot — which is exactly what
+    the deployment logged, three rejections inside one second.
+
+    Two per minute is a hundred and twenty an hour, far more than a production
+    generates, and it reads as a person working through their post rather than
+    a machine emptying a queue. Nothing is lost: rows over budget are left due
+    and taken by the next tick.
+    """
+
+    research_limit: int = 3
+    """How many items one tick may research.
+
+    Far below `tick_limit`, because researching a single item is a reasoning
+    call plus several web searches — the most expensive thing the loop does.
+    Fifty of them cannot fit in a fifty-second request, and Cloud Run killing
+    the attempt is what starved the sending step behind it.
+
+    Three fits comfortably with room for the rest of the pass. Nothing is lost
+    to the smaller number: an item not reached stays due and is picked up on
+    the next tick, so a twenty-prop script takes a handful of minutes instead
+    of one pass that never finishes.
+    """
 
     poll_query: str = "is:unread -from:me"
     """Gmail search for the by-hand inspection poll, and nothing else.

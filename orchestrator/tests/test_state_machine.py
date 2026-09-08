@@ -240,3 +240,22 @@ def test_no_move_maps_to_a_human_event() -> None:
     for action in MoveAction:
         event = event_for_move(action)
         assert event is None or event not in HUMAN_EVENTS
+
+
+def test_answering_a_seller_is_a_human_event() -> None:
+    """The only other way out of the stop state, and it is not the agent's.
+
+    ``AGENT_EVENTS`` is defined by subtraction, so an event added to the enum
+    and forgotten here is granted to the agent by default. That happened:
+    ``HUMAN_ANSWERED`` un-parks a READY_FOR_HUMAN negotiation, and for one
+    commit the agent could raise it. The stop condition still existed; the
+    agent could simply step over it.
+    """
+    assert NegotiationEvent.HUMAN_ANSWERED in HUMAN_EVENTS
+    assert NegotiationEvent.HUMAN_ANSWERED not in AGENT_EVENTS
+
+
+def test_every_human_named_event_is_a_human_event() -> None:
+    """The general form of the bug above, so the next one is caught by name."""
+    named = {e for e in NegotiationEvent if e.value.startswith("HUMAN_")}
+    assert named <= HUMAN_EVENTS, f"agent-reachable: {sorted(named - HUMAN_EVENTS)}"

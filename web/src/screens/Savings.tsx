@@ -12,20 +12,35 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { SkeletonRows } from "@/components/ui/skeleton";
 import type { Item, Negotiation } from "@/hooks/useProject";
 import { money, saving } from "@/lib/format";
 
 export function Savings({
   items,
   negotiations,
+  loading = false,
 }: {
   items: Item[];
   negotiations: Negotiation[];
+  loading?: boolean;
 }) {
   const rows = items
     .map((item) => {
       const best = negotiations
-        .filter((n) => n.item_id === item.id && n.latest_quote !== undefined)
+        // Listings are excluded, and not as a tidiness measure. A shop price
+        // beats a negotiated one by construction, so leaving them in means the
+        // cheapest row for an item is the listing — its first and latest quote
+        // are the same number, `saving` returns null, and the real reduction
+        // somebody spent five days winning vanishes from the savings screen.
+        // Their prices would also be summed into "sellers opened at", of
+        // prices no seller ever offered.
+        .filter(
+          (n) =>
+            n.item_id === item.id &&
+            n.latest_quote !== undefined &&
+            (n.listing_url ?? "") === "",
+        )
         .sort(
           (a, b) =>
             (a.latest_quote?.unit_price?.amount ?? Infinity) -
@@ -42,6 +57,11 @@ export function Savings({
     (sum, r) => sum + (r.negotiation.first_quote?.unit_price?.amount ?? 0),
     0,
   );
+
+  // "Nothing has moved off its opening price yet" is a real and useful answer.
+  // It is also what this said while the quotes were still being read, which
+  // made it a false one.
+  if (loading) return <SkeletonRows rows={3} className="mt-2" />;
 
   return (
     <div className="space-y-4">

@@ -20,6 +20,7 @@ Threading rules, which live here because getting them wrong is silent:
   match files their reply against the wrong negotiation.
 """
 
+from collections.abc import Sequence
 from typing import ClassVar, Protocol
 from uuid import uuid4
 
@@ -46,6 +47,21 @@ class RawInbound(BaseModel):
     body: str
     has_attachments: bool = False
     attachment_filenames: list[str] = Field(default_factory=list)
+
+
+class Attachment(BaseModel):
+    """A file to hang on an outbound message.
+
+    Bytes rather than a path or a URL: the transport does not know where the
+    producer's reference photo is stored and should not learn, and a seller
+    asking for a picture wants a picture rather than a link they have to trust.
+    """
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
+
+    filename: str
+    content_type: str
+    data: bytes
 
 
 class SentMessage(BaseModel):
@@ -83,6 +99,7 @@ class MailTransport(Protocol):
         thread_id: str = "",
         in_reply_to: str = "",
         references: str = "",
+        attachments: Sequence[Attachment] = (),
     ) -> SentMessage:
         """Send a message, starting a thread or continuing one.
 
@@ -110,6 +127,10 @@ class MailTransport(Protocol):
         nothing at this scale.
         """
         ...
+
+
+AGENT_ADDRESS = "agent@example.invalid"
+"""Who the fake's own outbound appears to come from."""
 
 
 class InMemoryMailbox:
@@ -146,6 +167,7 @@ class InMemoryMailbox:
         thread_id: str = "",
         in_reply_to: str = "",
         references: str = "",
+        attachments: Sequence[Attachment] = (),
     ) -> SentMessage:
         message_id = self._next_id("msg")
         # Shaped like a real header so tests catch anyone conflating the two ids.
@@ -161,7 +183,31 @@ class InMemoryMailbox:
                 "references": references,
                 "message_id": message_id,
                 "rfc822_message_id": rfc822,
+                # Filenames joined rather than a list, so this stays a
+                # dict[str, str] and the thirty-odd tests that read a field off
+                # it do not all have to learn a union. A test asserting the
+                # producer's file went out reads it with `in`.
+                "attachments": ", ".join(a.filename for a in attachments),
             }
+        )
+        # Our own outbound goes into the inbox too, because that is what the
+        # real transport does: Gmail keeps every message of a conversation in
+        # its thread, and `poll` fetches threads by id, so each pass re-offers
+        # what we sent. The fake not doing this was another way it was kinder
+        # than the thing it stands for — and it is how a SENT-labelled reply
+        # from the producer's own address got dropped in production while every
+        # test here passed. What stops the agent answering itself is
+        # `_file_reply` recognising the message id it filed, and that is only
+        # under test if the fake hands it back.
+        self._inbox.append(
+            RawInbound(
+                message_id=message_id,
+                rfc822_message_id=rfc822,
+                thread_id=resolved_thread,
+                from_email=AGENT_ADDRESS,
+                subject=subject,
+                body=body,
+            )
         )
         return SentMessage(
             message_id=message_id,
@@ -176,9 +222,16 @@ class InMemoryMailbox:
             # destroy anything.
             return list(self._inbox)
 
-        mine = [m for m in self._inbox if m.thread_id in threads]
-        self._inbox = [m for m in self._inbox if m.thread_id not in threads]
-        return mine
+        # Deliberately does not drain. The real transport re-offers every
+        # message in a live thread on every poll — it stopped using Gmail's
+        # UNREAD label as the "already seen" marker, because the producer
+        # clears that by opening their own inbox — and dedupe now happens when
+        # filing, against the message ids we stored.
+        #
+        # A fake that drained would model behaviour the real one does not have,
+        # and would leave that dedupe untested. This bug survived precisely
+        # because the fake was kinder than the thing it stood for.
+        return [m for m in self._inbox if m.thread_id in threads]
 
     # -- test-side helpers, not part of MailTransport ---------------------- #
 

@@ -35,6 +35,10 @@ import type { Row } from "./rows";
 export const EMAIL_TOOL = "email";
 export const DECISION_TOOL = "approve_purchase";
 export const PROPS_TOOL = "read_script";
+export const OPENINGS_TOOL = "draft_openings";
+export const RESEARCH_TOOL = "research_items";
+export const QUESTION_TOOL = "answer_supplier";
+export const LISTING_TOOL = "buy_listing";
 
 /**
  * A briefing, plus the note saying who wrote it.
@@ -119,6 +123,50 @@ export function toThreadMessage(row: Row): ThreadMessageLike {
         createdAt: row.at,
       };
 
+    case "research":
+      // The one part in here that carries a real `status`. assistant-ui gives
+      // tool-call parts a ToolCallMessagePartStatus and hands it to the
+      // renderer, which is the library's own way of saying "this is still
+      // going" — better than a bespoke boolean the component would have to be
+      // told about separately.
+      return {
+        id: row.id,
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: row.id,
+            toolName: RESEARCH_TOOL,
+            args: { items: row.items },
+            ...(row.running
+              ? {}
+              : { result: { items: row.items.length } }),
+          },
+        ],
+        status: row.running ? { type: "running" } : { type: "complete", reason: "stop" },
+        createdAt: row.at,
+      };
+
+    case "openings":
+      // Like `props`, and for the same reason: the writing has happened, the
+      // sending has not. Deliberately not an `approval` — that primitive is
+      // one decision, and this is a batch a producer reads and releases
+      // together.
+      return {
+        id: row.id,
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: row.id,
+            toolName: OPENINGS_TOOL,
+            args: { openings: row.openings },
+            result: { count: row.openings.length },
+          },
+        ],
+        createdAt: row.at,
+      };
+
     case "decision":
       // Deliberately no `result`: this one has not happened and must not look
       // as though it has. The `approval` field is what makes the library
@@ -142,6 +190,57 @@ export function toThreadMessage(row: Row): ThreadMessageLike {
               rivals: row.rivals,
             },
             approval: { id: row.negotiationId },
+          },
+        ],
+        createdAt: row.at,
+      };
+
+    case "listing":
+      // No `approval`, and not for the reason a question has none. The library
+      // renders an approval as accept-or-reject, and the reject here would have
+      // to mean "do not buy this", which is just leaving it alone. The card
+      // carries its own button because pressing it also opens the shop.
+      return {
+        id: row.id,
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: row.id,
+            toolName: LISTING_TOOL,
+            args: {
+              negotiationId: row.negotiationId,
+              itemId: row.itemId,
+              item: row.itemName,
+              shop: row.shop,
+              price: row.price,
+              url: row.url,
+              rivals: row.rivals,
+            },
+          },
+        ],
+        createdAt: row.at,
+      };
+
+    case "question":
+      // No `approval`, unlike a decision. An approval is a yes-or-no the
+      // library renders with accept and reject; this needs a person to type
+      // something and possibly attach a file, and there is no version of
+      // "reject" here that means anything to the seller waiting on it.
+      return {
+        id: row.id,
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: row.id,
+            toolName: QUESTION_TOOL,
+            args: {
+              negotiationId: row.negotiationId,
+              item: row.itemName,
+              supplier: row.supplier,
+              asked: row.asked,
+            },
           },
         ],
         createdAt: row.at,

@@ -55,7 +55,13 @@ def summarise(digest: ProjectDigest, question: str) -> tuple[str, list[Reference
 
     if any(word in asked for word in ("need", "waiting", "approve", "decide")):
         return _waiting(digest)
-    if any(word in asked for word in ("quiet", "silent", "chas", "stuck", "slow")):
+    # "bounce" and "dead" route here rather than to the overview because a
+    # producer only asks them after noticing a supplier went missing, and the
+    # overview would answer with a count that does not mention them at all.
+    if any(
+        word in asked
+        for word in ("quiet", "silent", "chas", "stuck", "slow", "bounc", "dead")
+    ):
         return _quiet(digest)
     if any(word in asked for word in ("cost", "price", "spend", "budget", "saving")):
         return _money_answer(digest)
@@ -88,11 +94,23 @@ def _waiting(digest: ProjectDigest) -> tuple[str, list[Referenced]]:
         chosen, *rivals = sorted(
             group, key=lambda n: n.latest_quote.amount if n.latest_quote else _DEAREST
         )
-        why = chosen.escalation_reason or "the agent stopped here"
-        line = (
-            f"  · {chosen.item_name} — {chosen.supplier} at "
-            f"{_money(chosen.latest_quote)} after {chosen.rounds_used} round(s). {why}."
-        )
+        # A listing and a negotiated quote are both decisions and are not the
+        # same sentence. Describing a shop page as "MYR 89 after 0 round(s)"
+        # invents a conversation, and a producer who spots one invention stops
+        # believing the numbers either.
+        if chosen.is_listing:
+            line = (
+                f"  · {chosen.item_name} — listed by {chosen.supplier} at "
+                f"{_money(chosen.latest_quote)}. Nothing negotiated; that is "
+                f"the price on the page."
+            )
+        else:
+            why = chosen.escalation_reason or "the agent stopped here"
+            line = (
+                f"  · {chosen.item_name} — {chosen.supplier} at "
+                f"{_money(chosen.latest_quote)} after "
+                f"{chosen.rounds_used} round(s). {why}."
+            )
         if rivals:
             line += f" {len(rivals)} dearer quote(s) for the same prop."
         lines.append(line)
@@ -110,6 +128,12 @@ def _quiet(digest: ProjectDigest) -> tuple[str, list[Referenced]]:
     """
     chasing = [n for n in digest.negotiations if n.state == "CHASING"]
     dead = [n for n in digest.negotiations if n.state == "DEAD"]
+    bounced = [n for n in dead if n.bounced]
+    # Never written to, so nobody failed to answer. Today this is a draft the
+    # producer dropped from the openings card; it would also cover anything
+    # else that dies before first contact.
+    unsent = [n for n in dead if not n.bounced and not n.ever_written_to]
+    silent = [n for n in dead if not n.bounced and n.ever_written_to]
     if not chasing and not dead:
         return ("Every supplier who was written to has answered.", [])
 
@@ -120,18 +144,59 @@ def _quiet(digest: ProjectDigest) -> tuple[str, list[Referenced]]:
         for n in chasing:
             lines.append(f"  · {n.supplier} about {n.item_name}")
             refs.append(("negotiation", n.negotiation_id, n.item_name))
-    if dead:
-        lines.append(f"{len(dead)} gave up on after no reply:")
-        for n in dead:
+    if silent:
+        lines.append(f"{len(silent)} gave up on after no reply:")
+        for n in silent:
             lines.append(f"  · {n.supplier} about {n.item_name}")
             refs.append(("negotiation", n.negotiation_id, n.item_name))
+    if unsent:
+        lines.append(f"{len(unsent)} you dropped before they were sent:")
+        for n in unsent:
+            lines.append(f"  · {n.supplier} about {n.item_name}")
+            refs.append(("negotiation", n.negotiation_id, n.item_name))
+    if bounced:
+        # Separated from the silent ones because they are a different problem
+        # with a different fix. Nobody was interrupted when these bounced —
+        # a dead mailbox is not a decision — so this answer is the only place
+        # the producer finds out, and calling it "no reply" would send them
+        # off to chase an address that does not exist.
+        lines.append(f"{len(bounced)} stopped because the address bounced:")
+        for n in bounced:
+            note = f" — {n.reasoning}" if n.reasoning else ""
+            lines.append(f"  · {n.supplier} about {n.item_name}{note}")
+            refs.append(("negotiation", n.negotiation_id, n.item_name))
+        lines.append(
+            "No more email goes to those. Their props carry on with "
+            "whoever else was written to."
+        )
     return ("\n".join(lines), refs)
 
 
 def _money_answer(digest: ProjectDigest) -> tuple[str, list[Referenced]]:
-    quoted = [n for n in digest.negotiations if n.latest_quote is not None]
+    # Listings are excluded from every sentence below about movement. A shop
+    # price did not open anywhere and did not come down, so counting it as a
+    # supplier who "has not moved off their opening" is a complaint about
+    # somebody who was never asked.
+    listings = [
+        n for n in digest.negotiations if n.is_listing and n.latest_quote is not None
+    ]
+    quoted = [
+        n
+        for n in digest.negotiations
+        if n.latest_quote is not None and not n.is_listing
+    ]
     if not quoted:
-        return ("No supplier has quoted a price yet.", [])
+        answer = "No supplier has quoted a price yet."
+        cheapest_listing = _cheapest(listings)
+        if cheapest_listing is not None:
+            # "Nobody has quoted" is true and, on a production sourced entirely
+            # from shop pages, reads as nothing having happened at all.
+            answer += (
+                f" {len(listings)} prop(s) have a shop listing instead — "
+                f"cheapest {cheapest_listing.item_name} at "
+                f"{_money(cheapest_listing.latest_quote)}."
+            )
+        return (answer, [])
 
     lines: list[str] = []
     refs: list[Referenced] = []
@@ -160,6 +225,15 @@ def _money_answer(digest: ProjectDigest) -> tuple[str, list[Referenced]]:
             f"at {_money(best.latest_quote)}."
         )
         refs.append(("negotiation", best.negotiation_id, best.item_name))
+    if listings:
+        best = _cheapest(listings)
+        if best is not None:
+            lines.append(
+                f"\n{len(listings)} prop(s) have a shop listing rather than a "
+                f"negotiation — cheapest {best.item_name} at "
+                f"{_money(best.latest_quote)}. Those are buy-it-yourself links, "
+                f"not offers anyone made."
+            )
     lines.append("These are quotes, not purchases. Nothing has been bought.")
     return ("\n".join(lines), refs)
 
@@ -183,14 +257,20 @@ def _overview(digest: ProjectDigest) -> tuple[str, list[Referenced]]:
     It says what is true and then what it can be asked, rather than improvising
     an answer to a question it did not understand.
     """
-    live = [n for n in digest.negotiations if n.state not in _DEAD]
-    lines = [
-        (
-            f"{digest.title}: {len(digest.items)} prop(s), "
-            f"{len(live)} live negotiation(s), "
-            f"{digest.waiting_count} waiting on you."
-        )
-    ]
+    live = [n for n in digest.negotiations if n.state not in _DEAD and not n.is_listing]
+    listings = [n for n in digest.negotiations if n.is_listing]
+    headline = (
+        f"{digest.title}: {len(digest.items)} prop(s), "
+        f"{len(live)} live negotiation(s), "
+        f"{digest.waiting_count} waiting on you."
+    )
+    if listings:
+        # Counted apart from negotiations, because a listing involves no
+        # conversation and saying "12 live negotiations" of a shopping list
+        # would make the number meaningless on the productions where it
+        # matters most.
+        headline += f" {len(listings)} prop(s) are shop listings to buy directly."
+    lines = [headline]
     refs: list[Referenced] = []
 
     best = _cheapest(live)

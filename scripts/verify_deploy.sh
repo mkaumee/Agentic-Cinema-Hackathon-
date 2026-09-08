@@ -44,6 +44,7 @@ REGION="${REGION:-us-central1}"
 AGENT_SA="${AGENT_SA:-cinema-agent}"
 APPROVALS_SA="${APPROVALS_SA:-cinema-approvals}"
 API_SA="${API_SA:-cinema-api}"
+SCHEDULER_SA="${SCHEDULER_SA:-cinema-scheduler}"
 ORDERS_DB="${ORDERS_DB:-orders}"
 TICK_SERVICE="${TICK_SERVICE:-cinema-tick}"
 APPROVALS_SERVICE="${APPROVALS_SERVICE:-cinema-approvals}"
@@ -59,6 +60,27 @@ command -v gcloud >/dev/null || { echo "gcloud is not installed." >&2; exit 2; }
 AGENT_EMAIL="${AGENT_SA}@${PROJECT_ID}.iam.gserviceaccount.com"
 APPROVALS_EMAIL="${APPROVALS_SA}@${PROJECT_ID}.iam.gserviceaccount.com"
 API_EMAIL="${API_SA}@${PROJECT_ID}.iam.gserviceaccount.com"
+SCHEDULER_EMAIL="${SCHEDULER_SA}@${PROJECT_ID}.iam.gserviceaccount.com"
+
+# An identity token Cloud Run will actually accept for the tick.
+#
+# `gcloud auth print-identity-token` on its own mints a token whose `aud` is
+# gcloud's own OAuth client, and Cloud Run requires `aud` to be the service
+# URL. So the front door refused it with an HTML 401 before the container was
+# ever reached, and this script reported a healthy private service as broken —
+# then, because the same token is used to read /health, gave up on three more
+# checks it could not answer. Four of twenty-two, every run, for a token that
+# could never have worked.
+#
+# `--audiences` needs a service account rather than a user login, so this
+# impersonates the one Cloud Scheduler uses. That is the point rather than a
+# workaround: it makes this the real path — same identity, same audience, same
+# call the scheduler makes every minute.
+tick_token() {
+  gcloud auth print-identity-token \
+    --impersonate-service-account="$SCHEDULER_EMAIL" \
+    --audiences="$TICK_URL" 2>/dev/null || true
+}
 
 PASSED=0
 FAILED=0
@@ -193,10 +215,13 @@ if [[ -n "$TICK_URL" ]]; then
              note "body: ${anon#*$'\t'}" ;;
   esac
 
-  token=$(gcloud auth print-identity-token 2>/dev/null || true)
+  token=$(tick_token)
   if [[ -z "$token" ]]; then
-    huh "could not mint an identity token, so the authorised path is untested"
-    note "  gcloud auth login"
+    huh "could not mint an identity token for the tick, so it is untested"
+    note "  needs permission to impersonate $SCHEDULER_SA:"
+    note "  gcloud iam service-accounts add-iam-policy-binding $SCHEDULER_EMAIL \\"
+    note "    --member=\"user:\$(gcloud config get-value account)\" \\"
+    note "    --role=roles/iam.serviceAccountTokenCreator"
   else
     check_http "an authorised GET /health" 200 \
       -H "Authorization: Bearer $token" "$TICK_URL/health"
@@ -536,7 +561,7 @@ say "7. What is actually reasoning"
 # visible from any screen in the product. Reporting them is the whole job.
 
 if [[ -n "$TICK_URL" ]]; then
-  token=$(gcloud auth print-identity-token 2>/dev/null || true)
+  token=$(tick_token)
   tick_health=$(body_of -H "Authorization: Bearer $token" "$TICK_URL/health")
 
   brain=$(field brain_backend <<<"$tick_health")

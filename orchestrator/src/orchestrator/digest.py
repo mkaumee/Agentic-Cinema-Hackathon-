@@ -33,7 +33,12 @@ from cinema_contracts import (
     ProducerQuestion,
 )
 
-from orchestrator.records import ItemRecord, ItemStatus, NegotiationRecord
+from orchestrator.records import (
+    ItemRecord,
+    ItemStatus,
+    NegotiationRecord,
+    is_listing,
+)
 
 WAITING_STATES = frozenset({NegotiationState.READY_FOR_HUMAN})
 """Where the agent has stopped and cannot continue without a person.
@@ -76,6 +81,35 @@ class NegotiationLine:
     why rather than only what."""
     waiting_on_human: bool
     escalation_reason: str
+    is_listing: bool = False
+    """A shop page, not a conversation.
+
+    Every sentence a briefing might build about a negotiation assumes a
+    counterpart: rounds spent, an opening price they came down from, whether
+    they have gone quiet. None of that is true of a listing, and it is not
+    almost-true either — "Mirror from Shopee at MYR 89 after 0 rounds" is a
+    description of a negotiation that never happened.
+    """
+
+    listing_url: str = ""
+
+    ever_written_to: bool = True
+    """Whether a word was ever actually sent to this seller.
+
+    False for an opening the producer dropped before releasing it. "We gave up
+    after no reply" is untrue of somebody who was never written to, and it
+    sends a producer off to chase a conversation that never started — the same
+    shape of mistake the bounce split fixed.
+    """
+
+    bounced: bool = False
+    """Dead because the address bounced, not because nobody answered.
+
+    Carried so a producer who asks "what happened to Skyline Props?" gets the
+    truth rather than the generic DEAD wording. The agent does not interrupt
+    anyone over a bounce — there is no decision in a dead mailbox — but not
+    interrupting is only defensible if asking still works.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +204,10 @@ def build_digest(
                 reasoning=record.latest_reasoning,
                 waiting_on_human=record.state in WAITING_STATES,
                 escalation_reason=record.escalation_reason,
+                is_listing=is_listing(record),
+                listing_url=record.listing_url,
+                ever_written_to=record.last_outbound_at is not None,
+                bounced=record.bounced_at is not None,
             )
         )
 
@@ -216,6 +254,8 @@ def as_question(digest: ProjectDigest, question: str) -> ProducerQuestion:
                 reasoning=talk.reasoning,
                 waiting_on_human=talk.waiting_on_human,
                 escalation_reason=talk.escalation_reason,
+                is_listing=talk.is_listing,
+                bounced=talk.bounced,
             )
             for talk in digest.negotiations
         ],

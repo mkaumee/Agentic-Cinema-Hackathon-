@@ -44,11 +44,18 @@ export function PropList({
   found: PropsRow["props"];
   name: string;
 }) {
-  // Store only edits. Newly arriving drafts use their saved quantity and are
-  // included by default, without resetting edits to the other items.
-  const [choices, setChoices] = useState<Record<string, { qty: number; include: boolean }>>(
-    {},
-  );
+  // Only what the producer changed. Everything else falls back to the agent's
+  // proposal at the point of use — included, at the quantity it suggested, on
+  // the route it guessed. Their job is to catch what is wrong, not to re-enter
+  // what is right.
+  //
+  // Empty rather than seeded from `found`, because `found` grows: this card is
+  // rebuilt from the Firestore snapshot, so an item can arrive after the first
+  // render. Seeding in `useState` happens once, and any prop landing later
+  // would have had no entry at all.
+  const [choices, setChoices] = useState<
+    Record<string, { qty: number; include: boolean; route: string }>
+  >({});
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -76,10 +83,14 @@ export function PropList({
         item_id: p.item_id,
         qty: choices[p.item_id]?.qty ?? p.qty,
         include: choices[p.item_id]?.include ?? true,
+        route: choices[p.item_id]?.route ?? p.route ?? "NEGOTIATE",
       })),
     )
       .then((result) => {
-        // Confirmed items disappear when the Firestore snapshot arrives.
+        // A confirmed item leaves `DRAFT`, so the card empties itself when the
+        // snapshot lands. Saying "3 props confirmed" under a card that is about
+        // to vanish would be a local flag standing in for the fact; the only
+        // thing left worth reporting is what went wrong.
         if (result.kind === "error") setError(result.detail);
       })
       .finally(() => setBusy(false));
@@ -88,6 +99,8 @@ export function PropList({
   return (
     <div className="my-2 rounded-lg border px-4 py-3 text-sm">
       <p className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
+        {/* A card rebuilt from stored items has no filename to show: the item
+            does not record which upload it came from. */}
         {name ? `Read from ${name}` : "Unconfirmed props"}
       </p>
       <p className="mt-1 font-medium">
@@ -96,7 +109,11 @@ export function PropList({
 
       <div className="mt-3 space-y-2">
         {found.map((prop) => {
-          const choice = choices[prop.item_id] ?? { qty: prop.qty, include: true };
+          const choice = choices[prop.item_id] ?? {
+            qty: prop.qty,
+            include: true,
+            route: prop.route ?? "NEGOTIATE",
+          };
           return (
             <div
               key={prop.item_id}
@@ -121,7 +138,34 @@ export function PropList({
                     destroyed on camera
                   </span>
                 )}
-                <label className="ml-auto flex items-center gap-1 text-xs text-muted-foreground">
+                {/* The route toggle. Here rather than on a card that appears
+                    later, because this is the last moment before anything is
+                    researched or written to a stranger — and the producer is
+                    the one who knows the birdcage is being built and the mugs
+                    are not. The agent only guessed. */}
+                <span className="ml-auto flex overflow-hidden rounded border text-xs">
+                  {(["NEGOTIATE", "BUY"] as const).map((option) => (
+                    <button
+                      key={option}
+                      type="button"
+                      disabled={busy || !choice.include}
+                      onClick={() =>
+                        setChoices((prior) => ({
+                          ...prior,
+                          [prop.item_id]: { ...choice, route: option },
+                        }))
+                      }
+                      className={`px-2 py-0.5 ${
+                        choice.route === option
+                          ? "bg-foreground text-background"
+                          : "text-muted-foreground"
+                      }`}
+                    >
+                      {option === "BUY" ? "buy online" : "negotiate"}
+                    </button>
+                  ))}
+                </span>
+                <label className="flex items-center gap-1 text-xs text-muted-foreground">
                   qty
                   <input
                     type="number"
@@ -154,15 +198,20 @@ export function PropList({
         })}
       </div>
 
-      {error && <p role="alert" className="mt-3 text-sm">{error}</p>}
       <div className="mt-3 flex items-center gap-3">
-        <Button size="sm" disabled={busy || kept === 0} onClick={confirm}>
+        <Button
+          size="sm"
+          loading={busy}
+          disabled={busy || kept === 0}
+          onClick={confirm}
+        >
           {busy ? "Confirming…" : `Confirm ${kept}`}
         </Button>
         <span className="text-xs text-muted-foreground">
           Nothing is researched or emailed until you do.
         </span>
       </div>
+      {error !== "" && <p className="mt-2 text-xs text-destructive">{error}</p>}
     </div>
   );
 }

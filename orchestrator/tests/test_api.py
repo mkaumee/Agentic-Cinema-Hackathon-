@@ -2,8 +2,11 @@
 # urllib's parse_qs is annotated to return Unknown-keyed dicts.
 # The `tokens` fixture is requested for its side effect — standing the Auth
 # emulator up before init_firebase runs — so it is deliberately unread.
+# firebase-admin ships no type information; that is about the library, not
+# this code, and conftest.py suppresses it the same way.
 # pyright: reportAny=false, reportUnknownMemberType=false
 # pyright: reportUnknownVariableType=false, reportUnknownArgumentType=false
+# pyright: reportMissingTypeStubs=false
 # pyright: reportUnusedParameter=false
 """The producer's browser-facing service.
 
@@ -15,10 +18,12 @@ another producer's account — or has the agent send as them.
 """
 
 import base64
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import cast, final
 from urllib.parse import parse_qs, urlparse
 
+import firebase_admin
 import httpx
 import pytest
 from cinema_contracts import (
@@ -34,8 +39,16 @@ from cinema_contracts import (
 )
 from cinema_contracts.testing import ScriptedBrain
 from conftest import TokenMinter
+from fastapi.middleware.cors import CORSMiddleware
+from firebase_admin import auth as firebase_auth
 from google.cloud.firestore_v1 import AsyncClient
 from orchestrator.api import MAX_REASON, ApiServices, app, build_api_services
+from orchestrator.attachments import (
+    MAX_BYTES,
+    AttachmentStore,
+    StoredFile,
+    TooLargeError,
+)
 from orchestrator.auth import init_firebase
 from orchestrator.clock import ClockState, SimClock
 from orchestrator.records import (
@@ -263,6 +276,9 @@ def test_this_service_cannot_spend_money() -> None:
     """
     paths = [getattr(route, "path", "") for route in app.routes]
 
+    # "approve" is reserved for money in this codebase, which is why releasing
+    # the opening emails is /openings/release rather than /openings/approve —
+    # this assertion is what caught that naming and it was right to.
     assert not [p for p in paths if "approve" in p or "purchase" in p], paths
     assert "orders" not in set(ApiServices.__dataclass_fields__)
     assert "orders_client" not in set(ApiServices.__dataclass_fields__)
@@ -940,3 +956,969 @@ async def test_an_empty_briefing_says_it_was_empty(
 
     assert body["source"] == "stored-facts"
     assert "empty" in body["fallback_reason"].lower()
+
+
+# --------------------------------------------------------------------------- #
+# Renaming and deleting
+# --------------------------------------------------------------------------- #
+
+
+async def test_renaming_changes_the_title_only(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    headers = _auth(tokens)
+    project_id = await _start(api, headers, title="Nihgtfall")
+
+    reply = await api.patch(
+        f"/projects/{project_id}", headers=headers, json={"title": "Nightfall"}
+    )
+
+    assert reply.status_code == 200, reply.text
+    assert reply.json()["project_id"] == project_id, "the id it is filed under stays"
+    project = await FirestoreRepository(firestore).get_project(project_id)
+    assert project is not None
+    assert project.title == "Nightfall"
+
+
+async def test_deleting_removes_the_production_and_its_work(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    """Through the route, so the ownership check and the recursion are both in
+    the path a browser actually takes."""
+    headers = _auth(tokens)
+    project_id = await _start(api, headers)
+    _ = await api.post(
+        f"/projects/{project_id}/script", headers=headers, json=_script_body()
+    )
+    repo = FirestoreRepository(firestore)
+    assert await repo.list_items(project_id) != {}
+
+    reply = await api.delete(f"/projects/{project_id}", headers=headers)
+
+    assert reply.status_code == 200, reply.text
+    assert await repo.get_project(project_id) is None
+    assert await repo.list_items(project_id) == {}
+
+
+async def test_a_stranger_cannot_rename_or_delete_a_production(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    """Same boundary as every other route here. The admin SDK bypasses
+    firestore.rules, so `_owned` is the only thing standing between a
+    signed-in stranger and somebody else's production — and these two are the
+    routes where getting that wrong is unrecoverable."""
+    repo = await _owned_project(firestore, "someone-elses", "a-different-producer")
+    headers = _auth(tokens, "outsider@example.invalid")
+
+    renamed = await api.patch(
+        "/projects/someone-elses", headers=headers, json={"title": "Mine Now"}
+    )
+    deleted = await api.delete("/projects/someone-elses", headers=headers)
+
+    assert renamed.status_code == deleted.status_code == 404
+    project = await repo.get_project("someone-elses")
+    assert project is not None, "still there"
+    assert project.title == "Kopitiam", "and still called what its owner called it"
+
+
+# --------------------------------------------------------------------------- #
+# Enrolling yourself as a producer
+# --------------------------------------------------------------------------- #
+
+
+async def test_signing_in_is_enough_to_become_a_producer(
+    api: httpx.AsyncClient, tokens: TokenMinter
+) -> None:
+    """The whole point: no shell command between a new account and the panel.
+
+    ``mint`` with no role gives a signed-in identity that would be refused
+    everywhere. After enrolling, a *fresh* token carries the claim — fresh
+    because custom claims are baked in at issue time, which is why the browser
+    forces a token refresh after calling this.
+    """
+    email = "newcomer@example.invalid"
+    unclaimed = {"Authorization": f"Bearer {tokens.mint(email)}"}
+
+    started = await api.post("/projects", headers=unclaimed, json={"title": "Before"})
+    assert started.status_code == 403, "not a producer yet"
+
+    enrolled = await api.post("/producers/me", headers=unclaimed)
+    assert enrolled.status_code == 200, enrolled.text
+
+    refreshed = {"Authorization": f"Bearer {tokens.sign_in(email)}"}
+    after = await api.post("/projects", headers=refreshed, json={"title": "After"})
+    assert after.status_code == 201, after.text
+
+
+async def test_enrolling_twice_is_fine(
+    api: httpx.AsyncClient, tokens: TokenMinter
+) -> None:
+    """The panel calls this on every sign-in, so it has to be boring."""
+    headers = {"Authorization": f"Bearer {tokens.mint('twice@example.invalid')}"}
+
+    first = await api.post("/producers/me", headers=headers)
+    second = await api.post("/producers/me", headers=headers)
+
+    assert first.status_code == second.status_code == 200
+    assert first.json()["uid"] == second.json()["uid"]
+
+
+async def test_enrolling_only_ever_claims_the_caller(
+    api: httpx.AsyncClient, tokens: TokenMinter
+) -> None:
+    """The containment, checked rather than asserted in a comment.
+
+    The route takes no body, so there is no field naming somebody else — this
+    test is what would fail if one were ever added.
+    """
+    assert firebase_admin._apps  # pyright: ignore[reportPrivateUsage]
+    bystander = tokens.create("bystander@example.invalid")
+    headers = {"Authorization": f"Bearer {tokens.mint('claimer@example.invalid')}"}
+
+    _ = await api.post("/producers/me", headers=headers)
+
+    assert not (firebase_auth.get_user(bystander).custom_claims or {}), (
+        "somebody who did not ask was given a role"
+    )
+
+
+async def test_a_closed_deployment_refuses_to_enrol(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    """The off switch, so the deployment can be closed once judging is over.
+
+    Swaps the settings on the live services rather than the environment,
+    because `Settings` is read once at startup — which is also why turning this
+    off in production is a redeploy of the api service and not a live toggle.
+    """
+    headers = {"Authorization": f"Bearer {tokens.mint('late@example.invalid')}"}
+    closed = replace(
+        _services(firestore),
+        settings=SETTINGS.model_copy(update={"open_enrolment": False}),
+    )
+    app.state.services = closed
+    try:
+        refused = await api.post("/producers/me", headers=headers)
+    finally:
+        app.state.services = _services(firestore)
+
+    assert refused.status_code == 403
+    assert "grant_producer" in refused.text, "and says how to get in anyway"
+
+
+# --------------------------------------------------------------------------- #
+# Reading the opening emails before they go
+# --------------------------------------------------------------------------- #
+
+
+async def _pending_opening(
+    firestore: AsyncClient, project_id: str, negotiation_id: str = "neg1"
+) -> FirestoreRepository:
+    repo = FirestoreRepository(firestore)
+    await repo.save_negotiation(
+        project_id,
+        negotiation_id,
+        NegotiationRecord(
+            item_id="mirror",
+            supplier_id="sup1",
+            state=NegotiationState.DRAFTED,
+            draft_subject="Hire enquiry",
+            draft_body="Hi, do you hire mirrors?",
+            created_at=T0,
+            updated_at=T0,
+        ),
+    )
+    return repo
+
+
+async def test_an_opening_can_be_rewritten_before_it_goes(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    headers = _auth(tokens)
+    project_id = await _start(api, headers)
+    repo = await _pending_opening(firestore, project_id)
+
+    reply = await api.patch(
+        f"/projects/{project_id}/negotiations/neg1/opening",
+        headers=headers,
+        json={"subject": "About a mirror", "body": "Rewritten by a person."},
+    )
+
+    assert reply.status_code == 200, reply.text
+    record = await repo.get_negotiation(project_id, "neg1")
+    assert record is not None
+    assert record.draft_body == "Rewritten by a person."
+    assert record.opening_released_at is None, "editing does not send it"
+    assert record.next_action_due_at is None, "and does not make it due"
+
+
+async def test_approving_makes_the_opening_due_without_sending_it(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    """This service holds no mailbox and sends nothing.
+
+    Approval writes the intent; the tick service does the posting. Same split
+    that keeps this one unable to write a purchase order.
+    """
+    headers = _auth(tokens)
+    project_id = await _start(api, headers)
+    repo = await _pending_opening(firestore, project_id)
+
+    reply = await api.post(
+        f"/projects/{project_id}/openings/release", headers=headers, json={}
+    )
+
+    assert reply.status_code == 200, reply.text
+    assert reply.json()["approved"] == ["neg1"]
+    record = await repo.get_negotiation(project_id, "neg1")
+    assert record is not None
+    assert record.opening_released_at is not None
+    assert record.next_action_due_at is not None
+    assert record.state is NegotiationState.DRAFTED, "still unsent until a tick runs"
+
+
+async def test_an_approved_opening_can_no_longer_be_edited(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    """An edit box over a message already on its way is a promise the screen
+    cannot keep."""
+    headers = _auth(tokens)
+    project_id = await _start(api, headers)
+    _ = await _pending_opening(firestore, project_id)
+    _ = await api.post(
+        f"/projects/{project_id}/openings/release", headers=headers, json={}
+    )
+
+    late = await api.patch(
+        f"/projects/{project_id}/negotiations/neg1/opening",
+        headers=headers,
+        json={"subject": "Too late", "body": "Too late."},
+    )
+
+    assert late.status_code == 409
+
+
+async def test_an_empty_opening_is_refused(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    """Empty has to keep meaning "never written".
+
+    The tick falls back to the brain's text when the stored draft is empty, so
+    saving a cleared box here would mail the very version the producer deleted.
+    """
+    headers = _auth(tokens)
+    project_id = await _start(api, headers)
+    _ = await _pending_opening(firestore, project_id)
+
+    reply = await api.patch(
+        f"/projects/{project_id}/negotiations/neg1/opening",
+        headers=headers,
+        json={"subject": "Still here", "body": ""},
+    )
+
+    assert reply.status_code == 422
+
+
+async def test_a_stranger_cannot_read_or_release_an_opening(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    _ = await _owned_project(firestore, "someone-elses", "a-different-producer")
+    repo = await _pending_opening(firestore, "someone-elses")
+    headers = _auth(tokens, "outsider@example.invalid")
+
+    edited = await api.patch(
+        "/projects/someone-elses/negotiations/neg1/opening",
+        headers=headers,
+        json={"subject": "Mine", "body": "Mine."},
+    )
+    approved = await api.post(
+        "/projects/someone-elses/openings/release", headers=headers, json={}
+    )
+
+    assert edited.status_code == approved.status_code == 404
+    record = await repo.get_negotiation("someone-elses", "neg1")
+    assert record is not None
+    assert record.opening_released_at is None, "nothing was released"
+    assert record.draft_body == "Hi, do you hire mirrors?", "and nothing was rewritten"
+
+
+# --------------------------------------------------------------------------- #
+# Answering a seller who asked the producer something
+# --------------------------------------------------------------------------- #
+
+
+class _FakeBucket:
+    """Stands in for Cloud Storage. Keeps the key rule and the size limit.
+
+    Both of those are the parts a test can be wrong about: the key is what
+    stops one production reading another's uploads, and the limit is the only
+    thing between a phone photograph and a send that fails at the transport.
+    """
+
+    def __init__(self) -> None:
+        self.files: dict[str, StoredFile] = {}
+
+    async def put(self, project_id: str, negotiation_id: str, file: StoredFile) -> str:
+        if len(file.data) > MAX_BYTES:
+            raise TooLargeError(f"{file.filename} is over the limit.")
+        key = AttachmentStore.key_for(project_id, negotiation_id, file.filename)
+        self.files[key] = file
+        return key
+
+
+def _with_bucket(firestore: AsyncClient, bucket: _FakeBucket | None) -> None:
+    repo = FirestoreRepository(firestore)
+    app.state.services = ApiServices(
+        settings=SETTINGS,
+        client=firestore,
+        repo=repo,
+        clock=SimClock(repo),
+        brain=ScriptedBrain(),
+        attachments=bucket,
+    )
+
+
+def _upload(answer: str = "", data: bytes = b"") -> dict[str, object]:
+    return {
+        "answer": answer,
+        "filename": "reference.jpg" if data else "",
+        "mime_type": "image/jpeg",
+        "content_b64": base64.b64encode(data).decode() if data else "",
+    }
+
+
+async def test_an_answer_and_a_file_send_the_negotiation_back_to_work(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    """The whole point of the parked state is that it un-parks.
+
+    Nothing is emailed here — this service holds no mailbox. It stores the
+    bytes, records the words, and makes the row due; the tick posts it.
+    """
+    owner = tokens.create("owner@example.invalid")
+    headers = {
+        "Authorization": f"Bearer {tokens.grant(owner, 'owner@example.invalid')}"
+    }
+    repo = await _owned_project(firestore, "kopitiam", owner)
+    bucket = _FakeBucket()
+    _with_bucket(firestore, bucket)
+
+    reply = await api.post(
+        "/projects/kopitiam/negotiations/neg1/answer",
+        headers=headers,
+        json=_upload("It is the tall one in the corner.", b"\xff\xd8jpeg-ish"),
+    )
+
+    assert reply.status_code == 200, reply.text
+    key = str(reply.json()["attached"])
+    assert key == "kopitiam/neg1/reference.jpg", "scoped so it cannot be guessed"
+    assert bucket.files[key].data == b"\xff\xd8jpeg-ish"
+
+    record = await repo.get_negotiation("kopitiam", "neg1")
+    assert record is not None
+    assert record.producer_answer == "It is the tall one in the corner."
+    assert record.producer_attachment_key == key
+    assert record.state is NegotiationState.NEGOTIATING, "no longer waiting on anyone"
+    assert record.next_action_due_at is not None, "and due now, not on a timer"
+    assert record.escalation_reason == "", "so it leaves the Needs You queue"
+
+
+async def test_words_alone_are_a_complete_answer(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    """Most of what a seller asks for is a sentence, not a photograph."""
+    owner = tokens.create("owner@example.invalid")
+    headers = {
+        "Authorization": f"Bearer {tokens.grant(owner, 'owner@example.invalid')}"
+    }
+    repo = await _owned_project(firestore, "kopitiam", owner)
+    _with_bucket(firestore, _FakeBucket())
+
+    reply = await api.post(
+        "/projects/kopitiam/negotiations/neg1/answer",
+        headers=headers,
+        json=_upload("About 1.2 metres tall."),
+    )
+
+    assert reply.status_code == 200, reply.text
+    assert reply.json()["attached"] == ""
+    record = await repo.get_negotiation("kopitiam", "neg1")
+    assert record is not None
+    assert record.producer_answer == "About 1.2 metres tall."
+    assert record.producer_attachment_key == ""
+
+
+async def test_an_answer_with_nothing_in_it_is_refused(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    """A Send button that posts an empty reply to a seller is worse than none.
+
+    The seller asked a question; a blank round-trip reads as the agent
+    acknowledging it and answering nothing.
+    """
+    owner = tokens.create("owner@example.invalid")
+    headers = {
+        "Authorization": f"Bearer {tokens.grant(owner, 'owner@example.invalid')}"
+    }
+    repo = await _owned_project(firestore, "kopitiam", owner)
+    _with_bucket(firestore, _FakeBucket())
+
+    reply = await api.post(
+        "/projects/kopitiam/negotiations/neg1/answer",
+        headers=headers,
+        json=_upload("   "),
+    )
+
+    assert reply.status_code == 422
+    record = await repo.get_negotiation("kopitiam", "neg1")
+    assert record is not None
+    assert record.state is NegotiationState.READY_FOR_HUMAN, "still parked"
+
+
+async def test_a_file_too_big_to_email_is_refused_here(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    """Refused at the door rather than at the transport.
+
+    Accepting it would store the bytes, un-park the negotiation, and then fail
+    on the tick — where the producer never sees it and the seller waits.
+    """
+    owner = tokens.create("owner@example.invalid")
+    headers = {
+        "Authorization": f"Bearer {tokens.grant(owner, 'owner@example.invalid')}"
+    }
+    repo = await _owned_project(firestore, "kopitiam", owner)
+    _with_bucket(firestore, _FakeBucket())
+
+    reply = await api.post(
+        "/projects/kopitiam/negotiations/neg1/answer",
+        headers=headers,
+        json=_upload("Here you go.", b"x" * (MAX_BYTES + 1)),
+    )
+
+    assert reply.status_code == 413
+    record = await repo.get_negotiation("kopitiam", "neg1")
+    assert record is not None
+    assert record.producer_answer == "", "nothing was recorded"
+    assert record.state is NegotiationState.READY_FOR_HUMAN, "and nothing un-parked"
+
+
+async def test_a_deployment_with_no_bucket_says_so_instead_of_dropping_the_file(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    """Silently sending the words without the photo is the bad failure.
+
+    The producer would see a sent reply and assume the seller has their
+    reference image. They do not.
+    """
+    owner = tokens.create("owner@example.invalid")
+    headers = {
+        "Authorization": f"Bearer {tokens.grant(owner, 'owner@example.invalid')}"
+    }
+    repo = await _owned_project(firestore, "kopitiam", owner)
+    _with_bucket(firestore, None)
+
+    refused = await api.post(
+        "/projects/kopitiam/negotiations/neg1/answer",
+        headers=headers,
+        json=_upload("Attached.", b"\xff\xd8jpeg-ish"),
+    )
+
+    assert refused.status_code == 503
+    record = await repo.get_negotiation("kopitiam", "neg1")
+    assert record is not None
+    assert record.state is NegotiationState.READY_FOR_HUMAN
+
+    # Words still work on the same deployment: no bucket is not no answering.
+    words = await api.post(
+        "/projects/kopitiam/negotiations/neg1/answer",
+        headers=headers,
+        json=_upload("It is 1.2 metres tall."),
+    )
+    assert words.status_code == 200, words.text
+
+
+async def test_a_corrupt_upload_is_refused_rather_than_stored(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    owner = tokens.create("owner@example.invalid")
+    headers = {
+        "Authorization": f"Bearer {tokens.grant(owner, 'owner@example.invalid')}"
+    }
+    _ = await _owned_project(firestore, "kopitiam", owner)
+    bucket = _FakeBucket()
+    _with_bucket(firestore, bucket)
+
+    reply = await api.post(
+        "/projects/kopitiam/negotiations/neg1/answer",
+        headers=headers,
+        json={
+            "answer": "Attached.",
+            "filename": "reference.jpg",
+            "mime_type": "image/jpeg",
+            "content_b64": "not base64 at all!!",
+        },
+    )
+
+    assert reply.status_code == 422
+    assert bucket.files == {}
+
+
+async def test_a_stranger_cannot_answer_your_supplier(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    """Answering is speaking as the producer, to their seller, from their
+    mailbox. It is scoped like everything else."""
+    repo = await _owned_project(firestore, "someone-elses", "a-different-producer")
+    bucket = _FakeBucket()
+    _with_bucket(firestore, bucket)
+    headers = _auth(tokens, "outsider@example.invalid")
+
+    reply = await api.post(
+        "/projects/someone-elses/negotiations/neg1/answer",
+        headers=headers,
+        json=_upload("Send it to me instead.", b"\xff\xd8jpeg-ish"),
+    )
+
+    assert reply.status_code == 404
+    assert bucket.files == {}, "and the bytes never reached the bucket"
+    record = await repo.get_negotiation("someone-elses", "neg1")
+    assert record is not None
+    assert record.producer_answer == ""
+
+
+async def test_answering_a_negotiation_that_is_not_there(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    owner = tokens.create("owner@example.invalid")
+    headers = {
+        "Authorization": f"Bearer {tokens.grant(owner, 'owner@example.invalid')}"
+    }
+    _ = await _owned_project(firestore, "kopitiam", owner)
+    _with_bucket(firestore, _FakeBucket())
+
+    reply = await api.post(
+        "/projects/kopitiam/negotiations/no-such-negotiation/answer",
+        headers=headers,
+        json=_upload("Hello?"),
+    )
+
+    assert reply.status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# Shop listings: a decision with nobody on the other end
+# --------------------------------------------------------------------------- #
+
+
+async def _listing(firestore: AsyncClient, project_id: str) -> FirestoreRepository:
+    """A prop sourced from a shop page rather than from a person."""
+    repo = FirestoreRepository(firestore)
+    await repo.save_supplier(
+        project_id,
+        "shop1",
+        SupplierRecord(
+            name="A Marketplace",
+            email="",
+            listing_url="https://shop.example.invalid/mirror",
+        ),
+    )
+    await repo.save_negotiation(
+        project_id,
+        "listing1",
+        NegotiationRecord(
+            item_id="mirror",
+            supplier_id="shop1",
+            state=NegotiationState.READY_FOR_HUMAN,
+            listing_url="https://shop.example.invalid/mirror",
+            latest_quote=ExtractedQuote(
+                unit_price=Money(amount=89, currency="MYR"),
+                total=Money(amount=89, currency="MYR"),
+            ),
+            escalation_reason="LISTING_FOUND",
+            created_at=T0,
+            updated_at=T0,
+        ),
+    )
+    return repo
+
+
+async def test_a_shop_listing_cannot_be_answered_as_though_it_asked_something(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    """A product page did not ask a question, and cannot be replied to.
+
+    Not cosmetic. This route sets `next_action_due_at = now`, which is how a
+    row with no email address gets into the tick's send path — the same failure
+    the floor endpoint has, reached through a different door.
+    """
+    owner = tokens.create("owner@example.invalid")
+    headers = {
+        "Authorization": f"Bearer {tokens.grant(owner, 'owner@example.invalid')}"
+    }
+    repo = await _owned_project(firestore, "kopitiam", owner)
+    _ = await _listing(firestore, "kopitiam")
+    _with_bucket(firestore, _FakeBucket())
+
+    reply = await api.post(
+        "/projects/kopitiam/negotiations/listing1/answer",
+        headers=headers,
+        json=_upload("Here is the photo you asked for."),
+    )
+
+    assert reply.status_code == 409
+    record = await repo.get_negotiation("kopitiam", "listing1")
+    assert record is not None
+    assert record.next_action_due_at is None, "still out of the tick's queue"
+    assert record.producer_answer == ""
+
+
+async def test_saying_the_checkout_went_through(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    """Approving a listing sends someone to a shop. Only they know what happened."""
+    owner = tokens.create("owner@example.invalid")
+    headers = {
+        "Authorization": f"Bearer {tokens.grant(owner, 'owner@example.invalid')}"
+    }
+    repo = await _owned_project(firestore, "kopitiam", owner)
+    item = await repo.get_item("kopitiam", "mirror")
+    assert item is not None
+    item.status = ItemStatus.ORDERED
+    await repo.save_item("kopitiam", "mirror", item)
+
+    reply = await api.post(
+        "/projects/kopitiam/items/mirror/receipt",
+        headers=headers,
+        json={"received": True},
+    )
+
+    assert reply.status_code == 200, reply.text
+    settled = await repo.get_item("kopitiam", "mirror")
+    assert settled is not None
+    assert settled.purchase_confirmed_at is not None
+    assert settled.purchase_note == ""
+
+
+async def test_a_failed_checkout_does_not_unwind_the_order(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    """The purchase order stands. It is never rewritten, by anyone, ever.
+
+    Which is the honest outcome rather than a shortcoming: `purchase_orders` is
+    create-only by Hard Rule 4, and making the one receipt in this system
+    mutable to tidy up a UI state would cost far more than it buys. What
+    changes is that the item stops claiming to be sorted.
+    """
+    owner = tokens.create("owner@example.invalid")
+    headers = {
+        "Authorization": f"Bearer {tokens.grant(owner, 'owner@example.invalid')}"
+    }
+    repo = await _owned_project(firestore, "kopitiam", owner)
+    item = await repo.get_item("kopitiam", "mirror")
+    assert item is not None
+    item.status = ItemStatus.ORDERED
+    await repo.save_item("kopitiam", "mirror", item)
+
+    reply = await api.post(
+        "/projects/kopitiam/items/mirror/receipt",
+        headers=headers,
+        json={"received": False, "note": "Sold out by the time I got there."},
+    )
+
+    assert reply.status_code == 200, reply.text
+    settled = await repo.get_item("kopitiam", "mirror")
+    assert settled is not None
+    assert settled.status is ItemStatus.ORDERED, "the order is not undone"
+    assert settled.purchase_confirmed_at is None
+    assert settled.purchase_note == "Sold out by the time I got there."
+
+
+async def test_there_is_nothing_to_confirm_before_anything_is_approved(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    owner = tokens.create("owner@example.invalid")
+    headers = {
+        "Authorization": f"Bearer {tokens.grant(owner, 'owner@example.invalid')}"
+    }
+    _ = await _owned_project(firestore, "kopitiam", owner)
+
+    reply = await api.post(
+        "/projects/kopitiam/items/mirror/receipt",
+        headers=headers,
+        json={"received": True},
+    )
+
+    assert reply.status_code == 409
+
+
+async def test_a_stranger_cannot_report_on_your_shopping(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    repo = await _owned_project(firestore, "someone-elses", "a-different-producer")
+    item = await repo.get_item("someone-elses", "mirror")
+    assert item is not None
+    item.status = ItemStatus.ORDERED
+    await repo.save_item("someone-elses", "mirror", item)
+
+    reply = await api.post(
+        "/projects/someone-elses/items/mirror/receipt",
+        headers=_auth(tokens, "outsider@example.invalid"),
+        json={"received": False, "note": "Mine now."},
+    )
+
+    assert reply.status_code == 404
+    settled = await repo.get_item("someone-elses", "mirror")
+    assert settled is not None
+    assert settled.purchase_note == ""
+
+
+# --------------------------------------------------------------------------- #
+# Choosing which openings go, and where
+# --------------------------------------------------------------------------- #
+
+
+async def _two_openings(firestore: AsyncClient, project_id: str) -> FirestoreRepository:
+    repo = FirestoreRepository(firestore)
+    for negotiation_id, supplier_id in (("neg1", "sup1"), ("neg2", "sup2")):
+        await repo.save_negotiation(
+            project_id,
+            negotiation_id,
+            NegotiationRecord(
+                item_id="mirror",
+                supplier_id=supplier_id,
+                state=NegotiationState.DRAFTED,
+                draft_subject="Hire enquiry",
+                draft_body="Hi, do you hire mirrors?",
+                created_at=T0,
+                updated_at=T0,
+            ),
+        )
+    return repo
+
+
+async def test_only_the_ticked_openings_are_released(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    """The gap that existed the whole time this was releasable in principle.
+
+    The server has always filtered on the ids it is given; the card just never
+    gave it a subset. Nothing covered the populated path until now.
+    """
+    headers = _auth(tokens)
+    project_id = await _start(api, headers)
+    repo = await _two_openings(firestore, project_id)
+
+    reply = await api.post(
+        f"/projects/{project_id}/openings/release",
+        headers=headers,
+        json={
+            "openings": [
+                {"negotiation_id": "neg1", "include": True},
+                {"negotiation_id": "neg2", "include": False},
+            ]
+        },
+    )
+
+    assert reply.status_code == 200, reply.text
+    assert reply.json() == {"approved": ["neg1"], "dropped": ["neg2"]}
+
+    sent = await repo.get_negotiation(project_id, "neg1")
+    assert sent is not None
+    assert sent.opening_released_at is not None
+    assert sent.next_action_due_at is not None
+    assert sent.state is NegotiationState.DRAFTED, "still unsent until a tick runs"
+
+
+async def test_unticking_an_opening_drops_it_rather_than_leaving_it_waiting(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    """Unticking is a decision, the same as unticking a prop.
+
+    Left merely unreleased it would come back in the card on every snapshot,
+    forever — and a queue that fills with things somebody already decided
+    against is a queue people stop reading.
+    """
+    headers = _auth(tokens)
+    project_id = await _start(api, headers)
+    repo = await _two_openings(firestore, project_id)
+
+    _ = await api.post(
+        f"/projects/{project_id}/openings/release",
+        headers=headers,
+        json={"openings": [{"negotiation_id": "neg2", "include": False}]},
+    )
+
+    dropped = await repo.get_negotiation(project_id, "neg2")
+    assert dropped is not None
+    assert dropped.state is NegotiationState.DEAD
+    assert dropped.opening_released_at is None, "it was never approved for sending"
+    assert dropped.next_action_due_at is None, "and never becomes due"
+
+    # The one it said nothing about is untouched, so a second pass can still
+    # decide it.
+    untouched = await repo.get_negotiation(project_id, "neg1")
+    assert untouched is not None
+    assert untouched.state is NegotiationState.DRAFTED
+    assert untouched.opening_released_at is None
+
+
+async def test_an_empty_body_still_releases_everything(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    """What the card did before it had checkboxes, and what the older tests post."""
+    headers = _auth(tokens)
+    project_id = await _start(api, headers)
+    repo = await _two_openings(firestore, project_id)
+
+    reply = await api.post(
+        f"/projects/{project_id}/openings/release", headers=headers, json={}
+    )
+
+    assert sorted(reply.json()["approved"]) == ["neg1", "neg2"]
+    assert reply.json()["dropped"] == []
+    for negotiation_id in ("neg1", "neg2"):
+        record = await repo.get_negotiation(project_id, negotiation_id)
+        assert record is not None
+        assert record.opening_released_at is not None
+
+
+async def test_an_opening_can_be_pointed_at_a_different_address(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    """Which is what makes the loop demonstrable in a minute rather than a week.
+
+    Stored on the negotiation, never on the supplier: a seller's document id is
+    a slug of their address, so editing the supplier would leave the record
+    disagreeing with its own key and redirect every other item that shares them.
+    """
+    headers = _auth(tokens)
+    project_id = await _start(api, headers)
+    repo = await _pending_opening(firestore, project_id)
+    await repo.save_supplier(
+        project_id,
+        "sup1",
+        SupplierRecord(name="Ah Seng Rentals", email="s@example.invalid"),
+    )
+
+    reply = await api.patch(
+        f"/projects/{project_id}/negotiations/neg1/opening",
+        headers=headers,
+        json={
+            "subject": "About a mirror",
+            "body": "Do you hire mirrors?",
+            "to_email": "Me+Seller@Example.Invalid",
+        },
+    )
+
+    assert reply.status_code == 200, reply.text
+    record = await repo.get_negotiation(project_id, "neg1")
+    assert record is not None
+    assert record.recipient_override == "me+seller@example.invalid", "normalised"
+
+    supplier = await repo.get_supplier(project_id, "sup1")
+    assert supplier is not None
+    assert supplier.email == "s@example.invalid", "the seller's own record is untouched"
+
+
+async def test_a_mistyped_redirect_is_refused(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    """It does not fail loudly later — it posts into a void and waits two days.
+
+    Which on this screen is indistinguishable from a seller who is simply slow,
+    so the refusal has to happen while somebody is looking at it.
+    """
+    headers = _auth(tokens)
+    project_id = await _start(api, headers)
+    repo = await _pending_opening(firestore, project_id)
+
+    reply = await api.patch(
+        f"/projects/{project_id}/negotiations/neg1/opening",
+        headers=headers,
+        json={"subject": "s", "body": "b", "to_email": "me at example dot com"},
+    )
+
+    assert reply.status_code == 422
+    record = await repo.get_negotiation(project_id, "neg1")
+    assert record is not None
+    assert record.recipient_override == ""
+
+
+async def test_no_redirect_leaves_the_seller_where_they_were(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    """The ordinary case: an edit that only touches the words."""
+    headers = _auth(tokens)
+    project_id = await _start(api, headers)
+    repo = await _pending_opening(firestore, project_id)
+
+    reply = await api.patch(
+        f"/projects/{project_id}/negotiations/neg1/opening",
+        headers=headers,
+        json={"subject": "s", "body": "Rewritten."},
+    )
+
+    assert reply.status_code == 200, reply.text
+    record = await repo.get_negotiation(project_id, "neg1")
+    assert record is not None
+    assert record.recipient_override == ""
+    assert record.draft_body == "Rewritten."
+
+
+async def test_a_stranger_cannot_drop_or_redirect_an_opening(
+    api: httpx.AsyncClient, firestore: AsyncClient, tokens: TokenMinter
+) -> None:
+    _ = await _owned_project(firestore, "someone-elses", "a-different-producer")
+    repo = await _pending_opening(firestore, "someone-elses")
+    headers = _auth(tokens, "outsider@example.invalid")
+
+    dropped = await api.post(
+        "/projects/someone-elses/openings/release",
+        headers=headers,
+        json={"openings": [{"negotiation_id": "neg1", "include": False}]},
+    )
+    redirected = await api.patch(
+        "/projects/someone-elses/negotiations/neg1/opening",
+        headers=headers,
+        json={"subject": "s", "body": "b", "to_email": "me@example.invalid"},
+    )
+
+    assert dropped.status_code == redirected.status_code == 404
+    record = await repo.get_negotiation("someone-elses", "neg1")
+    assert record is not None
+    assert record.state is NegotiationState.DRAFTED, "not dropped"
+    assert record.recipient_override == "", "and not redirected"
+
+
+def test_cors_allows_every_method_this_app_routes() -> None:
+    """The list and the routes have to agree, and once they did not.
+
+    ``allow_methods`` said GET/POST/OPTIONS while the app served PATCH and
+    DELETE. Nothing failed in any test, because a test client does not do CORS
+    — but in a browser the *preflight* is refused, so the real request is never
+    sent, nothing reaches a server log, and the page can only report fetch's
+    own "Failed to fetch". Renaming a production, deleting one and editing an
+    opening email were all inert on the deployment for as long as they existed.
+
+    Derived from ``app.routes`` rather than written out, so adding a verb
+    cannot silently leave this behind.
+    """
+    routed: set[str] = set()
+    for route in app.routes:
+        routed |= getattr(route, "methods", set()) or set()
+    # HEAD comes free with GET and is never sent by this panel.
+    routed.discard("HEAD")
+
+    cors = [m for m in _cors_methods() if m != "OPTIONS"]
+
+    assert routed <= set(cors), f"routed but not allowed by CORS: {routed - set(cors)}"
+    assert "OPTIONS" in _cors_methods(), "the preflight itself has to be allowed"
+
+
+def _cors_methods() -> list[str]:
+    for middleware in app.user_middleware:
+        if middleware.cls is CORSMiddleware:
+            allowed = cast(list[str], middleware.kwargs["allow_methods"])
+            return list(allowed)
+    raise AssertionError("no CORS middleware on the api app")

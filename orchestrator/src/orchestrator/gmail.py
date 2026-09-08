@@ -33,6 +33,7 @@ the tick stamps it with ``clock.now()`` — see Hard Rule 2 in CLAUDE.md.
 import asyncio
 import base64
 import json
+from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from email.message import EmailMessage
@@ -44,7 +45,7 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-from orchestrator.mail import RawInbound, SentMessage
+from orchestrator.mail import Attachment, RawInbound, SentMessage
 from orchestrator.settings import GMAIL_SCOPES, Settings, TokenBackend
 
 
@@ -367,6 +368,7 @@ class GmailTransport:
         thread_id: str = "",
         in_reply_to: str = "",
         references: str = "",
+        attachments: Sequence[Attachment] = (),
     ) -> SentMessage:
         """Send one message, minting our own ``Message-ID`` so we know it.
 
@@ -386,6 +388,19 @@ class GmailTransport:
         if references:
             message["References"] = references
         message.set_content(body)
+
+        for attachment in attachments:
+            # `add_attachment` promotes the message to multipart and does the
+            # base64 and headers itself. Splitting the type is what the stdlib
+            # wants; anything it cannot place lands as a generic binary, which
+            # every mail client can still save.
+            maintype, _, subtype = attachment.content_type.partition("/")
+            message.add_attachment(
+                attachment.data,
+                maintype=maintype or "application",
+                subtype=subtype or "octet-stream",
+                filename=attachment.filename,
+            )
 
         request: dict[str, Any] = {
             "raw": base64.urlsafe_b64encode(message.as_bytes()).decode("ascii")
@@ -449,13 +464,32 @@ class GmailTransport:
 
             for message in thread.get("messages") or []:
                 labels: list[str] = message.get("labelIds") or []
-                if "UNREAD" not in labels:
-                    continue  # already filed on an earlier tick
-                if "SENT" in labels:
-                    continue  # our own outbound, echoed back in the thread
 
+                # Neither UNREAD nor SENT is filtered here any more, and they
+                # were wrong for the same reason: both are Gmail's labels, and
+                # both stopped describing what we needed the moment
+                # negotiations moved into the producer's own mailbox.
+                #
+                # UNREAD was the "already filed" marker. The producer opens the
+                # seller's reply — of course they do, it is their inbox — and
+                # the agent never sees it again.
+                #
+                # SENT was the "this one is ours" marker. But the whole point
+                # of redirecting an opening is to send it to an address the
+                # producer owns, and when that is the same account the agent
+                # sends from, *their reply carries SENT too* — so the one
+                # message the agent was waiting for was the one it threw away.
+                # It then chased, timed out at 48 hours and died as though
+                # nobody had answered.
+                #
+                # Both are answered instead by a document we wrote: every
+                # outbound is filed under its Gmail message id, so `_file_reply`
+                # asks `has_message` and skips what we sent. Nobody else can
+                # clear that, and no label can lie about it.
                 received.append(self._to_inbound(message, thread_id))
-                await self._mark_read(str(message["id"]))
+                if "UNREAD" in labels:
+                    # A courtesy to the producer's inbox, not a mechanism.
+                    await self._mark_read(str(message["id"]))
 
         return received
 

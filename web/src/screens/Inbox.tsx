@@ -27,6 +27,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Separator } from "@/components/ui/separator";
+import { SkeletonRows } from "@/components/ui/skeleton";
 import type { Item, Negotiation } from "@/hooks/useProject";
 import { money, saving, simTime } from "@/lib/format";
 
@@ -37,16 +38,23 @@ export function Inbox({
   items,
   negotiations,
   supplierName,
+  loading = false,
 }: {
   projectId: string;
   items: Item[];
   negotiations: Negotiation[];
   supplierName: (id: string | undefined) => string;
+  loading?: boolean;
 }) {
   const decisions = pending(items, negotiations);
   const running = negotiations.filter(
     (n) => n.state === "SENT" || n.state === "AWAITING_REPLY",
   ).length;
+
+  // Before the empty state, because they are not the same thing and rendering
+  // one for the other is the bug this replaces: an empty production and a
+  // production still being read looked identical.
+  if (loading) return <SkeletonRows rows={4} className="mt-2" />;
 
   if (decisions.length === 0) {
     return (
@@ -92,7 +100,7 @@ function DecisionCard({
   decision: Decision;
   supplierName: (id: string | undefined) => string;
 }) {
-  const { item, chosen, rivals } = decision;
+  const { item, chosen, rivals, isListing } = decision;
   const [outcome, setOutcome] = useState<Outcome | null>(null);
   const [busy, setBusy] = useState(false);
   const won = saving(chosen.first_quote, chosen.latest_quote);
@@ -113,10 +121,14 @@ function DecisionCard({
           {item.consumable === true && (
             <Badge variant="secondary">destroyed on camera · ×{item.qty ?? 1}</Badge>
           )}
-          {chosen.escalation_reason !== undefined &&
+          {isListing ? (
+            <Badge variant="outline">buy it yourself</Badge>
+          ) : (
+            chosen.escalation_reason !== undefined &&
             chosen.escalation_reason !== "" && (
               <Badge variant="outline">{chosen.escalation_reason}</Badge>
-            )}
+            )
+          )}
         </div>
 
         {/* The script line, inline. This is the answer to "why does the shoot
@@ -133,29 +145,59 @@ function DecisionCard({
       </CardHeader>
 
       <CardContent className="space-y-4">
+        {/* Everything here except the price describes a conversation, so on a
+            listing all of it is an invention. `first_quote` equals
+            `latest_quote`, which renders the same number struck through under
+            "opened at"; rounds is 0/4; "last heard" is a dash. A producer who
+            catches one invented figure stops believing the rest. */}
         <div className="flex flex-wrap items-end gap-x-8 gap-y-3">
-          <Figure label={`${supplierName(chosen.supplier_id)} offers`}>
+          <Figure
+            label={
+              isListing
+                ? `${supplierName(chosen.supplier_id)} lists it at`
+                : `${supplierName(chosen.supplier_id)} offers`
+            }
+          >
             <span className="text-2xl font-semibold">
               {money(chosen.latest_quote?.unit_price)}
             </span>
           </Figure>
-          <Figure label="opened at">
-            <span className="text-muted-foreground line-through">
-              {money(chosen.first_quote?.unit_price)}
-            </span>
-          </Figure>
-          {won !== null && (
-            <Figure label="talked down by">
-              <span className="font-medium">
-                {money(won.amount)} ({String(won.percent)}%)
-              </span>
-            </Figure>
+          {!isListing && (
+            <>
+              <Figure label="opened at">
+                <span className="text-muted-foreground line-through">
+                  {money(chosen.first_quote?.unit_price)}
+                </span>
+              </Figure>
+              {won !== null && (
+                <Figure label="talked down by">
+                  <span className="font-medium">
+                    {money(won.amount)} ({String(won.percent)}%)
+                  </span>
+                </Figure>
+              )}
+              <Figure label="rounds">
+                {String(chosen.rounds_used ?? 0)}/{String(chosen.max_rounds ?? "?")}
+              </Figure>
+              <Figure label="last heard (sim)">
+                {simTime(chosen.last_inbound_at)}
+              </Figure>
+            </>
           )}
-          <Figure label="rounds">
-            {String(chosen.rounds_used ?? 0)}/{String(chosen.max_rounds ?? "?")}
-          </Figure>
-          <Figure label="last heard (sim)">{simTime(chosen.last_inbound_at)}</Figure>
         </div>
+
+        {isListing && (chosen.listing_url ?? "") !== "" && (
+          <p className="text-sm break-all">
+            <a
+              href={chosen.listing_url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="underline underline-offset-4"
+            >
+              {chosen.listing_url}
+            </a>
+          </p>
+        )}
 
         {item.reference_band !== undefined && (
           <p className="text-sm text-muted-foreground">
@@ -172,7 +214,9 @@ function DecisionCard({
           <>
             <Separator />
             <div className="text-sm">
-              <p className="mb-1 text-muted-foreground">Also approached:</p>
+              <p className="mb-1 text-muted-foreground">
+                {isListing ? "Also listed:" : "Also approached:"}
+              </p>
               <ul className="space-y-1">
                 {rivals.map((r) => (
                   <li key={r.id} className="flex justify-between gap-4">
@@ -193,27 +237,44 @@ function DecisionCard({
       <CardFooter className="flex flex-wrap items-center gap-3">
         <Button
           disabled={busy || outcome?.kind === "approved"}
-          onClick={run(() => approve(projectId, item.id, chosen.id))}
-        >
-          Approve {money(chosen.latest_quote?.unit_price)}
-        </Button>
-        <Button
-          variant="outline"
-          disabled={busy}
           onClick={run(() => {
-            const price = chosen.latest_quote?.unit_price;
-            const floor = {
-              amount: Math.round((price?.amount ?? 0) * 0.9),
-              currency: price?.currency ?? "MYR",
-            };
-            return setFloor(projectId, chosen.id, floor);
+            // Opened synchronously, before the await: a window.open inside a
+            // promise callback is not a user gesture and the popup blocker
+            // eats it silently.
+            if (isListing && (chosen.listing_url ?? "") !== "") {
+              window.open(chosen.listing_url, "_blank", "noopener,noreferrer");
+            }
+            return approve(projectId, item.id, chosen.id);
           })}
         >
-          Push for 10% less
+          {isListing
+            ? `Buy at ${supplierName(chosen.supplier_id)}`
+            : `Approve ${money(chosen.latest_quote?.unit_price)}`}
         </Button>
+        {/* Not merely useless on a listing — destructive. A floor makes the
+            negotiation due, and a row with no email address in the tick's send
+            path is an agent trying to haggle with a URL. The server refuses it
+            too; a hidden button is not a guard. */}
+        {!isListing && (
+          <Button
+            variant="outline"
+            disabled={busy}
+            onClick={run(() => {
+              const price = chosen.latest_quote?.unit_price;
+              const floor = {
+                amount: Math.round((price?.amount ?? 0) * 0.9),
+                currency: price?.currency ?? "MYR",
+              };
+              return setFloor(projectId, chosen.id, floor);
+            })}
+          >
+            Push for 10% less
+          </Button>
+        )}
         <p className="text-xs text-muted-foreground">
-          Approving writes a purchase order through a separate service — the
-          agent has no access to it.
+          {isListing
+            ? "Records the order and opens the shop. You pay on their site — the agent never does."
+            : "Approving writes a purchase order through a separate service — the agent has no access to it."}
         </p>
       </CardFooter>
     </Card>

@@ -49,7 +49,11 @@ works in demo mode" is never evidence that it works.
 ## How the pieces fit
 
 ```
-screenplay ──> extract_props ──> research_item ──> negotiate over Gmail
+screenplay ──> extract_props ──> research_item ──> draft the opening email
+                                                          │
+                                                   a person reads it
+                                                          │
+                                                 negotiate over Gmail
                                                           │
                                                     READY_FOR_HUMAN
                                                           │
@@ -57,6 +61,9 @@ screenplay ──> extract_props ──> research_item ──> negotiate over Gm
                                                           │
                                                        ORDERED
 ```
+
+Two of those arrows wait on a human: before the first word to a stranger, and
+before any money. Everything between them runs on its own, for days.
 
 ## Ownership
 
@@ -160,6 +167,48 @@ item, `approved_by` matching the caller, no updates and no deletes ever.
 the repo that does, since everything else reaches Firestore through the admin
 SDK and bypasses them.
 
+## Two ways to get a prop
+
+Not every prop needs a conversation. A rattan birdcage is built to order; six
+coffee mugs are not, and emailing a stranger about them was faintly absurd.
+
+So the breakdown assigns each prop a **route**. `NEGOTIATE` is the original
+road — rentals, handmade pieces, period furniture, animals — and works exactly
+as before. `BUY` means the agent finds shop listings and hands the producer the
+cheapest one with its link; they buy it on that site.
+
+The brain proposes the route from what the object is, the producer can flip it
+on the confirmation list, and research corrects it when the evidence disagrees.
+That last part also fixed a bug older than the feature: research that found
+real sellers on marketplace pages with no scrapeable address stored as nothing
+at all, and the item retried every six hours forever.
+
+**A listing is a negotiation that was never negotiable.** It is the same
+`NegotiationRecord`, created at `READY_FOR_HUMAN` with the shop price as its
+quote and **no `next_action_due_at`** — so it never enters the tick's queue,
+the brain is never asked what to say to a shop, and no email is ever drafted
+for one. Approving goes through the same `/items/{item_id}/approve`, writing
+the same `purchase_orders/{item_id}` with `create()`. There is still exactly
+one path to money, which is the rule this feature was parked behind.
+
+Three independent things stop a shop being emailed, because one would be a
+convention rather than a guarantee: the row has no due date, the tick parks any
+listing that becomes due anyway, and the send refuses a supplier with no
+address. `set_floor` and `answer_supplier` refuse a listing outright — both set
+a due date, so both were doors into the send path, and "Push for 10% less" on a
+shop page would have had the agent haggling with a URL every fifteen minutes
+while the card vanished from the producer's queue.
+
+`NegotiationRecord.listing_url` is the marker, and `is_listing()` reads it. Not
+an `escalation_reason` value: a dozen call sites need to tell the two apart —
+the send path, the savings screen, the briefing, the floor endpoint — and a
+reason string that only one of them happens to check is a convention waiting to
+be forgotten.
+
+Approving a listing records that a person was *sent to a shop*. It cannot know
+they finished paying, so the card asks afterwards, and the answer goes on the
+item — never on the order, which is create-only.
+
 ## Money and units
 
 Money is always `{"amount": 880, "currency": "MYR"}`. Never a formatted string
@@ -183,22 +232,34 @@ a restricted scope, so publishing forces Google's verification plus a CASA
 security assessment. Re-auth weekly is the strategy, not the fallback. See
 `docs/oauth-runbook.md`.
 
-## The stop condition
+## The stop conditions
 
-The agent stops at `READY_FOR_HUMAN`. Always. No exceptions, no config flag, no
-"auto-approve under RM500." `ORDERED` is the only state that writes a purchase
-order, and it is reachable only through the human-authenticated endpoint.
+There are two, at the two moments the agent would otherwise act in a person's
+name without them.
+
+**Before it spends.** The agent stops at `READY_FOR_HUMAN`. Always. No
+exceptions, no config flag, no "auto-approve under RM500." `ORDERED` is the only
+state that writes a purchase order, and it is reachable only through the
+human-authenticated endpoint.
 
 Confusing or unparseable supplier replies escalate to `READY_FOR_HUMAN` too. An
 agent that guesses at an ambiguous quote is worse than one that asks.
 
-## Not in scope yet
+**Before it speaks to a stranger.** The opening email of every negotiation is
+written and held. `DRAFTED` with `opening_released_at` unset means composed and
+not sent; the producer reads it, edits it if they want, and releases it. That
+first message goes from their mailbox over their name, and a model wrote it.
 
-**Buying direct from online shops.** The agent will eventually be able to
-source an item from a listing — good price, good reviews — instead of
-negotiating with a person. It is parked. When it lands, a listing is just
-another quote and it funnels into the same approval gate; do not add a second
-path to money.
+Only the opening. Every later round — counters, chases, the reply that comes
+back on day four — runs unattended, because a gate on each of those would mean
+a five-day negotiation stalls on whether somebody is at their desk, and running
+while nobody watches is the thing this system is for.
+
+The stored draft is what gets sent, not whatever the brain would say on the tick
+that finally posts it. Re-asking there would leave the edit box working
+perfectly and changing nothing.
+
+## Not in scope yet
 
 **The supplier simulator and the compressed replay.** Both are test
 infrastructure for later. Nothing in the product may depend on either.
