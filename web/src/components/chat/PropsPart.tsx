@@ -20,12 +20,13 @@
 import type { ToolCallMessagePartProps } from "@assistant-ui/react";
 import { useState } from "react";
 
-import { confirmProps, type Prop } from "@/chat/api";
+import { confirmProps } from "@/chat/api";
+import type { PropsRow } from "@/chat/rows";
 import { useProjectId } from "@/components/chat/context";
 import { Button } from "@/components/ui/button";
 
 export interface PropsArgs {
-  props?: Prop[];
+  props?: PropsRow["props"];
   filename?: string;
 }
 
@@ -40,22 +41,22 @@ export function PropList({
   name,
 }: {
   projectId: string;
-  found: Prop[];
+  found: PropsRow["props"];
   name: string;
 }) {
-  // Everything included by default with the quantity the agent proposed. The
-  // producer's job is to catch what is wrong, not to re-enter what is right.
+  // Only what the producer changed. Everything else falls back to the agent's
+  // proposal at the point of use — included, at the quantity it suggested, on
+  // the route it guessed. Their job is to catch what is wrong, not to re-enter
+  // what is right.
+  //
+  // Empty rather than seeded from `found`, because `found` grows: this card is
+  // rebuilt from the Firestore snapshot, so an item can arrive after the first
+  // render. Seeding in `useState` happens once, and any prop landing later
+  // would have had no entry at all.
   const [choices, setChoices] = useState<
     Record<string, { qty: number; include: boolean; route: string }>
-  >(
-    Object.fromEntries(
-      found.map((p) => [
-        p.item_id,
-        { qty: p.qty, include: true, route: p.route ?? "NEGOTIATE" },
-      ]),
-    ),
-  );
-  const [done, setDone] = useState<string>("");
+  >({});
+  const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
   if (found.length === 0) {
@@ -71,10 +72,11 @@ export function PropList({
     );
   }
 
-  const kept = found.filter((p) => choices[p.item_id]?.include).length;
+  const kept = found.filter((p) => choices[p.item_id]?.include ?? true).length;
 
   const confirm = () => {
     setBusy(true);
+    setError("");
     void confirmProps(
       projectId,
       found.map((p) => ({
@@ -85,11 +87,11 @@ export function PropList({
       })),
     )
       .then((result) => {
-        setDone(
-          result.kind === "confirmed"
-            ? `${result.confirmed.length} prop(s) confirmed. The agent starts researching them on the next tick.`
-            : result.detail,
-        );
+        // A confirmed item leaves `DRAFT`, so the card empties itself when the
+        // snapshot lands. Saying "3 props confirmed" under a card that is about
+        // to vanish would be a local flag standing in for the fact; the only
+        // thing left worth reporting is what went wrong.
+        if (result.kind === "error") setError(result.detail);
       })
       .finally(() => setBusy(false));
   };
@@ -97,7 +99,9 @@ export function PropList({
   return (
     <div className="my-2 rounded-lg border px-4 py-3 text-sm">
       <p className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
-        Read from {name || "the script"}
+        {/* A card rebuilt from stored items has no filename to show: the item
+            does not record which upload it came from. */}
+        {name ? `Read from ${name}` : "Unconfirmed props"}
       </p>
       <p className="mt-1 font-medium">
         {found.length} prop{found.length === 1 ? "" : "s"} found
@@ -119,7 +123,8 @@ export function PropList({
                 <input
                   type="checkbox"
                   checked={choice.include}
-                  disabled={done !== ""}
+                  disabled={busy}
+                  aria-label={`Include ${prop.name}`}
                   onChange={(e) =>
                     setChoices((prior) => ({
                       ...prior,
@@ -143,7 +148,7 @@ export function PropList({
                     <button
                       key={option}
                       type="button"
-                      disabled={done !== "" || !choice.include}
+                      disabled={busy || !choice.include}
                       onClick={() =>
                         setChoices((prior) => ({
                           ...prior,
@@ -166,7 +171,7 @@ export function PropList({
                     type="number"
                     min={1}
                     value={choice.qty}
-                    disabled={done !== "" || !choice.include}
+                    disabled={busy || !choice.include}
                     onChange={(e) =>
                       setChoices((prior) => ({
                         ...prior,
@@ -193,23 +198,20 @@ export function PropList({
         })}
       </div>
 
-      {done === "" ? (
-        <div className="mt-3 flex items-center gap-3">
-          <Button
-            size="sm"
-            loading={busy}
-            disabled={busy || kept === 0}
-            onClick={confirm}
-          >
-            {busy ? "Confirming…" : `Confirm ${kept}`}
-          </Button>
-          <span className="text-xs text-muted-foreground">
-            Nothing is researched or emailed until you do.
-          </span>
-        </div>
-      ) : (
-        <p className="mt-3 font-medium">{done}</p>
-      )}
+      <div className="mt-3 flex items-center gap-3">
+        <Button
+          size="sm"
+          loading={busy}
+          disabled={busy || kept === 0}
+          onClick={confirm}
+        >
+          {busy ? "Confirming…" : `Confirm ${kept}`}
+        </Button>
+        <span className="text-xs text-muted-foreground">
+          Nothing is researched or emailed until you do.
+        </span>
+      </div>
+      {error !== "" && <p className="mt-2 text-xs text-destructive">{error}</p>}
     </div>
   );
 }

@@ -16,6 +16,7 @@
 
 import type { Prop } from "./api";
 import type { ResearchItem } from "./research";
+import type { Item } from "@/hooks/useProject";
 
 /** Something an answer pointed at, that the panel renders as a link. */
 export interface Reference {
@@ -165,8 +166,63 @@ export interface PropsRow {
   kind: "props";
   id: string;
   filename: string;
-  props: Prop[];
+  /** Everything a `Prop` carries except the confidence score.
+   *
+   * The score exists only on the upload response — it is the model saying how
+   * sure it was, and it is not worth a Firestore field. A card rebuilt from
+   * stored items therefore cannot supply one, so the row asks for the shape
+   * both sources can actually produce. */
+  props: Omit<Prop, "confidence">[];
   at: Date;
+}
+
+/**
+ * Rebuild the confirmation card from saved items, including after a reload.
+ *
+ * The card the upload pushes into the transcript lives in React state, and
+ * React state does not survive closing the tab. A producer who uploaded a
+ * screenplay, went to make coffee and came back would find the gate gone with
+ * nothing confirmed — and no way back to it but uploading the script again.
+ *
+ * The items themselves were never lost: `extract_props` writes them as `DRAFT`
+ * before anyone sees the card, and `useProject` is already subscribed to them.
+ * So the card is derived from the store rather than remembered, which also
+ * means it updates itself as items leave `DRAFT`.
+ *
+ * One row per production, keyed on the project rather than on the upload, so a
+ * later snapshot expands the card that is already there instead of stacking a
+ * second one underneath it.
+ */
+export function draftRows(projectId: string, items: Item[]): PropsRow[] {
+  const drafts = items.filter((item) => item.status === "DRAFT");
+  if (drafts.length === 0) return [];
+
+  return [
+    {
+      kind: "props",
+      id: `drafts:${projectId}`,
+      // No filename: the item does not record which upload it came from, and
+      // inventing one would put a wrong name on the card. `PropsPart` reads an
+      // empty name as "Unconfirmed props".
+      filename: "",
+      at: new Date(Math.max(...drafts.map((item) => item.updated_at?.toMillis() ?? 0))),
+      props: drafts.map((item) => ({
+        item_id: item.id,
+        name: item.name ?? item.id,
+        category: item.category ?? "",
+        qty: item.qty ?? 1,
+        consumable: item.consumable ?? false,
+        // A restored card offers the same BUY/NEGOTIATE toggle a fresh one
+        // does. Without this the route silently reset to the default on
+        // reload, which is a decision changing itself while nobody looked.
+        route: item.route ?? "NEGOTIATE",
+        scenes: item.scenes ?? [],
+        lines: (item.mentions ?? []).flatMap((mention) =>
+          mention.line ? [mention.line] : [],
+        ),
+      })),
+    },
+  ];
 }
 
 /**
@@ -248,3 +304,21 @@ export const inOrder = (rows: Row[]): Row[] =>
     const byTime = a.at.getTime() - b.at.getTime();
     return byTime !== 0 ? byTime : a.id.localeCompare(b.id);
   });
+
+/**
+ * Everything the transcript shows, in order.
+ *
+ * A function rather than an expression inside the hook's `useMemo`, so the one
+ * thing that is easy to get wrong here can be tested. The derived sources —
+ * `draftRows` in particular — are assembled *here*, not passed in: a card that
+ * is meant to survive a reload is worth nothing if it is built correctly and
+ * then left out of the list, and that omission is invisible on screen. It
+ * looks exactly like a producer who has not uploaded anything yet.
+ */
+export function transcriptRows(
+  projectId: string,
+  items: Item[],
+  groups: Row[][],
+): Row[] {
+  return inOrder([...groups.flat(), ...draftRows(projectId, items)]);
+}

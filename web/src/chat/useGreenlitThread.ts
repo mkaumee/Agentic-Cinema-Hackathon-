@@ -23,7 +23,7 @@ import { IDLE, isBusy, type Busy } from "./busy";
 import { decisionsFor, questionsFor } from "./decisions";
 import { researchOf, stillWorking } from "./research";
 import { toThreadMessage } from "./convert";
-import { directionOf, inOrder, type Row } from "./rows";
+import { directionOf, transcriptRows, type Row } from "./rows";
 
 /** Where a row with no timestamp at all sorts: the very top.
 
@@ -283,18 +283,31 @@ export function useGreenlitThread(sources: ThreadSources): GreenlitThread {
     ];
   }, [sources.items, sources.suppliers, sources.negotiations]);
 
+  // `transcriptRows` adds the restored confirmation card itself, derived from
+  // the `DRAFT` items rather than pushed in by the upload — so the gate is
+  // still there after a reload. See `draftRows`.
   const rows = useMemo(
     () =>
-      inOrder([
-        ...conversation,
-        ...activity,
-        ...waiting,
-        ...listings,
-        ...questions,
-        ...openings,
-        ...research,
+      transcriptRows(sources.projectId, sources.items, [
+        conversation,
+        activity,
+        waiting,
+        listings,
+        questions,
+        openings,
+        research,
       ]),
-    [conversation, activity, waiting, listings, questions, openings, research],
+    [
+      conversation,
+      activity,
+      waiting,
+      listings,
+      questions,
+      openings,
+      research,
+      sources.projectId,
+      sources.items,
+    ],
   );
 
 
@@ -385,27 +398,28 @@ export function useGreenlitThread(sources: ThreadSources): GreenlitThread {
       try {
         const upload: Upload = await toUpload(file);
         const result = await uploadScript(sources.projectId, upload);
+        // The props are already `DRAFT` items in Firestore by the time this
+        // returns, and `draftRows` builds the card from those. Pushing a second
+        // copy into the transcript here would show the same gate twice, and
+        // only one of the two would survive a reload.
+        if (result.kind === "read" && result.props.length > 0) return;
         const readAt = new Date();
         setConversation((prior) => [
           ...prior,
-          result.kind === "read"
-            ? {
-                kind: "props",
-                id: `s:${readAt.getTime()}`,
-                filename: file.name,
-                props: result.props,
-                at: readAt,
-              }
-            : {
-                // An unreadable file is not an error to swallow: the message
-                // says a scan is a scan and what to do instead, and it is
-                // written for the person reading it.
-                kind: "briefing",
-                id: `s:${readAt.getTime()}`,
-                text: result.detail,
-                refs: [],
-                at: readAt,
-              },
+          {
+            // Either the file could not be read, or it could and held no
+            // physical props. Neither is an error to swallow: the message says
+            // what happened and what to do instead, and it is written for the
+            // person reading it.
+            kind: "briefing",
+            id: `s:${readAt.getTime()}`,
+            text:
+              result.kind === "read"
+                ? `No physical props were found in ${file.name}.`
+                : result.detail,
+            refs: [],
+            at: readAt,
+          },
         ]);
       } finally {
         setBusy(IDLE);

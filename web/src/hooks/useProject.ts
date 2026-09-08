@@ -85,6 +85,10 @@ export interface Item {
   floor_price?: Money;
   chosen_quote?: Quote;
   next_action_due_at?: Timestamp;
+  /** When this item was last written. Dates the restored confirmation card, so
+   * it sorts into the transcript where the script was read rather than jumping
+   * to the bottom on every snapshot. */
+  updated_at?: Timestamp;
   /** BUY or NEGOTIATE — a shop page, or a person to write to. */
   route?: string;
   listings?: Listing[];
