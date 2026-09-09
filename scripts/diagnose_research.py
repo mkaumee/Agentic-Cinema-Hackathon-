@@ -258,6 +258,35 @@ async def queue(project: str) -> tuple[int, int]:
     return due_now, parked
 
 
+def scheduler_state(project: str, job: str, region: str) -> str:
+    """ENABLED, PAUSED, or "" when it cannot be read.
+
+    Checked rather than suggested. This script used to print "no tick logged"
+    and hand over a command to run, which is a diagnostic stopping one question
+    short of the answer — and a paused job is not a rare edge: pausing it is
+    step one of the reset runbook, so forgetting to resume is the single most
+    likely reason a healthy deployment does nothing at all.
+    """
+    try:
+        return subprocess.run(
+            [
+                "gcloud",
+                "scheduler",
+                "jobs",
+                "describe",
+                job,
+                f"--project={project}",
+                f"--location={region}",
+                "--format=value(state)",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    except subprocess.CalledProcessError, FileNotFoundError:
+        return ""
+
+
 def ticks(project: str, service: str, minutes: int) -> None:
     """What the last few passes reported. The counters, not just that it ran."""
     try:
@@ -283,8 +312,7 @@ def ticks(project: str, service: str, minutes: int) -> None:
 
     if not entries:
         bad(f"no tick logged in the last {minutes} minutes")
-        note("Nothing will be researched while the loop is not running:")
-        note("  gcloud scheduler jobs describe cinema-tick --location=us-central1")
+        note("Nothing is researched, sent or answered while the loop is stopped.")
         return
 
     ok(f"{len(entries)} tick(s) in the last {minutes} minutes")
@@ -388,7 +416,21 @@ async def run(args: argparse.Namespace) -> int:
     due_now, parked = await queue(project)
 
     # -- 5 ---------------------------------------------------------------- #
-    say("5. What the loop reported")
+    say("5. Is the loop even running")
+    state = scheduler_state(project, str(args.job), region)
+    if state == "ENABLED":
+        ok(f"scheduler job {args.job!r} is enabled")
+    elif state == "PAUSED":
+        bad(f"scheduler job {args.job!r} is PAUSED — nothing is ticking")
+        note("Pausing it is step one of the reset runbook, so this is usually a")
+        note("resume that never happened:")
+        note(f"  gcloud scheduler jobs resume {args.job} --location={region}")
+        note("Turn the real brain on BEFORE resuming. A scripted brain will")
+        note("work through everything due within a minute, writing unsourced")
+        note("bands and template emails you would then have to wipe.")
+        findings.append(f"the {args.job} scheduler job is paused")
+    else:
+        huh(f"could not read the state of scheduler job {args.job!r}")
     ticks(project, service, int(args.minutes))
 
     # -- verdict ---------------------------------------------------------- #
@@ -424,6 +466,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Why is nothing being researched?")
     _ = parser.add_argument("--project", required=True, help="the GCP project")
     _ = parser.add_argument("--service", default="cinema-tick")
+    _ = parser.add_argument("--job", default="cinema-tick", help="the Scheduler job")
     _ = parser.add_argument("--region", default="us-central1")
     _ = parser.add_argument(
         "--minutes", default=15, type=int, help="how far back to read tick logs"
