@@ -51,6 +51,7 @@ A person's, in Cloud Shell::
 
 # argparse Namespace attributes are Any by nature; values are str()'d at use.
 # pyright: reportAny=false, reportUnknownMemberType=false
+# pyright: reportUnknownVariableType=false, reportUnknownArgumentType=false
 import argparse
 import asyncio
 import json
@@ -58,10 +59,11 @@ import subprocess
 import urllib.error
 import urllib.request
 from collections import defaultdict
-from datetime import UTC, datetime
 
 from check_research import REFUSED, UNKNOWN, check, key_from_deployment
 from google.cloud.firestore_v1 import AsyncClient
+from orchestrator.clock import SimClock
+from orchestrator.repository import ITEMS, PROJECTS, FirestoreRepository
 
 GREEN, YELLOW, RED, DIM, OFF = "\033[32m", "\033[33m", "\033[31m", "\033[2m", "\033[0m"
 
@@ -164,7 +166,7 @@ def probe_vertex(project: str, model: str, location: str) -> tuple[int, str]:
         return 0, f"{type(exc).__name__}: {exc}"
 
 
-async def queue(project: str, now: datetime) -> tuple[int, int]:
+async def queue(project: str) -> tuple[int, int]:
     """What is in Firestore, by status and by whether it is due.
 
     Returns (items due now in a sourcing status, items parked in one).
@@ -175,30 +177,60 @@ async def queue(project: str, now: datetime) -> tuple[int, int]:
     a negotiation due for a chase is in ``due_items`` and is not research work,
     and counting it here would report a queue that is about to move when the
     research queue is empty. This counts what sourcing would actually *do*.
+
+    Walked per production rather than as one collection-group scan, because
+    "due" is measured against ``clock.now()`` and every production carries its
+    own clock. A single wall-clock reading compared against stored simulation
+    time is the desync Hard Rule 2 exists to prevent — in demo mode it would
+    report every row as parked years out. It also reads better: a stuck
+    production is named rather than averaged into a total.
     """
     client = AsyncClient(project=project)
+    repo = FirestoreRepository(client)
+    clock = SimClock(repo)
 
     by_status: defaultdict[str, int] = defaultdict(int)
     due_now = parked = undated = 0
-    soonest: datetime | None = None
+    soonest: tuple[float, str] | None = None
 
-    async for snapshot in client.collection_group("items").stream():
-        data = snapshot.to_dict() or {}
-        status = str(data.get("status", "?"))
-        by_status[status] += 1
-        if status not in SOURCING_STATUSES:
+    project_ids = await repo.list_project_ids()
+    if not project_ids:
+        huh("no productions at all")
+        return 0, 0
+
+    for pid in project_ids:
+        try:
+            now = await clock.now(pid)
+        except Exception as exc:
+            # A production whose document will not load is exactly the kind of
+            # thing this script is run to find, so it is reported rather than
+            # raised. Crashing here would take the other productions' answers
+            # down with it.
+            bad(f"{pid}: cannot read its clock — {type(exc).__name__}: {exc}")
+            note("Its items cannot be judged due or not. Everything below")
+            note("excludes this production.")
             continue
-        due_at = data.get("next_action_due_at")
-        if due_at is None:
-            undated += 1
-        elif due_at <= now:
-            due_now += 1
-        else:
-            parked += 1
-            soonest = due_at if soonest is None else min(soonest, due_at)
+        async for snapshot in (
+            client.collection(PROJECTS).document(pid).collection(ITEMS).stream()
+        ):
+            data = snapshot.to_dict() or {}
+            status = str(data.get("status", "?"))
+            by_status[status] += 1
+            if status not in SOURCING_STATUSES:
+                continue
+            due_at = data.get("next_action_due_at")
+            if due_at is None:
+                undated += 1
+            elif due_at <= now:
+                due_now += 1
+            else:
+                parked += 1
+                minutes = (due_at - now).total_seconds() / 60
+                if soonest is None or minutes < soonest[0]:
+                    soonest = (minutes, pid)
 
     if not by_status:
-        huh("no items at all — nothing has been confirmed from a screenplay yet")
+        huh(f"{len(project_ids)} production(s), no items — nothing confirmed yet")
         return 0, 0
 
     for status, count in sorted(by_status.items()):
@@ -214,8 +246,7 @@ async def queue(project: str, now: datetime) -> tuple[int, int]:
     if due_now:
         ok(f"{due_now} item(s) due for sourcing right now")
     if parked and soonest is not None:
-        minutes = (soonest - now).total_seconds() / 60
-        huh(f"{parked} item(s) parked — soonest due in {minutes:.1f} min")
+        huh(f"{parked} item(s) parked — soonest in {soonest[0]:.1f} min ({soonest[1]})")
         note("A claim lease is 15 minutes. Parked rows are normal right after a")
         note("tick claimed them, and a symptom if they never come back.")
     if undated:
@@ -277,7 +308,6 @@ async def run(args: argparse.Namespace) -> int:
     project = str(args.project)
     region = str(args.region)
     service = str(args.service)
-    now = datetime.now(UTC)  # noqa: TID251 — a diagnostic, outside the product
     findings: list[str] = []
 
     print(f"Diagnosing research on {project!r}.")
@@ -355,7 +385,7 @@ async def run(args: argparse.Namespace) -> int:
 
     # -- 4 ---------------------------------------------------------------- #
     say("4. What is actually waiting in Firestore")
-    due_now, parked = await queue(project, now)
+    due_now, parked = await queue(project)
 
     # -- 5 ---------------------------------------------------------------- #
     say("5. What the loop reported")
