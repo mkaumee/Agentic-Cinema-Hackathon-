@@ -11,6 +11,10 @@ real email across real days.
 It stops before spending money. Every purchase order is created by a human, and
 that limit is enforced by database rules rather than by prompt design.
 
+Parallel track: Greenlit actively uses Parallel Search at runtime to research current supplier listings and source-backed price bands. Gemini, via Google ADK and Vertex AI, interprets those results, extracts production requirements from screenplays, drafts outreach, and reasons about negotiation state.  
+Google Cloud: Cloud Run hosts the agent services; Cloud Scheduler drives the durable negotiation loop; Firestore stores state; Firebase provides the web app and authentication; Secret Manager stores mailbox refresh tokens; Cloud Storage holds screenplay attachments.  
+Data sources: Greenlit uses producer-uploaded screenplays, mailbox threads explicitly connected by the producer, and public web sources returned by Parallel Search. It does not rely on a preloaded proprietary dataset.
+
 ## Layout
 
 ```
