@@ -52,6 +52,16 @@ the only source of time, which is what makes a multi-day negotiation testable in
 milliseconds. See `CLAUDE.md` for why that is a hard rule rather than a
 preference.
 
+## Web research with Parallel
+
+Greenlit uses Parallel’s Search API in `main-agent` to find reference prices
+and supplier candidates for props extracted from a screenplay. The Gemini
+research agent calls Parallel through a Google ADK tool, supplying a research
+objective and targeted search queries, then searching again when the results
+are insufficient. Parallel returns source URLs and relevant excerpts that
+Gemini uses to produce price ranges and sourcing recommendations, with links
+so producers can check the evidence behind them.
+
 ## The rules that shape the code
 
 `CLAUDE.md` holds five constraints that are load-bearing for what this system
