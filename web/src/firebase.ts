@@ -17,6 +17,7 @@ import {
   connectAuthEmulator,
   getAuth,
   GoogleAuthProvider,
+  signInWithEmailAndPassword,
   signInWithPopup,
   signOut,
   type Auth,
@@ -67,6 +68,13 @@ if (USE_EMULATOR) {
  */
 export const signIn = async (): Promise<void> => {
   await signInWithPopup(auth, new GoogleAuthProvider());
+};
+
+export const signInWithPassword = async (
+  email: string,
+  password: string,
+): Promise<void> => {
+  await signInWithEmailAndPassword(auth, email.trim(), password);
 };
 
 export const signOutOfEverything = async (): Promise<void> => {

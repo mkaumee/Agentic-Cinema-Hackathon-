@@ -19,6 +19,7 @@ import {
   auth,
   resetSession,
   signIn,
+  signInWithPassword,
   signOutOfEverything,
   USE_EMULATOR,
 } from "@/firebase";
@@ -41,6 +42,7 @@ export function App() {
   // `auth/cancelled-popup-request`. The person then sees an error for having
   // done nothing wrong.
   const [signingIn, setSigningIn] = useState(false);
+  const [passwordSigningIn, setPasswordSigningIn] = useState(false);
   // Whether the wait has gone on long enough to be a fault rather than a load.
   const [stuck, setStuck] = useState(false);
 
@@ -79,7 +81,10 @@ export function App() {
           negotiates with sellers over days. It never buys anything — you do.
         </p>
         <Button
+          className="w-full max-w-sm mt-4"
+          size="lg"
           loading={signingIn}
+          disabled={signingIn || passwordSigningIn}
           onClick={() => {
             setError("");
             setSigningIn(true);
@@ -97,7 +102,61 @@ export function App() {
         >
           {signingIn ? "Waiting for Google…" : "Sign in with Google"}
         </Button>
-        {error !== "" && <p className="max-w-md text-sm text-destructive">{error}</p>}
+        <p className="text-sm text-muted-foreground">or</p>
+        <form
+          className="flex w-full max-w-sm flex-col gap-3 text-left"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (signingIn || passwordSigningIn) return;
+            const form = event.currentTarget;
+            const data = new FormData(form);
+            setError("");
+            setPasswordSigningIn(true);
+            void signInWithPassword(
+              String(data.get("email") ?? ""),
+              String(data.get("password") ?? ""),
+            )
+              .then(() => form.reset())
+              .catch((cause: unknown) => setError(explain(cause)))
+              .finally(() => setPasswordSigningIn(false));
+          }}
+        >
+          <label htmlFor="login-email" className="text-sm">
+            Email address
+          </label>
+          <input
+            id="login-email"
+            name="email"
+            type="email"
+            autoComplete="username"
+            required
+            disabled={signingIn || passwordSigningIn}
+            className="rounded-md border border-input bg-background px-3 py-2"
+          />
+          <label htmlFor="login-password" className="text-sm">
+            Password
+          </label>
+          <input
+            id="login-password"
+            name="password"
+            type="password"
+            autoComplete="current-password"
+            required
+            disabled={signingIn || passwordSigningIn}
+            className="rounded-md border border-input bg-background px-3 py-2"
+          />
+          <Button
+            type="submit"
+            variant="outline"
+            loading={passwordSigningIn}
+            disabled={signingIn || passwordSigningIn}
+          >
+            {passwordSigningIn ? "Signing in…" : "Sign in"}
+          </Button>
+        </form>
+        {error !== "" && (
+          <p role="alert" className="max-w-md text-sm text-destructive">{error}</p>
+        )}
       </Centred>
     );
   }

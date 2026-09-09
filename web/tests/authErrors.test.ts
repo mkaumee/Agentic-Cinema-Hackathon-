@@ -14,6 +14,15 @@ const firebaseError = (code: string): Error =>
   Object.assign(new Error(`Firebase: Error (${code}).`), { code });
 
 describe("explaining auth errors", () => {
+  it.each(["auth/invalid-credential", "auth/wrong-password", "auth/user-not-found"])(
+    "explains %s without saying whether the account exists",
+    (code) => {
+      expect(explain(firebaseError(code))).toContain(
+        "The email address or password is incorrect.",
+      );
+    },
+  );
+
   it("says to press Get started when Auth was never switched on", () => {
     const shown = explain(firebaseError("auth/configuration-not-found"));
 

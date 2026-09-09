@@ -17,8 +17,15 @@ export const AUTH_HELP: Record<string, string> = {
     "Firebase console → Authentication → Get started. The provider list " +
     "does not exist until that button is pressed.",
   "auth/operation-not-allowed":
-    "Google sign-in is off. Firebase console → Authentication → " +
-    "Sign-in method → Google → Enable.",
+    "This sign-in method is off. Firebase console → Authentication → " +
+    "Sign-in method → Enable Google or Email/Password as appropriate.",
+  "auth/invalid-credential": "The email address or password is incorrect.",
+  "auth/wrong-password": "The email address or password is incorrect.",
+  "auth/user-not-found": "The email address or password is incorrect.",
+  "auth/invalid-email": "Enter a valid email address.",
+  "auth/user-disabled": "This account is disabled. Contact your administrator.",
+  "auth/too-many-requests": "Too many attempts. Wait a while and try again.",
+  "auth/network-request-failed": "Check your connection and try again.",
   "auth/unauthorized-domain":
     "This domain is not on the authorised list. Firebase console → " +
     "Authentication → Settings → Authorised domains.",
